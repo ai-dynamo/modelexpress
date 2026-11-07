@@ -878,7 +878,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_P2P_COLD_START_WAIT_TIMEOUT_SECS` | `600` | Maximum time in seconds for cold-start donor discovery and election before skipping RDMA and continuing with the remaining load strategies. Also caps total donor lease renewal time from acquisition. Must be positive and less than 1500 seconds; invalid values use the default. This leaves a margin below the default 1800-second Gloo timeout, but deployments with a shorter CPU process-group timeout must configure a shorter MX wait. |
 | `MX_ARTIFACT_READY_URL` | Framework default for bundles; unset for vLLM weight publication | Readiness endpoint used before preparing and publishing cache artifact bundles. For vLLM weight metadata, readiness is gated only when explicitly configured. Bundle readiness defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
-| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile and kernel JIT cache (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI) artifact source pools. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -1285,6 +1285,15 @@ The value is opaque to ModelExpress; it only has to be equal across workers that
 should share caches and different across those that should not. Note that this
 partitions the pool but does not by itself make prefill and decode share a
 cache — they cannot, because vLLM's own cache keys already differ.
+
+The same digest partitions the kernel JIT caches (Triton, DeepGEMM, TileLang,
+CuTe DSL, FlashInfer, and SGLang's TVM-FFI). Their files are keyed per kernel,
+so a bundle from another compile configuration is never wrong, but it can be
+incomplete: which kernels a worker JIT-compiles follows its configuration, most
+visibly `max_num_batched_tokens`, which bounds the GEMM shapes DeepGEMM warms up.
+A prefill worker that installs a decode worker's DeepGEMM bundle reuses the
+smaller shape set and compiles the rest at startup. With the digest set per
+compile configuration, each worker installs only bundles produced under its own.
 
 To check whether a transferred cache was actually used, look for the
 effectiveness line the vLLM loader emits once the engine is up:

@@ -642,7 +642,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
-| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled and falls back to generic per-tensor NIXL registration. Further backends can be added behind the same interface |
+| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled, falls back to generic per-tensor NIXL registration, and requires no classic-allocator pool for registered buffers. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
@@ -1124,6 +1124,17 @@ The vLLM adapter passes an exclusion predicate to engine-agnostic hidden-tensor 
 
 The SGLang adapter's predicate skips any object whose class is defined under `sglang.srt.distributed`, `sglang.srt.layers.communication`, or `torch.distributed`. Communication workspaces such as `FinalizePushWorkspace` hold direct references to the communicator's push counter and slabs, so excluding the communicator alone is not enough. SGLang layers keep their `GroupCoordinator` as `tp_group`, so without it the scan reaches the custom all-reduce communicator and copies the donor's epoch counters, symmetric slab, and CUDA-graph pointer table. Those tensors match in size across instances, so the transfer succeeds, but the receiver's ranks then disagree on epoch parity and the first push all-reduce deadlocks.
 
+The vLLM adapter identifies FlashInfer MLA attention layers through
+`attn_backend.get_name() == "FLASHINFER_MLA"`, independently of the implementation
+class name or module path. It preserves the instance-owned
+`impl._multi_ctas_kv_counter_buffer` and excludes that tensor from hidden-tensor
+adoption. Collection also omits buffer aliases within the counter's byte range,
+including previously adopted buffers, while retaining unrelated hidden derived
+tensors. Parameters, partial buffer overlaps, and widened storage transfers that
+overlap local state raise a classification error. This bounded compatibility rule
+does not classify arbitrary runtime buffers or implementations without a declared
+backend; versions using a module-global counter need no instance-field exclusion.
+
 ```mermaid
 graph TD
     subgraph Source
@@ -1204,7 +1215,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint used before preparing and publishing cache bundles, and before vLLM weight metadata publication when explicitly configured. Bundle readiness defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
-| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the torch compile cache `SourceIdentity`, adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the `SourceIdentity` of the torch compile cache and of the kernel JIT caches (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI), adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
