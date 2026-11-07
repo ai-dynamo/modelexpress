@@ -167,6 +167,7 @@ def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float):
         worker_id="worker-1",
         metadata_endpoint="127.0.0.1:17000",
         agent_name="peer-agent",
+        accelerator="cuda",
         tensors=[
             p2p_pb2.TensorDescriptor(
                 name="weight",
@@ -191,12 +192,13 @@ def _peer_receive(monkeypatch, *, nbytes: int, wire_s: float):
         lambda *_args, **_kwargs: (_Lease(), 0),
     )
     method = RuntimeTensorNixlUpdateMethod(
-        manager=_Manager(), device_id=DEVICE_ID,
+        manager=_Manager(), device_id=DEVICE_ID, accelerator="cuda",
         runtime_tensors={"weight": torch.empty(4, dtype=torch.float32)},
     )
     prepared = method.prepare(version=None, source=GeneratorPeerUpdateSource(
         worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="127.0.0.1:18000"),
         mx_source_id="source-1", worker_id="worker-1",
+        identity=p2p_pb2.SourceIdentity(model_name="model"),
     ))
     with method.installation_context(prepared):
         pass

@@ -2767,7 +2767,10 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         lambda version_id, **_kwargs: versions[version_id],
     )
     peer = GeneratorPeerUpdateSource(
-        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="peer:9000"), mx_source_id="peer", worker_id="peer"
+        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="peer:9000"),
+        mx_source_id="peer",
+        worker_id="peer",
+        identity=p2p_pb2.SourceIdentity(model_name="model"),
     )
     resolver = Mock(spec=SourceResolver, kind=WeightSource.GENERATOR)
     resolver.supports.return_value = True
@@ -2776,7 +2779,10 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         (peer,) if use_peer_for_second_delta and version.version_id == "delta-2" else ()
     )
     peer_method = RuntimeTensorNixlUpdateMethod(
-        manager=Mock(), device_id=0, runtime_tensors={"weight": tensors[0]}
+        manager=Mock(),
+        device_id=0,
+        accelerator="cuda",
+        runtime_tensors={"weight": tensors[0]},
     )
     monkeypatch.setattr(peer_method, "_prepare_peer_read", lambda _source: Mock())
     monkeypatch.setattr(peer_method, "_receive_peer", lambda _read: {})
