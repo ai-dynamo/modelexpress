@@ -23,7 +23,11 @@ from modelexpress import p2p_pb2
 from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.base import LoadResult, clear_exception_tracebacks
-from modelexpress.load_strategy.rdma_strategy import MAX_SOURCE_RETRIES, RdmaStrategy
+from modelexpress.load_strategy.rdma_strategy import (
+    MAX_DRAFT_SOURCE_METADATA_LOOKUPS,
+    MAX_SOURCE_RETRIES,
+    RdmaStrategy,
+)
 from modelexpress.source_selection import (
     ENV_SELECTOR,
     LoadAwareSelector,
@@ -650,6 +654,87 @@ def test_load_slices_to_max_source_retries():
     assert ei.value.mutated is False
     assert strat._fetch_worker_metadata.call_count == MAX_SOURCE_RETRIES
     strat._load_as_target.assert_not_called()
+
+
+
+def _draft_ctx():
+    ctx = MagicMock(global_rank=0)
+    ctx.p2p_role = "draft"
+    ctx.draft_tensor_namespace = "mx_draft::test::"
+    ctx.accelerator_backend.name = ""
+    return ctx
+
+
+def _worker_with_tensor(name):
+    return p2p_pb2.WorkerMetadata(
+        tensor_source=p2p_pb2.TensorSourceMetadata(
+            tensors=[p2p_pb2.TensorDescriptor(name=name)]
+        )
+    )
+
+
+def test_draft_load_skips_main_only_sources_before_transfer_limit():
+    strat = RdmaStrategy()
+    candidates = _sources(MAX_SOURCE_RETRIES + 1)
+    strat._find_source_instances = MagicMock(return_value=candidates)
+    main_only = _worker_with_tensor("main.weight")
+    draft = _worker_with_tensor("mx_draft::test::weight")
+    strat._fetch_worker_metadata = MagicMock(
+        side_effect=[main_only] * MAX_SOURCE_RETRIES + [draft]
+    )
+    strat._load_as_target = MagicMock(return_value="loaded")
+
+    assert strat.load(MagicMock(), _draft_ctx()) == "loaded"
+    assert strat._fetch_worker_metadata.call_count == MAX_SOURCE_RETRIES + 1
+    assert strat._load_as_target.call_count == 1
+    assert strat._load_as_target.call_args.args[-1] == candidates[-1].worker_id
+
+
+def test_draft_load_bounds_metadata_lookups():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(
+        return_value=_sources(MAX_DRAFT_SOURCE_METADATA_LOOKUPS + 1)
+    )
+    strat._fetch_worker_metadata = MagicMock(
+        return_value=_worker_with_tensor("main.weight")
+    )
+    strat._load_as_target = MagicMock()
+
+    with pytest.raises(StrategyFailed):
+        strat.load(MagicMock(), _draft_ctx())
+    assert strat._fetch_worker_metadata.call_count == MAX_DRAFT_SOURCE_METADATA_LOOKUPS
+    strat._load_as_target.assert_not_called()
+
+
+def test_draft_load_bounds_transfer_attempts_with_ineligible_sources():
+    strat = RdmaStrategy()
+    candidates = _sources(MAX_SOURCE_RETRIES * 2 + 1)
+    strat._find_source_instances = MagicMock(return_value=candidates)
+    main_only = _worker_with_tensor("main.weight")
+    draft = _worker_with_tensor("mx_draft::test::weight")
+    strat._fetch_worker_metadata = MagicMock(
+        side_effect=[main_only, draft] * MAX_SOURCE_RETRIES + [draft]
+    )
+    strat._load_as_target = MagicMock(
+        side_effect=StrategyFailed("receive failed", mutated=False)
+    )
+    strat.rollback = MagicMock()
+
+    with pytest.raises(StrategyFailed, match="receive failed"):
+        strat.load(MagicMock(), _draft_ctx())
+    assert strat._fetch_worker_metadata.call_count == MAX_SOURCE_RETRIES * 2
+    assert strat._load_as_target.call_count == MAX_SOURCE_RETRIES
+    assert strat.rollback.call_count == MAX_SOURCE_RETRIES - 1
+
+
+def test_draft_load_unknown_manifest_consumes_transfer_attempt():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(return_value=p2p_pb2.WorkerMetadata())
+    strat._load_as_target = MagicMock(return_value="loaded")
+
+    assert strat.load(MagicMock(), _draft_ctx()) == "loaded"
+    strat._load_as_target.assert_called_once()
 
 
 def test_load_metadata_miss_tries_next_candidate():

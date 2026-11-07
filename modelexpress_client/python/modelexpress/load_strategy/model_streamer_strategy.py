@@ -26,11 +26,11 @@ logger = logging.getLogger("modelexpress.strategy_model_streamer")
 
 def _resolve_model_uri(ctx: LoadContext) -> str:
     """Resolve the model URI used by ModelStreamer across engine configs."""
-    if model_uri := envs.MX_MODEL_URI:
+    if not ctx.use_model_config_uri and (model_uri := envs.MX_MODEL_URI):
         return model_uri
     for attr in ("model_weights", "model", "model_path"):
         value = getattr(ctx.model_config, attr, None)
-        if value:
+        if isinstance(value, str) and value:
             return value
     return ""
 
@@ -62,7 +62,11 @@ class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
     def is_available(self, ctx: LoadContext) -> bool:
         if not self.supports_explicit_uri(ctx):
             return False
-        model_uri = envs.MX_MODEL_URI or ""
+        model_uri = (
+            _resolve_model_uri(ctx)
+            if ctx.use_model_config_uri
+            else envs.MX_MODEL_URI or ""
+        )
         if not model_uri:
             logger.info(
                 f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"

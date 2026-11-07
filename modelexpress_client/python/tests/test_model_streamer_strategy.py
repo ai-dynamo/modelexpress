@@ -113,6 +113,17 @@ class TestModelStreamerIsAvailable:
             with patch("importlib.util.find_spec", return_value=MagicMock()):
                 assert strategy.is_available(ctx) is True
 
+    def test_separate_draft_uses_its_own_uri(self):
+        from modelexpress.load_strategy.model_streamer_strategy import _resolve_model_uri
+
+        ctx = _make_load_context(use_model_config_uri=True)
+        ctx.model_config.model_weights = "s3://bucket/draft"
+        strategy = self._make_strategy()
+        with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/main"}):
+            with patch("importlib.util.find_spec", return_value=MagicMock()):
+                assert strategy.is_available(ctx)
+                assert _resolve_model_uri(ctx) == "s3://bucket/draft"
+
     def test_unavailable_no_env(self):
         ctx = _make_load_context()
         strategy = self._make_strategy()
