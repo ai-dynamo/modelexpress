@@ -127,7 +127,7 @@ def accelerators_compatible(
     transferable cross-vendor, so they are rejected pending inference-correctness
     validation. This is the single compatibility rule shared by RDMA tensor
     source selection and artifact source discovery, in both their pre-fetch and
-    post-fetch checks.
+    post-fetch checks, and by RL generator-peer lease validation.
 
     Args:
         target: Runtime accelerator family of the pulling (target) worker,
