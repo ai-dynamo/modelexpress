@@ -13,6 +13,7 @@ use hf_hub::api::tokio::{ApiBuilder, ApiError};
 use hf_hub::{Cache, Repo, RepoType};
 use std::collections::HashSet;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -20,6 +21,9 @@ use tracing::{debug, info, warn};
 
 const HF_FALLBACK_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HF_FALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Upper bound on the exponential backoff delay between Hugging Face retries.
+const HF_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// Revision used when a caller does not pin one. Matches hf-hub's own default branch.
 const DEFAULT_HF_REVISION: &str = "main";
@@ -229,6 +233,80 @@ impl HuggingFaceProvider {
         )
     }
 
+    /// Whether an `ApiError` is a transient Hub or network failure worth retrying.
+    ///
+    /// Covers HTTP 408, 429, and 5xx responses plus transport errors that carry no
+    /// status at all (connection reset mid-shard, timeouts). Everything else, such
+    /// as 401/403/404, local I/O, and cache locking, fails fast.
+    fn is_retryable_api_error(error: &ApiError) -> bool {
+        match error {
+            ApiError::RequestError(e) => match e.status() {
+                Some(status) => {
+                    status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error()
+                }
+                None => !e.is_builder(),
+            },
+            ApiError::TooManyRetries(inner) => Self::is_retryable_api_error(inner),
+            _ => false,
+        }
+    }
+
+    /// Files that are not needed to run the model. A download failure on one of
+    /// these is logged and skipped instead of failing the whole model fetch, so a
+    /// 429 on `LICENSE` cannot crash a worker that has every weight shard.
+    fn is_optional_file(filename: &str) -> bool {
+        let name = Path::new(filename)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(filename)
+            .to_ascii_lowercase();
+        name.ends_with(".md")
+            || name.ends_with(".pdf")
+            || name.starts_with("license")
+            || name.starts_with("licence")
+            || name.starts_with("notice")
+            || name.starts_with("changelog")
+            || name.starts_with("use_policy")
+            || name.starts_with("usage_policy")
+    }
+
+    /// Run `operation`, retrying transient Hub failures with exponential backoff.
+    ///
+    /// hf-hub 0.4.x keeps its internal `max_retries` at zero and exposes no public
+    /// setter, so without this boundary a single 429 or dropped connection aborts
+    /// the whole model download. hf-hub's resume logic picks partially downloaded
+    /// files back up on the next attempt, so retries do not restart from byte zero.
+    async fn with_retry<T, F, Fut>(
+        description: &str,
+        mut operation: F,
+    ) -> std::result::Result<T, ApiError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = std::result::Result<T, ApiError>>,
+    {
+        let max_retries = envs::hf_max_retries();
+        let base_delay = Duration::from_millis(envs::hf_retry_base_delay_ms());
+        let mut attempt: u64 = 0;
+        loop {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt < max_retries && Self::is_retryable_api_error(&error) => {
+                    let exponent = u32::try_from(attempt).unwrap_or(u32::MAX);
+                    let delay = base_delay
+                        .saturating_mul(2u32.saturating_pow(exponent))
+                        .min(HF_RETRY_MAX_DELAY);
+                    attempt = attempt.saturating_add(1);
+                    warn!(
+                        "Transient Hugging Face error while {description} \
+                         (retry {attempt} of {max_retries}): {error}; retrying in {delay:?}"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     async fn download_full_body_file(
         url: &str,
         cache_dir: &Path,
@@ -422,12 +500,15 @@ impl HuggingFaceProvider {
             builder = builder.with_cache_dir(cache_dir.to_path_buf());
         }
         let api = builder.build()?;
-        api.repo(Repo::with_revision(
+        let repo = api.repo(Repo::with_revision(
             model_name.to_string(),
             RepoType::Model,
             revision.to_string(),
-        ))
-        .info()
+        ));
+        Self::with_retry(
+            &format!("fetching metadata for model '{model_name}' at revision '{revision}'"),
+            || repo.info(),
+        )
         .await
         .map_err(|e| {
             anyhow::anyhow!(
@@ -520,20 +601,24 @@ impl HuggingFaceProvider {
         let model_name = model_name.to_string();
         let requested_revision = revision.unwrap_or(DEFAULT_HF_REVISION).to_string();
 
-        let info = api
-            .repo(Repo::with_revision(
-                model_name.clone(),
-                RepoType::Model,
-                requested_revision.clone(),
-            ))
-            .info()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to fetch model '{model_name}' at revision '{requested_revision}' from \
-                     HuggingFace. Is this a valid HuggingFace ID and revision? Error: {e}"
-                )
-            })?;
+        let requested_repo = api.repo(Repo::with_revision(
+            model_name.clone(),
+            RepoType::Model,
+            requested_revision.clone(),
+        ));
+        let info = Self::with_retry(
+            &format!(
+                "fetching metadata for model '{model_name}' at revision '{requested_revision}'"
+            ),
+            || requested_repo.info(),
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to fetch model '{model_name}' at revision '{requested_revision}' from \
+                 HuggingFace. Is this a valid HuggingFace ID and revision? Error: {e}"
+            )
+        })?;
         debug!("Got model info: {info:?}");
 
         if info.siblings.is_empty() {
@@ -565,7 +650,15 @@ impl HuggingFaceProvider {
                 continue;
             }
 
-            match pinned_repo.get(&sib.rfilename).await {
+            match Self::with_retry(
+                &format!(
+                    "downloading file '{}' from model '{model_name}'",
+                    sib.rfilename
+                ),
+                || pinned_repo.get(&sib.rfilename),
+            )
+            .await
+            {
                 Ok(_) => {}
                 Err(e) if HuggingFaceProvider::is_missing_content_range_error(&e) => {
                     // hf-hub requires Content-Range for its size probe. Some HF mirrors return a
@@ -574,7 +667,7 @@ impl HuggingFaceProvider {
                         "Hugging Face range metadata missing for '{}' from model '{}'; retrying with full-body download",
                         sib.rfilename, model_name
                     );
-                    HuggingFaceProvider::download_full_body_file(
+                    if let Err(fallback_error) = HuggingFaceProvider::download_full_body_file(
                         &pinned_repo.url(&sib.rfilename),
                         &cache_dir,
                         &model_name,
@@ -583,14 +676,21 @@ impl HuggingFaceProvider {
                         token.as_deref(),
                     )
                     .await
-                    .map_err(|fallback_error| {
-                        anyhow::anyhow!(
+                    {
+                        if HuggingFaceProvider::is_optional_file(&sib.rfilename) {
+                            warn!(
+                                "Skipping optional file '{}' from model '{}': {e}; full-body fallback also failed: {fallback_error:#}",
+                                sib.rfilename, model_name
+                            );
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!(
                             "Failed to download file '{sib}' from model '{model_name}': {e}; full-body fallback also failed: {fallback_error:#}",
                             sib = sib.rfilename,
                             model_name = model_name,
                             e = e
-                        )
-                    })?;
+                        ));
+                    }
                 }
                 Err(e) => {
                     // HTTP 416 (Range Not Satisfiable) occurs for empty files (0 bytes)
@@ -601,6 +701,13 @@ impl HuggingFaceProvider {
                         warn!(
                             "Skipping empty file '{}' from model '{}': {}",
                             sib.rfilename, model_name, e
+                        );
+                        continue;
+                    }
+                    if HuggingFaceProvider::is_optional_file(&sib.rfilename) {
+                        warn!(
+                            "Skipping optional file '{}' from model '{}' after download failure: {e}",
+                            sib.rfilename, model_name
                         );
                         continue;
                     }
@@ -1434,6 +1541,226 @@ mod tests {
                 .to_string()
                 .contains("not found in cache")
         );
+    }
+
+    #[test]
+    fn test_is_optional_file() {
+        for optional in [
+            "LICENSE",
+            "LICENSE.txt",
+            "Licence",
+            "NOTICE",
+            "USE_POLICY.md",
+            "README.md",
+            "CHANGELOG.md",
+            "paper.pdf",
+        ] {
+            assert!(
+                HuggingFaceProvider::is_optional_file(optional),
+                "{optional} should be optional"
+            );
+        }
+        for required in [
+            "config.json",
+            "model.safetensors",
+            "tokenizer.json",
+            "tokenizer.model",
+            "merges.txt",
+            "vocab.txt",
+            "generation_config.json",
+        ] {
+            assert!(
+                !HuggingFaceProvider::is_optional_file(required),
+                "{required} should be required"
+            );
+        }
+    }
+
+    /// Stub model info for `test/model` with the given sibling file list.
+    async fn mock_model_info(server: &MockServer, sha: &str, siblings: &[&str]) {
+        let siblings: Vec<_> = siblings
+            .iter()
+            .map(|name| json!({"rfilename": name}))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "test/model",
+                "sha": sha,
+                "siblings": siblings
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// A successful commit-pinned range response for `filename`.
+    fn file_response(sha: &str) -> ResponseTemplate {
+        ResponseTemplate::new(206)
+            .insert_header("etag", format!("\"{sha}\""))
+            .insert_header("x-repo-commit", sha)
+            .insert_header("accept-ranges", "bytes")
+            .insert_header("content-length", "64")
+            .insert_header("content-range", "bytes 0-63/64")
+            .set_body_bytes(vec![0u8; 64])
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_retries_transient_429_then_succeeds() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        mock_model_info(&server, "def5678", &["config.json"]).await;
+
+        // The first two requests for the file are rate limited; mocks match in
+        // mount order, so the success stub below takes over afterwards.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/def5678/config\.json$"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .expect(2)
+            .named("transient 429 responses")
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/def5678/config\.json$"))
+            .respond_with(file_response("def5678"))
+            .mount(&server)
+            .await;
+
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+        let _delay_guard = EnvVarGuard::set(
+            &env_lock,
+            crate::envs::MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS,
+            "1",
+        );
+
+        let snapshot = HuggingFaceProvider
+            .download_model("test/model", Some(temp_dir.path().to_path_buf()), false)
+            .await
+            .expect("Download should survive transient 429s");
+
+        assert!(snapshot.join("config.json").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_fails_after_retries_exhausted_on_required_file() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        mock_model_info(&server, "def5678", &["config.json"]).await;
+
+        // One initial attempt plus exactly one retry.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/def5678/config\.json$"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(2)
+            .named("persistent server errors")
+            .mount(&server)
+            .await;
+
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+        let _retries_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::MODEL_EXPRESS_HF_MAX_RETRIES, "1");
+        let _delay_guard = EnvVarGuard::set(
+            &env_lock,
+            crate::envs::MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS,
+            "1",
+        );
+
+        let error = HuggingFaceProvider
+            .download_model("test/model", Some(temp_dir.path().to_path_buf()), false)
+            .await
+            .expect_err("Required file must stay fatal after retries are exhausted");
+
+        assert!(error.to_string().contains("config.json"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_download_skips_optional_file_after_persistent_failure() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        mock_model_info(&server, "def5678", &["config.json", "LICENSE"]).await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/def5678/config\.json$"))
+            .respond_with(file_response("def5678"))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/def5678/LICENSE$"))
+            .respond_with(ResponseTemplate::new(429))
+            .named("rate-limited LICENSE")
+            .mount(&server)
+            .await;
+
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+        let _retries_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::MODEL_EXPRESS_HF_MAX_RETRIES, "0");
+
+        let snapshot = HuggingFaceProvider
+            .download_model("test/model", Some(temp_dir.path().to_path_buf()), false)
+            .await
+            .expect("Optional file failure must not fail the model download");
+
+        assert!(snapshot.join("config.json").exists());
+        assert!(!snapshot.join("LICENSE").exists());
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("models--test--model/refs/main"))
+                .expect("Expected cache ref"),
+            "def5678"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_metadata_fetch_retries_transient_429() {
+        let env_lock = acquire_env_mutex();
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/api/models/test/model(?:/.*)?$"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(1)
+            .expect(1)
+            .named("transient 429 on model info")
+            .mount(&server)
+            .await;
+
+        mock_model_info(&server, "def5678", &["config.json"]).await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/test/model/resolve/def5678/config\.json$"))
+            .respond_with(file_response("def5678"))
+            .mount(&server)
+            .await;
+
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &server.uri());
+        let _delay_guard = EnvVarGuard::set(
+            &env_lock,
+            crate::envs::MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS,
+            "1",
+        );
+
+        let snapshot = HuggingFaceProvider
+            .download_model("test/model", Some(temp_dir.path().to_path_buf()), false)
+            .await
+            .expect("Metadata fetch should survive a transient 429");
+
+        assert!(snapshot.join("config.json").exists());
     }
 
     /// Stub the revision-metadata endpoint hf-hub queries for `revision`, reporting
