@@ -557,7 +557,7 @@ def _vllm_health_ready(ctx: LoadContext | None = None) -> bool:
 def _vllm_health_url(ctx: LoadContext | None = None) -> str:
     return _artifact_lifecycle.resolve_health_url(
         envs.MX_ARTIFACT_READY_URL,
-        _DEFAULT_READY_URL,
+        getattr(ctx, "artifact_ready_url", None) or _DEFAULT_READY_URL,
         getattr(ctx, "head_addr", None),
     )
 

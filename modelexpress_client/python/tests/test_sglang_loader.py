@@ -97,6 +97,27 @@ def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
     assert ctx.mx_client.server_url == "mx.example:9000"
 
 
+def test_sglang_context_captures_listener_without_changing_source_identity(monkeypatch):
+    from modelexpress.engines.sglang.readiness import SglangServerReadiness
+    from modelexpress.metadata.source_id import compute_mx_source_id
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.adapter.sglang_server_readiness",
+        lambda: SglangServerReadiness("http://127.0.0.1:9007/health", True),
+    )
+    first = build_sglang_load_context(_load_config(), _model_config(), _device_config())
+    assert first.artifact_ready_url == "http://127.0.0.1:9007/health"
+    assert first.artifact_ready_local is True
+
+    monkeypatch.setattr(
+        "modelexpress.engines.sglang.adapter.sglang_server_readiness",
+        lambda: SglangServerReadiness("https://127.0.0.1:9443/health", False),
+    )
+    second = build_sglang_load_context(_load_config(), _model_config(), _device_config())
+    assert second.artifact_ready_local is False
+    assert compute_mx_source_id(first.identity) == compute_mx_source_id(second.identity)
+
+
 @pytest.fixture(params=["legacy", "runtime_context"])
 def sglang_parallel(request, monkeypatch):
     """Represent the two SGLang parallel-state API surfaces."""
