@@ -22,6 +22,7 @@ import pytest
 
 from modelexpress.load_strategy.base import SourceTransferError
 from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+from modelexpress.types import ManifestMismatchError
 
 P2P_AGENT = "mx-auto-worker0-0d6a01a9"
 BLOB_AGENT = "agent-from-blob"
@@ -51,6 +52,7 @@ def _ctx(manager):
         worker_rank=0,
         worker_id="target-0",
         is_reload=False,
+        require_exact_tensor_catalog=False,
         nixl_manager=manager,
         accelerator_backend=SimpleNamespace(name="cuda", synchronize=MagicMock()),
         adapter=adapter,
@@ -331,3 +333,18 @@ def test_reload_does_not_change_registered_runtime_layout():
     ctx.is_reload = True
     _receive(manager, ctx=ctx)
     ctx.adapter.prepare_rdma_target_from_manifest.assert_not_called()
+
+
+def test_exact_catalog_rejection_falls_back():
+    """A reload that asks for an exact catalog passes that on, and a peer that
+    does not name every target tensor fails the attempt before any write."""
+    mgr = _manager()
+    mgr.receive_from_source.side_effect = ManifestMismatchError("Tensor name mismatch")
+    ctx = _ctx(mgr)
+    ctx.require_exact_tensor_catalog = True
+
+    with pytest.raises(SourceTransferError, match="Tensor name mismatch"):
+        _receive(mgr, ctx=ctx)
+
+    assert mgr.receive_from_source.call_args.kwargs["require_exact_match"] is True
+    mgr.remove_remote_agent.assert_called_once_with(P2P_AGENT)

@@ -308,6 +308,33 @@ def adopt_hidden_tensors(
     return adopted
 
 
+def adopt_bare_tensors(
+    model: nn.Module,
+    accelerator_backend: AcceleratorBackend | None = None,
+) -> int:
+    """Promote bare accelerator tensor attributes to non-persistent buffers.
+
+    What capture_tensor_attrs would have done had this process run the
+    post-load processing: a model another loader loaded keeps its W_UV-style
+    tensors as plain attributes, which discover_tensors would otherwise miss.
+    """
+    backend = _resolve_accelerator_backend(accelerator_backend)
+    adopted = 0
+    for _, module in model.named_modules():
+        for name, value in list(vars(module).items()):
+            if (
+                name in _NEVER_ADOPTED_ATTRS
+                or not isinstance(value, torch.Tensor)
+                or isinstance(value, nn.Parameter)
+                or not backend.is_accel_tensor(value)
+            ):
+                continue
+            delattr(module, name)
+            module.register_buffer(name, value, persistent=False)
+            adopted += 1
+    return adopted
+
+
 def iter_module_tensors(
     module: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
