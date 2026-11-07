@@ -101,6 +101,7 @@ class TrainerRuntime:
         process_group: Any,
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
+        release_after_trainer_reads: bool = False,
     ) -> TrainerRuntime:
         if object_storage is not None:
             read_seed_tensor, _ = make_tensor_reader(
@@ -160,6 +161,7 @@ class TrainerRuntime:
                     service=service,
                     worker_id=worker_id,
                     rpc_timeout_seconds=rpc_timeout_seconds,
+                    release_after_trainer_reads=release_after_trainer_reads,
                 )
 
             return cls(

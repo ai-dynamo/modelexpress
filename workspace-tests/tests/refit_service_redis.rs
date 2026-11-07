@@ -555,6 +555,7 @@ async fn linked_reader_lease_fences_replica_addition_until_release_or_expiry() {
                 version_id: version.uid.clone(),
                 worker_id: generator_id,
                 ttl_seconds: if expire { 2 } else { 60 },
+                ..Default::default()
             })
             .await
             .expect("acquire linked reader lease")
@@ -887,6 +888,7 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
             version_id: fresh.uid.clone(),
             logical_shard_id: logical_shard_id.clone(),
             worker_id: replacement_id,
+            ..Default::default()
         })
         .await
         .expect("release replacement before retirement");
@@ -908,6 +910,7 @@ async fn mesh_linked_versions_publish_and_discover_declared_trainers() {
                 version_id: version.uid.clone(),
                 logical_shard_id: logical_shard_id.clone(),
                 worker_id: trainer_id,
+                ..Default::default()
             })
             .await
             .expect_err("mesh update already retired the original publication")
@@ -1015,6 +1018,7 @@ async fn staged_mesh_readiness_requires_current_publications() {
                         version_id: version.uid.clone(),
                         logical_shard_id: first.logical_shard_id.clone(),
                         worker_id: first_id.clone(),
+                        ..Default::default()
                     })
                     .await
                     .expect("release first shard while staging");
@@ -1168,6 +1172,7 @@ async fn mesh_worker_rebinding_retires_publication(replace_worker_id: bool) {
             version_id: version.uid.clone(),
             worker_id: generator_id,
             ttl_seconds: 60,
+            ..Default::default()
         })
         .await
         .expect("acquire reader lease")
@@ -1266,6 +1271,7 @@ async fn mesh_worker_rebinding_retires_publication(replace_worker_id: bool) {
             version_id: fresh.uid.clone(),
             logical_shard_id: new.logical_shard_id,
             worker_id: replacement_id,
+            ..Default::default()
         })
         .await
         .expect("retire replacement publication");
@@ -2146,6 +2152,7 @@ async fn live_lease_protects_releasing_version_shards() {
         version_id: version.uid.clone(),
         worker_id: generator_id.clone(),
         ttl_seconds: 60,
+        ..Default::default()
     };
     let lease = client_b
         .register_version_lease(register_lease.clone())
@@ -2179,6 +2186,7 @@ async fn live_lease_protects_releasing_version_shards() {
             version_id: version.uid.clone(),
             worker_id: second_generator_id.clone(),
             ttl_seconds: 60,
+            ..Default::default()
         })
         .await
         .expect_err("a releasing version rejects new consumers");
@@ -2194,6 +2202,7 @@ async fn live_lease_protects_releasing_version_shards() {
             version_id: version.uid.clone(),
             logical_shard_id: published_shard.logical_shard_id.clone(),
             worker_id: trainer_id.clone(),
+            ..Default::default()
         })
         .await
         .expect_err("a live lease protects every source shard");
@@ -2212,6 +2221,7 @@ async fn live_lease_protects_releasing_version_shards() {
             version_id: version.uid.clone(),
             logical_shard_id: published_shard.logical_shard_id,
             worker_id: trainer_id.clone(),
+            ..Default::default()
         })
         .await
         .expect("source may evict after the final lease is gone")
@@ -2255,6 +2265,7 @@ async fn live_lease_protects_releasing_version_shards() {
         version_id: expiring_version.uid.clone(),
         worker_id: generator_id.clone(),
         ttl_seconds: 1,
+        ..Default::default()
     };
     client_b
         .register_version_lease(expiring_lease.clone())
@@ -2280,6 +2291,7 @@ async fn live_lease_protects_releasing_version_shards() {
             version_id: expiring_version.uid,
             logical_shard_id: expiring_shard.logical_shard_id,
             worker_id: trainer_id.clone(),
+            ..Default::default()
         })
         .await
         .expect("expired lease no longer protects source shards");
@@ -2287,6 +2299,107 @@ async fn live_lease_protects_releasing_version_shards() {
     stop(stop_a, server_a).await;
     stop(stop_b, server_b).await;
     stop(stop_worker, worker_server).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn trainer_reads_are_capped_per_reader_group_and_alone_hold_trainer_shards() {
+    let redis_url =
+        std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string());
+    let port = free_port();
+    let (shutdown, server) = start_server(port, &redis_url);
+    let mut client = connect(port).await;
+
+    let trainer_id = unique_id("cap-trainer");
+    let (engine_a, engine_b) = (unique_id("engine-a"), unique_id("engine-b"));
+    let readers = [
+        (unique_id("a-rank0"), engine_a.clone()),
+        (unique_id("a-rank1"), engine_a),
+        (unique_id("b-rank0"), engine_b),
+    ];
+    let (metadata, stop_worker, worker_server) = bound_worker().await;
+    client
+        .register_worker(mesh_trainer(&trainer_id, &metadata))
+        .await
+        .expect("register trainer");
+    for (worker_id, _) in &readers {
+        client
+            .register_worker(worker(worker_id, WorkerRole::Generator, 60))
+            .await
+            .expect("register generator");
+    }
+    let mesh_id = mesh_for_workers(
+        &mut client,
+        HashMap::from([(trainer_id.clone(), metadata.clone())]),
+    )
+    .await;
+    let version = fresh_mesh_version(&mut client, &mesh_id).await;
+    let shard = mesh_shard(&version.uid, &trainer_id, &metadata);
+    client
+        .create_weight_version_shard(CreateWeightVersionShardRequest {
+            shard: Some(shard.clone()),
+        })
+        .await
+        .expect("publish complete version");
+    let lease =
+        |(worker_id, group): &(String, String), reads_trainer: bool| RegisterVersionLeaseRequest {
+            version_id: version.uid.clone(),
+            worker_id: worker_id.clone(),
+            ttl_seconds: 60,
+            reads_trainer,
+            max_trainer_readers: 1,
+            reader_group: group.clone(),
+        };
+    let delete_shard = DeleteWeightVersionShardRequest {
+        version_id: version.uid.clone(),
+        logical_shard_id: shard.logical_shard_id.clone(),
+        worker_id: trainer_id.clone(),
+        wait_for_trainer_readers_only: true,
+    };
+
+    let engine_a_leases = [
+        client
+            .register_version_lease(lease(&readers[0], true))
+            .await
+            .expect("engine A takes the trainer"),
+        client
+            .register_version_lease(lease(&readers[1], true))
+            .await
+            .expect("a second worker of engine A shares its slot"),
+    ];
+    let refused = client
+        .register_version_lease(lease(&readers[2], true))
+        .await
+        .expect_err("engine B waits for a peer");
+    assert_eq!(refused.code(), tonic::Code::ResourceExhausted, "{refused}");
+    client
+        .register_version_lease(lease(&readers[2], false))
+        .await
+        .expect("engine B still leases the version to read it from a peer");
+    let held = client
+        .delete_weight_version_shard(delete_shard.clone())
+        .await
+        .expect_err("engine A still reads the trainer's shard");
+    assert_eq!(held.code(), tonic::Code::FailedPrecondition, "{held}");
+
+    for response in engine_a_leases {
+        let lease = response.into_inner().lease.expect("lease");
+        client
+            .delete_version_lease(DeleteVersionLeaseRequest {
+                version_id: version.uid.clone(),
+                lease_id: lease.lease_id,
+                worker_id: lease.worker_id,
+            })
+            .await
+            .expect("release engine A");
+    }
+    client
+        .delete_weight_version_shard(delete_shard)
+        .await
+        .expect("a peer reader does not hold the trainer's shard");
+
+    stop(stop_worker, worker_server).await;
+    stop(shutdown, server).await;
 }
 
 #[tokio::test]
@@ -2764,6 +2877,7 @@ async fn stable_metadata_is_atomically_pinned_until_mesh_generation_changes() {
             version_id: initial.clone(),
             worker_id: reader_id.clone(),
             ttl_seconds: 60,
+            ..Default::default()
         })
         .await
         .expect("protect original version")
@@ -2834,6 +2948,7 @@ async fn stable_metadata_is_atomically_pinned_until_mesh_generation_changes() {
                 version_id: initial.clone(),
                 worker_id,
                 logical_shard_id: metadata.logical_shard_id.clone(),
+                ..Default::default()
             })
             .await
             .expect("remove retired publications");

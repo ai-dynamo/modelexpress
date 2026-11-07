@@ -70,6 +70,10 @@ fn leases_key(version_id: &str) -> String {
     format!("mx:refit:version:leases:{version_id}")
 }
 
+fn trainer_readers_key(version_id: &str) -> String {
+    format!("mx:refit:version:trainer-readers:{version_id}")
+}
+
 fn lease_key(version_id: &str, lease_id: &str) -> String {
     format!("mx:refit:version:lease:{version_id}:{lease_id}")
 }
@@ -964,8 +968,15 @@ impl RefitBackend for RedisRefitBackend {
             .key(shards_key(&request.version_id))
             .key(leases_key(&request.version_id))
             .key(publication_endpoints_key(&request.version_id))
+            .key(trainer_readers_key(&request.version_id))
             .arg(publication_key)
             .arg(encoded)
+            .arg(&request.version_id)
+            .arg(if request.wait_for_trainer_readers_only {
+                "1"
+            } else {
+                "0"
+            })
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -1004,6 +1015,7 @@ impl RefitBackend for RedisRefitBackend {
             .key(worker_key(&request.worker_id))
             .key(lease_key(&request.version_id, &lease_id))
             .key(leases_key(&request.version_id))
+            .key(trainer_readers_key(&request.version_id))
             .arg(&lease_id)
             .arg(&request.version_id)
             .arg(&request.worker_id)
@@ -1013,6 +1025,13 @@ impl RefitBackend for RedisRefitBackend {
             .arg(i32::from(
                 modelexpress_common::grpc::refit::WorkerRole::Generator,
             ))
+            .arg(if request.reads_trainer { "1" } else { "0" })
+            .arg(request.max_trainer_readers)
+            .arg(if request.reader_group.is_empty() {
+                &request.worker_id
+            } else {
+                &request.reader_group
+            })
             .invoke_async(&mut redis)
             .await
             .map_err(redis_error)?;
@@ -1038,6 +1057,10 @@ impl RefitBackend for RedisRefitBackend {
             "LEASE_CONFLICT" => Err(RefitBackendError::AlreadyExists(
                 "version lease ID is already used by a different worker".to_string(),
             )),
+            "TRAINER_READERS_FULL" => Err(RefitBackendError::ResourceExhausted(format!(
+                "weight version already has {} trainer reader groups; read it from a peer",
+                request.max_trainer_readers
+            ))),
             _ => Err(RefitBackendError::Internal(format!(
                 "unexpected Redis response: {result}"
             ))),
@@ -1049,6 +1072,7 @@ impl RefitBackend for RedisRefitBackend {
         let result: String = Script::new(DELETE_LEASE_LUA)
             .key(lease_key(&request.version_id, &request.lease_id))
             .key(leases_key(&request.version_id))
+            .key(trainer_readers_key(&request.version_id))
             .arg(&request.lease_id)
             .arg(&request.version_id)
             .arg(&request.worker_id)

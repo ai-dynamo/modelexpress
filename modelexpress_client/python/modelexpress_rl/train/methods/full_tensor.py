@@ -39,6 +39,7 @@ class FullTensorNixlPublicationMethod:
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         worker_id: str,
         rpc_timeout_seconds: float,
+        release_after_trainer_reads: bool = False,
     ) -> None:
         if staging_mode not in adapter.supported_staging_modes:
             raise ValueError(
@@ -55,6 +56,7 @@ class FullTensorNixlPublicationMethod:
         self._service = service
         self._worker_id = worker_id
         self._rpc_timeout_seconds = rpc_timeout_seconds
+        self._release_after_trainer_reads = release_after_trainer_reads
         self.published: dict[str, list[StagedWeightVersionShardData]] = {}
         self._metadata_identity: MeshIdentity | None = None
         self._metadata_digest: str | None = None
@@ -189,6 +191,7 @@ class FullTensorNixlPublicationMethod:
             version_id=version.version_id,
             logical_shard_id=logical_shard_id,
             worker_id=self._worker_id,
+            wait_for_trainer_readers_only=self._release_after_trainer_reads,
         )
         deadline = monotonic() + self._rpc_timeout_seconds
         # Publication buffers must outlive every generator reader lease.

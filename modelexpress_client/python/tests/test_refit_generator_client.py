@@ -86,6 +86,8 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.fail_mesh_lookup = False
         self.fail_lease_deletion = False
         self.fail_registration = False
+        self.trainer_readers_full = False
+        self.trainer_read_claims = []
         self.lease_events = []
         self.omit_base_version = False
         self.additional_versions = {}
@@ -172,6 +174,10 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION, "generator not registered"
             )
+        if request.reads_trainer:
+            self.trainer_read_claims.append((request.max_trainer_readers, request.reader_group))
+            if self.trainer_readers_full:
+                context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "trainer readers full")
         lease_id = f"lease-{request.worker_id}"
         self.active_leases.add(lease_id)
         self.lease_registrations += 1
@@ -1091,6 +1097,37 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
     assert service.lease_registrations == 2
     assert service.lease_deletions == 2
     assert adapter.stage_calls == []
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_generator_claims_a_trainer_read_before_reading_the_trainer(monkeypatch, full):
+    monkeypatch.setenv("MX_MAX_TRAINER_READERS", "1")
+    server, endpoint, service = _start_server()
+    service.trainer_readers_full = full
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    try:
+        if full:
+            with pytest.raises(grpc.RpcError) as refused:
+                generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert refused.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+        else:
+            generator.stage_weight(version=WeightVersionRef("version-a")).release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert (service.trainer_read_claims, len(adapter.stage_calls), service.active_leases) == (
+        [(1, "")],
+        0 if full else 1,
+        set(),
+    )
 
 
 def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch):

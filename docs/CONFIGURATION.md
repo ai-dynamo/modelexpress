@@ -132,6 +132,7 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_METADATA_BACKEND | empty on client; required on server | redis, kubernetes/k8s/crd, or client-only k8s-service |
 | MX_METADATA_PORT | 5555 | Base NIXL metadata port; worker port is base plus device ID |
 | MX_WORKER_GRPC_PORT | 6555 | Base worker gRPC port for tensor and artifact manifests |
+| MX_MAX_TENSOR_READERS | 0 | Peers one published tensor source serves at once; a refused peer reads from another source. 0 serves any number |
 | MX_WORKER_HOST | auto-detect | Advertised worker host override |
 | MX_MODEL_REVISION | unset | Source-identity revision label; pin an exact revision for decentralized source pools |
 | MX_NIXL_BACKEND | UCX | NIXL backend; LIBFABRIC is used for AWS EFA |

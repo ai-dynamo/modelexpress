@@ -92,6 +92,10 @@ class ModelExpressTrainerConfig:
     process_group: Any | None = None
     object_storage: ObjectStorageConfig | None = None
     engine_context: TrainerEngineContext | None = None
+    # Release a shard once no generator reads it from this trainer, rather than once no
+    # generator holds its version, so generators reading the version from peers do not
+    # hold this trainer's buffers. Safe only when every generator marks its trainer reads.
+    release_after_trainer_reads: bool = False
 
     def __post_init__(self) -> None:
         if self.payload_format is WeightPayloadFormat.UNSPECIFIED:
@@ -198,6 +202,7 @@ class ModelExpressTrainerClient:
                 process_group=config.process_group,
                 service=lambda: client._service,
                 rpc_timeout_seconds=config.rpc_timeout_seconds,
+                release_after_trainer_reads=config.release_after_trainer_reads,
             )
             client.worker_endpoint = client._runtime.worker_endpoint
             if client._runtime.requires_registration:
