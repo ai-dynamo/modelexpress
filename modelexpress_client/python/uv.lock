@@ -992,6 +992,7 @@ version = "0.8.0"
 source = { editable = "." }
 dependencies = [
     { name = "boto3" },
+    { name = "cuda-python", marker = "sys_platform == 'linux'" },
     { name = "google-crc32c" },
     { name = "grpcio" },
     { name = "huggingface-hub" },
@@ -1039,6 +1040,7 @@ requires-dist = [
     { name = "azure-identity", marker = "extra == 'azure'", specifier = ">=1.25.3" },
     { name = "azure-storage-blob", marker = "extra == 'azure'", specifier = ">=12.31.0" },
     { name = "boto3", specifier = ">=1.35.2" },
+    { name = "cuda-python", marker = "sys_platform == 'linux'", specifier = ">=12.4" },
     { name = "cuda-python", marker = "extra == 'vmm'", specifier = ">=12.4" },
     { name = "google-crc32c", specifier = ">=1.5.0" },
     { name = "grpcio", specifier = ">=1.66.2" },

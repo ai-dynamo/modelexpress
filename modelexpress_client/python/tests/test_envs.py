@@ -40,7 +40,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_ARTIFACT_BACKEND == "nixl"
     assert envs.MX_METADATA_PORT == 5555
     assert envs.MX_WORKER_GRPC_PORT == 6555
-    assert envs.MX_POOL_REG is False
+    assert envs.MX_POOL_REG is True
     assert envs.MX_VMM_ARENA is False
     assert envs.MX_MS_DISTRIBUTED is True
     assert envs.MX_LOAD_STRATEGY_CHAIN == "INFERENCE"
@@ -78,6 +78,20 @@ def test_int_and_float_parsing(monkeypatch):
     assert envs.MX_GDS_TIMEOUT == pytest.approx(1.5)
     assert envs.MX_SOURCE_QUERY_TIMEOUT == 42
 
+
+@pytest.mark.parametrize(
+    ("pool_reg", "vmm_arena", "expected"),
+    [(None, "1", False), ("1", "1", True), ("0", None, False)],
+)
+def test_pool_reg_default_yields_to_vmm_arena(
+    monkeypatch, pool_reg, vmm_arena, expected
+):
+    for name, value in (("MX_POOL_REG", pool_reg), ("MX_VMM_ARENA", vmm_arena)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert envs.MX_POOL_REG is expected
 
 def test_invalid_int_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("MX_METADATA_PORT", "not-a-number")
