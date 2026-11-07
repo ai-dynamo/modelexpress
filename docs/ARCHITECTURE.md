@@ -1013,7 +1013,7 @@ During transfer, `ManifestMismatchError` is raised if source and target tensor n
 
 After loading by any strategy, the worker starts a `PublisherThread` that owns initial publication retry and then periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the publisher sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged and retried in the publisher thread instead of crashing the worker.
 
-Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and publishes independently. Workers use `torch.distributed.get_rank()` as their global rank (captures both TP and PP position).
+Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and publishes independently. The server only accepts a `worker_id` of at most 63 bytes made of lowercase alphanumerics, `-` and `.`, with each dot-separated segment starting and ending alphanumeric, on `PublishMetadata`, `GetMetadata` and `UpdateStatus`. Custom producers emitting anything else, uppercase included, must change their IDs; records a Redis backend stored under such an ID before this check can still be listed but no longer fetched or updated. Workers use `torch.distributed.get_rank()` as their global rank (captures both TP and PP position).
 
 ### Tensor Discovery
 
