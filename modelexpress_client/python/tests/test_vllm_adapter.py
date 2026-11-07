@@ -815,6 +815,55 @@ def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeyp
     assert events == [("process", torch.device("cpu"))]
 
 
+@pytest.mark.parametrize(
+    "hook_name",
+    ("after_native_load", "after_weight_iter_load", "before_rdma_receive"),
+)
+def test_online_quant_load_hooks_finalize_layerwise_before_postprocessing(
+    monkeypatch, hook_name
+):
+    """Check that each load hook finalizes Meta weights before post-processing."""
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        assert not model.weight.is_meta
+        torch.testing.assert_close(model.weight, torch.ones(2, 2))
+        events.append(("process", model, model_config, target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    reload_module = sys.modules["vllm.model_executor.model_loader.reload"]
+
+    def finalize(model, config):
+        assert model.weight.is_meta
+        model.weight = nn.Parameter(torch.ones(2, 2))
+        events.append(("layerwise", model, config))
+
+    reload_module.finalize_layerwise_processing = finalize
+
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = nn.Module()
+    model.quant_method = SimpleNamespace(uses_meta_device=True)
+    model.weight = nn.Parameter(torch.empty(2, 2, device="meta"))
+    result = LoadResult(value=model, model=model)
+    if hook_name == "before_rdma_receive":
+        monkeypatch.setattr(
+            adapter,
+            "_finalize_model_specific_weights",
+            lambda value, _names: events.append("model_specific") or value,
+        )
+
+    assert getattr(adapter, hook_name)(result) is result
+
+    expected = ["model_specific"] if hook_name == "before_rdma_receive" else []
+    expected.extend(
+        [
+            ("layerwise", model, adapter.model_config),
+            ("process", model, adapter.model_config, torch.device("cpu")),
+        ]
+    )
+    assert events == expected
+
+
 def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
     fake_platforms = SimpleNamespace(
         current_platform=SimpleNamespace(
@@ -825,6 +874,7 @@ def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
 
 
 def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
+    """Install isolated vLLM loader stubs with a custom post-processing hook."""
     packages = [
         "vllm",
         "vllm.model_executor",
@@ -838,6 +888,10 @@ def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
     utils = ModuleType("vllm.model_executor.model_loader.utils")
     utils.process_weights_after_loading = process_fn
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
+
+    reload_module = ModuleType("vllm.model_executor.model_loader.reload")
+    reload_module.finalize_layerwise_processing = lambda *_args: None
+    monkeypatch.setitem(sys.modules, reload_module.__name__, reload_module)
 
 
 def _stub_metadata_client(monkeypatch) -> None:
