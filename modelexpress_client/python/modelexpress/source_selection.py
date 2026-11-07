@@ -173,6 +173,27 @@ class RendezvousHashSelector(ScoredSelector):
 UNKNOWN_LOAD_PRIOR = 0.5
 
 
+def _source_load(candidate: p2p_pb2.SourceInstanceRef) -> float:
+    """The candidate's published load clamped to ``[0, 1]``, or the prior.
+
+    Shared by every policy that reads ``source_load`` so they agree on what an
+    unset field means.
+    """
+    # Presence matters: a source with NO reading (older client, or a provider
+    # with no signal) must not outrank one reporting real load, so unknown
+    # ranks as a neutral prior rather than as idle. A measured 0.0 still gets
+    # the full bonus. Objects without presence tracking (tests, old servers)
+    # count as unknown.
+    has_field = getattr(candidate, "HasField", None)
+    try:
+        known = bool(has_field("source_load")) if has_field else False
+    except (ValueError, TypeError):
+        known = False
+    if known:
+        return min(1.0, max(0.0, candidate.source_load))
+    return UNKNOWN_LOAD_PRIOR
+
+
 class LoadAwareSelector(ScoredSelector):
     """Load-aware spreading: rendezvous ordering biased away from busy sources.
 
@@ -209,21 +230,7 @@ class LoadAwareSelector(ScoredSelector):
         candidate: p2p_pb2.SourceInstanceRef,
         ctx: LoadContext,
     ) -> float:
-        # Presence matters: a source with NO reading (older client, or a provider
-        # with no signal) must not outrank one reporting real load, so unknown
-        # ranks as a neutral prior rather than as idle. A measured 0.0 still gets
-        # the full bonus. Objects without presence tracking (tests, old servers)
-        # count as unknown.
-        has_field = getattr(candidate, "HasField", None)
-        try:
-            known = bool(has_field("source_load")) if has_field else False
-        except (ValueError, TypeError):
-            known = False
-        if known:
-            load = min(1.0, max(0.0, candidate.source_load))
-        else:
-            load = UNKNOWN_LOAD_PRIOR
-        return _unit_hash(candidate, ctx) - self.w_load * load
+        return _unit_hash(candidate, ctx) - self.w_load * _source_load(candidate)
 
 
 class TopologyAwareSelector(ScoredSelector):
@@ -252,7 +259,7 @@ class TopologyAwareSelector(ScoredSelector):
 
     Composes with load-aware selection without depending on it: when the
     within-tier load weight is > 0 the tiebreak becomes ``unit_hash - w *
-    source_load`` (``source_load`` read defensively off the candidate), so within
+    source_load`` (unset reads as ``UNKNOWN_LOAD_PRIOR``), so within
     a locality tier it also steers away from busy sources. The weight is
     ``MX_P2P_TOPOLOGY_LOAD_WEIGHT`` when set, else it falls back to the load_aware
     weight ``MX_P2P_LOAD_WEIGHT`` when that feature is deployed -- so a single
@@ -341,8 +348,7 @@ class TopologyAwareSelector(ScoredSelector):
         depth = self._shared_depth(source_topology)
         tiebreak = self._unit_hash(candidate, ctx)
         if self.w_load > 0.0:
-            load = min(1.0, max(0.0, getattr(candidate, "source_load", 0.0)))
-            tiebreak -= self.w_load * load
+            tiebreak -= self.w_load * _source_load(candidate)
         return (depth, tiebreak)
 
 
