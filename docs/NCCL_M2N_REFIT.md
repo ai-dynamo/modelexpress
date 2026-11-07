@@ -26,8 +26,11 @@ Package: `modelexpress_rl.collective`. Per side, an integrator:
   from the RL framework's actor RPCs, with the same `version` and
   `operation_id` on all participants.
 
-This PR ships no Megatron `Publisher` or vLLM `Loader`; the integration provides
+The core ships no Megatron `Publisher` or vLLM `Loader`; the integration provides
 them. NeMo RL's existing builders port directly to the `LocalParamSpec` SPI.
+The optional [MILES/SGLang integration](../modelexpress_client/python/modelexpress_rl/collective/integrations/README.md)
+provides a trainer protocol and external generator receiver. Its endpoint and
+inherited collective settings are documented in the [RL configuration reference](rl/CONFIGURATION.md#miles-integration-nccl-m2n).
 
 ### `CollectiveRendezvous`
 
