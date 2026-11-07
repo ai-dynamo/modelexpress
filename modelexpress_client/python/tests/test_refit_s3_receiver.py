@@ -2793,7 +2793,7 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
             methods=methods,
             installer=installer,
             max_transfer_attempts=1,
-            start_lease=lambda _version_id: Mock(),
+            start_lease=lambda _version_id, **_: Mock(),
             resolve_replay_chain=lambda version: generator._resolve_replay_chain(
                 version.version_id, from_full_root=True
             ),

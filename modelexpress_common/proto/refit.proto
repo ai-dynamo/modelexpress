@@ -290,6 +290,10 @@ message DeleteWeightVersionShardRequest {
   string version_id = 1;
   string logical_shard_id = 2;
   string worker_id = 3;
+  // Delete once no lease marked as reading the trainer remains, instead of once no
+  // lease at all remains, so generators reading the version from peers do not hold
+  // the trainer's buffers. Safe only when every generator marks its trainer reads.
+  bool wait_for_trainer_readers_only = 4;
 }
 
 message DeleteWeightVersionShardResponse {
@@ -308,6 +312,15 @@ message RegisterVersionLeaseRequest {
   string version_id = 1;
   string worker_id = 2;
   uint32 ttl_seconds = 3;
+  // Marks the lease as reading the trainer's snapshot of a READY version. Renewing a
+  // marked lease keeps the mark; deleting the lease clears it.
+  bool reads_trainer = 4;
+  // With reads_trainer, admits the mark only while fewer than this many reader
+  // groups read the version from the trainer. 0 admits any number.
+  uint32 max_trainer_readers = 5;
+  // Leases sharing a group, such as the workers of one engine, count as one trainer
+  // reader. Empty counts the lease's worker alone.
+  string reader_group = 6;
 }
 
 message RegisterVersionLeaseResponse {

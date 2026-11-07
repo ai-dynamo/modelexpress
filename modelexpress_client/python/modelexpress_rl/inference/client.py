@@ -78,6 +78,9 @@ class ModelExpressGeneratorConfig:
     object_storage: ObjectStorageGeneratorConfig | None = None
     # Version read from the engine's serving-version API after cold start.
     initial_serving_version_id: str | None = None
+    # Workers sharing a group, such as the ranks of one engine, count as one trainer reader
+    # under MX_MAX_TRAINER_READERS. Unset counts each worker alone.
+    reader_group: str | None = None
     # Ordered source fallback. Canonical object storage may be used alone or
     # combined with generator P2P in either order.
     source_order: tuple[WeightSource, ...] | None = None
@@ -251,6 +254,7 @@ class ModelExpressGeneratorClient:
         self._registration_thread: threading.Thread | None = None
         self._operation_lock = threading.RLock()
         self._active_handle: StagedWeightHandle | None = None
+        self._reader_group = ""
         self._serving_version_id: str | None = None
         self._has_initial_serving_version = False
         self._engine_state = _EngineState.READY
@@ -297,6 +301,7 @@ class ModelExpressGeneratorClient:
         client.server_url = server_url
         client._registration_ttl_seconds = registration_ttl_seconds
         client._lease_ttl_seconds = lease_ttl_seconds
+        client._reader_group = config.reader_group or ""
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._max_replay_chain_length = config.max_replay_chain_length
         if config.staging_buffer_bytes is not None:
@@ -610,12 +615,15 @@ class ModelExpressGeneratorClient:
                 "initial serving version model_name does not match the generator"
             )
 
-    def _register_lease(self, version_id: str):
+    def _register_lease(self, version_id: str, *, reads_trainer: bool = False):
         response = self._service.RegisterVersionLease(
             refit_pb2.RegisterVersionLeaseRequest(
                 version_id=version_id,
                 worker_id=self.worker_id,
                 ttl_seconds=self._lease_ttl_seconds,
+                reads_trainer=reads_trainer,
+                max_trainer_readers=rl_envs.MX_MAX_TRAINER_READERS,
+                reader_group=self._reader_group,
             ),
             timeout=self._rpc_timeout_seconds,
         )
@@ -634,10 +642,13 @@ class ModelExpressGeneratorClient:
             logger.exception("unexpected version %s lease renewal failure", version_id)
         return None
 
-    def _start_version_lease(self, version_id: str) -> _VersionLease:
+    def _start_version_lease(self, version_id: str, *, reads_trainer: bool = False) -> _VersionLease:
+        """Lease ``version_id`` for one update. ``reads_trainer`` marks the lease as reading the
+        trainer's snapshot, which the server refuses while MX_MAX_TRAINER_READERS other reader
+        groups hold a mark; renewals keep the mark and closing the lease clears it."""
         # A restarted MX server loses registrations until the next renewal tick.
         self._register_worker()
-        lease = self._register_lease(version_id)
+        lease = self._register_lease(version_id, reads_trainer=reads_trainer)
         stop = threading.Event()
 
         def renew() -> None:
