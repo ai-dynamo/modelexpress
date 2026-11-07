@@ -1006,7 +1006,7 @@ def test_transfer_engine_pending_warnings_are_periodic(
 @pytest.mark.parametrize(
     "failure", ["drained_failure", "later_batch", "submission_exception", "drain_exception", "interrupted", "validation"]
 )
-def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure):
+def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure, monkeypatch):
     transfer_engine = MagicMock()
     transfer_engine.register_memory.return_value = 0
 
@@ -1038,7 +1038,21 @@ def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure):
     prepared_model = nn.Linear(2, 2)
     fresh_model = nn.Linear(2, 2)
     native_model = nn.Linear(2, 2)
-    target_tensor = torch.randn(2, 3)
+    target_tensor = SimpleNamespace(
+        data_ptr=lambda: 4104,
+        numel=lambda: 6,
+        element_size=lambda: 4,
+        is_cuda=True,
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "memory_snapshot",
+        lambda: [{
+            "address": 4096,
+            "is_expandable": False,
+            "blocks": [{"address": 4096, "size": 512, "state": "active_allocated"}],
+        }],
+    )
     native_tensor = torch.randn(3, 2)
     prepared_result = SimpleNamespace(value=prepared_model, model=prepared_model)
     fresh_result = SimpleNamespace(value=fresh_model, model=fresh_model)
@@ -1120,7 +1134,7 @@ def test_transfer_engine_receive_failure_waits_for_safe_fallback(failure):
         assert failed_ticket.drained
         assert failed_ticket.drain.call_count == 2
     assert loaded is native_model
-    transfer_engine.unregister_memory.assert_called_once_with(target_tensor.data_ptr())
+    transfer_engine.unregister_memory.assert_called_once_with(4096)
     adapter.reinit_for_retry.assert_called_once_with(prepared_result)
     adapter.load_via_native.assert_called_once_with(fresh_result)
     publish.assert_called_once()
@@ -1203,12 +1217,13 @@ def test_transfer_engine_registers_discovered_tensor_map():
             calls.append((addr, size))
             return 0
 
-    weight_info = loader._register_transfer_engine_tensors(
+    weight_info, registered_ptrs = loader._register_transfer_engine_tensors(
         {"weight.__storage": tensor, "empty": empty},
         FakeTransferEngine(),
     )
 
     assert calls == [(tensor.data_ptr(), tensor.numel() * tensor.element_size())]
+    assert registered_ptrs == {tensor.data_ptr()}
     assert weight_info == {
         "weight.__storage": (
             tensor.data_ptr(),
