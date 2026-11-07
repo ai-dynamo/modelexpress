@@ -237,20 +237,26 @@ def test_transfer_engine_published_manifest_receives_and_finalizes_mxfp8(monkeyp
     source_by_addr = {tensor.data_ptr(): tensor for tensor in tensors.values()}
     target_by_addr = {tensor.data_ptr(): tensor for tensor in targets.values()}
 
-    def copy_tensors(session_id, target_ptrs, source_ptrs, sizes):
+    def copy_tensors(
+        session_id, target_ptrs, sizes, source_ptrs, source_sizes,
+        target_offsets, source_offsets, lengths,
+    ):
         assert session_id == "donor-session"
+        assert source_sizes == sizes
+        assert target_offsets == source_offsets == [[0] for _ in sizes]
+        assert lengths == [[size] for size in sizes]
         for target_ptr, source_ptr, size in zip(target_ptrs, source_ptrs, sizes, strict=True):
             source = source_by_addr[source_ptr]
             assert size == source.numel() * source.element_size()
             target_by_addr[target_ptr].copy_(source)
-        return 0
+        return SimpleNamespace(drained=True, status=SimpleNamespace(name="COMPLETED"))
 
     transfer_engine = Mock()
-    transfer_engine.batch_transfer_sync_read.side_effect = copy_tensors
+    transfer_engine.submit_scatter_read.side_effect = copy_tensors
     loader._receive_via_transfer_engine(targets, transfer_engine, worker, ctx)
     finalize_runtime_state(receiver)
     assert receiver.proj.block_fp8_mxfp8_ready
     for name, tensor in tensors.items():
         torch.testing.assert_close(targets[name], tensor)
-    transfer_engine.batch_transfer_sync_read.assert_called_once()
+    transfer_engine.submit_scatter_read.assert_called_once()
     encode.assert_called_once()

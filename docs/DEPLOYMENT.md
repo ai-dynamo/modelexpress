@@ -607,7 +607,14 @@ intact.
 
 For the Mooncake TransferEngine SGLang example, add
 `--build-arg INSTALL_MOONCAKE=true` to install
-`mooncake-transfer-engine-cuda13`.
+`mooncake-transfer-engine-cuda13>=0.3.14`. A receiving weight loader requires the
+native `submit_scatter_read` completion-ticket API and rejects unsupported
+runtimes after source discovery, before preparing or registering destination
+weights. A seed with no source can load natively and publish using an older
+runtime without the ticket API. Pending tickets retain their buffers while
+draining and warn every 30 seconds with rank, elapsed time, and batch bytes;
+after submission, native fallback is allowed only after a drained failure. An
+undrainable operation requires supervised worker recovery.
 
 The Dynamo examples use their own runtime image Dockerfile:
 `examples/dynamo_p2p_transfer_k8s/Dockerfile`.
@@ -870,7 +877,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
-| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile cache artifact source pool. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
+| `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile and kernel JIT cache (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI) artifact source pools. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend. `{rank}` is substituted with the worker's own rank. If the resolved pattern has no `:port`, the client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` (multi-GPU-per-pod shape); if it has an explicit port, that port is used verbatim (1-GPU-per-pod shape). |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` backend: max retries on `FAILED_PRECONDITION` (revision mismatch during rolling updates). Each retry opens a fresh gRPC channel so kube-proxy re-picks a backend. |
@@ -1152,6 +1159,15 @@ RL generator peer leases and in-place update safety are described in the [RL ref
 
 Set `MX_METADATA_PORT` and `MX_WORKER_GRPC_PORT` to fixed ports when running in K8s (port 0 picks an ephemeral port). Set `MX_WORKER_HOST` if the pod IP auto-detection doesn't produce a routable address.
 
+Worker metadata endpoints may use DNS hostnames or numeric IPv4/IPv6 addresses.
+Before fetching NIXL metadata, the client resolves hostnames using the system
+resolver and selects the first IPv4 or IPv6 address in resolver order; it does
+not retry other addresses if the connection fails. Numeric addresses bypass
+DNS, bracketed IPv6 literals are normalized, and IPv6 scope IDs are preserved.
+DNS failures are reported before calling NIXL. IPv6 socket metadata exchange
+requires a NIXL build containing
+[IPv6 support from PR #2236](https://github.com/ai-dynamo/nixl/pull/2236).
+
 ### Artifact Transfer Backends
 
 Set `MX_ARTIFACT_TRANSFER=1` on source and target workers. The vLLM and SGLang
@@ -1239,6 +1255,15 @@ The value is opaque to ModelExpress; it only has to be equal across workers that
 should share caches and different across those that should not. Note that this
 partitions the pool but does not by itself make prefill and decode share a
 cache — they cannot, because vLLM's own cache keys already differ.
+
+The same digest partitions the kernel JIT caches (Triton, DeepGEMM, TileLang,
+CuTe DSL, FlashInfer, and SGLang's TVM-FFI). Their files are keyed per kernel,
+so a bundle from another compile configuration is never wrong, but it can be
+incomplete: which kernels a worker JIT-compiles follows its configuration, most
+visibly `max_num_batched_tokens`, which bounds the GEMM shapes DeepGEMM warms up.
+A prefill worker that installs a decode worker's DeepGEMM bundle reuses the
+smaller shape set and compiles the rest at startup. With the digest set per
+compile configuration, each worker installs only bundles produced under its own.
 
 To check whether a transferred cache was actually used, look for the
 effectiveness line the vLLM loader emits once the engine is up:
