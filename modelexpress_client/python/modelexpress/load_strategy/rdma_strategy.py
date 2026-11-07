@@ -187,7 +187,7 @@ class RdmaStrategy(LoadStrategy):
         ctx.nixl_manager = None
 
     def is_available(self, ctx: LoadContext) -> bool:
-        if not ctx.p2p_enabled:
+        if not ctx.p2p_enabled or getattr(ctx, "skip_rdma", False) is True:
             return False
         if not super().is_available(ctx):
             return False

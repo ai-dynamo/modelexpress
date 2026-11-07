@@ -874,8 +874,9 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
 | `MX_ARTIFACT_MOONCAKE_NAMESPACE` | `modelexpress/artifacts` | Key prefix used by the Mooncake artifact backend. |
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
-| `MX_ARTIFACT_READY_URL` | Framework default | Readiness endpoint polled before source workers publish weight metadata or prepare and publish cache artifact bundles. Defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. Each probe allows 1 second for vLLM and 5 seconds for SGLang, whose health endpoint may generate a token before responding. On the non-head nodes of a multi-node engine a loopback host is rewritten onto the head's address, preserving the configured port and path; a non-loopback host is used verbatim. See [Multi-node readiness](#multi-node-readiness). |
+| `MX_P2P_COLD_START` | `0` | Opt in to lease-coordinated concurrent cold starts with vLLM and a centralized Redis-backed MX server. Supports fixed non-elastic TP, PP, DP, EP and speculative decoding. TP, DP and PP have been validated on GPUs; EP has not. Prefill or decode context parallelism greater than one is rejected by the opt-in path; reload, sleep/wake and elastic EP are unsupported. |
+| `MX_P2P_COLD_START_WAIT_TIMEOUT_SECS` | `600` | Maximum time in seconds for cold-start donor discovery and election before skipping RDMA and continuing with the remaining load strategies. Also caps total donor lease renewal time from acquisition. Must be positive and less than 1500 seconds; invalid values use the default. This leaves a margin below the default 1800-second Gloo timeout, but deployments with a shorter CPU process-group timeout must configure a shorter MX wait. |
+| `MX_ARTIFACT_READY_URL` | Framework default for bundles; unset for vLLM weight publication | Readiness endpoint used before preparing and publishing cache artifact bundles. For vLLM weight metadata, readiness is gated only when explicitly configured. Bundle readiness defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. See [Multi-node readiness](#multi-node-readiness). |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile and kernel JIT cache (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI) artifact source pools. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
@@ -1149,6 +1150,35 @@ was validated, i.e. dmabuf/IB, where `ibv_reg_dmabuf_mr` does span several
 handles.
 
 ### P2P Metadata Exchange
+
+With `MX_P2P_COLD_START=1`, replica rank zero coordinates via a 60-second
+Redis lease, renewed every 20 seconds. Followers check READY ranks every two
+seconds. The server accepts lease terms from 1 to 600 seconds; this limits each
+term. The configured cold-start wait timeout also caps total donor renewal time
+from acquisition, after which the donor attempts to release the lease. The lease
+may also be released earlier after READY ranks are discovered. Transient discovery
+and election RPC failures are retried for up to three seconds after the first failure,
+within the overall wait deadline.
+If coordination fails or the configured cold-start wait timeout expires, the replica's workers skip the
+built-in RDMA strategy and continue through the remaining loading strategies;
+successful loads can still be published as peers. Plugins are unaffected, and
+multiple replicas may then load from storage concurrently. Subsequent strategy
+selection and runtime failures are not coordinated across workers and can still
+prevent startup. The timeout starts after worker-group validation; it does not
+bound collective operations or subsequent model loading. A donor can continue
+loading after its lease is released or expires; it is not fenced from publishing,
+and another donor can load from storage concurrently. The lease is scoped to source identity, not accelerator
+compatibility, and the normal load strategy can fall back to object storage.
+Election runs at weight loading and does not prevent earlier downloads. For
+server-backed, non-shared storage, set `MODEL_EXPRESS_NO_SHARED_STORAGE=1`
+and configure the MX server so the vLLM loader leaves weight acquisition to
+the strategy chain. Metadata may still be fetched before election.
+
+On UCX/RC deployments where short GPU reads are emulated in the source process,
+peer reads during CUDA graph capture can invalidate capture. Operators may set
+`UCX_RC_MLX5_TX_INLINE_RESP=0` and `UCX_PROTO_EMULATION_ENABLE=n` for affected
+configurations, or explicitly defer publication using `MX_ARTIFACT_READY_URL`.
+Validate UCX protocol selection and performance for the deployment.
 
 P2P metadata exchange is enabled by default. Source workers expose their own per-worker gRPC `WorkerService` (the `WorkerGrpcServer` on `MX_WORKER_GRPC_PORT`) and their NIXL agent metadata directly on the worker's NIXL listen thread (`MX_METADATA_PORT`). Targets fetch tensor manifests or artifact manifests directly from the source worker rather than pulling them through the central store. For file-backed cache artifacts, targets call `PrepareArtifactChunk` and `ReleaseArtifactChunk` while bytes move through NIXL into target-local staging, then install the staged artifact into the runtime cache directory. The division of responsibility depends on which metadata backend is in use:
 
