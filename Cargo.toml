@@ -52,11 +52,14 @@ object-store-reqwest = { package = "reqwest", version = "0.13", default-features
 prometheus-client = { version = "0.25", default-features = false }
 prost = "0.13"
 rustls = { version = "0.23.46", default-features = false }
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 mockall = "0.14.0"
 tempfile = "3.20"
 tokio = { version = "1.46", features = ["full"] }
+tokio-openssl = "0.6.5"
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["tls12"] }
 tokio-stream = "0.1"
 tonic = "0.13"
 tonic-build = "0.13"
