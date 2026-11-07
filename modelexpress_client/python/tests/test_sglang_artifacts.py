@@ -14,6 +14,7 @@ import pytest
 from modelexpress import p2p_pb2
 from modelexpress.engines.sglang import artifacts
 from modelexpress.engines.vllm import artifacts as vllm_artifacts
+from modelexpress.metadata.source_id import compute_mx_source_id
 
 
 def test_artifact_publisher_state_is_isolated_from_vllm():
@@ -354,3 +355,58 @@ def test_sglang_deep_gemm_cache_root_uses_sglang_config(monkeypatch, tmp_path):
     monkeypatch.setenv("DG_JIT_CACHE_DIR", str(tmp_path / "overwritten-cache"))
 
     assert artifacts._deep_gemm_cache_root() == tmp_path / "deep-gemm-cache"
+
+
+SGLANG_KERNEL_CACHE_SOURCE_TYPES = [
+    p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+    p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
+    p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+    p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+    p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
+]
+
+
+def _sglang_kernel_cache_identity(monkeypatch, source_type, digest):
+    monkeypatch.setattr(artifacts, "_sglang_version", lambda: "0.5.13")
+    for name, value in (
+        ("triton_version", "3.4.0"),
+        ("triton_key", "triton-key"),
+        ("deep_gemm_jit_key", "deep-gemm-key"),
+        ("tilelang_version", "0.1.6"),
+        ("cutlass_dsl_version", "4.2.0"),
+        ("flashinfer_version", "0.4.0"),
+    ):
+        monkeypatch.setattr(artifacts._common_artifacts, name, lambda value=value: value)
+    monkeypatch.setattr(artifacts._common_artifacts, "gpu_arch", lambda device_id: "sm90")
+    if digest is None:
+        monkeypatch.delenv("MX_ARTIFACT_COMPILE_CONFIG_DIGEST", raising=False)
+    else:
+        monkeypatch.setenv("MX_ARTIFACT_COMPILE_CONFIG_DIGEST", digest)
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(
+            model_name="test/model",
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
+        ),
+    )
+    return artifacts._artifact_identity(ctx, source_type)
+
+
+@pytest.mark.parametrize("source_type", SGLANG_KERNEL_CACHE_SOURCE_TYPES)
+def test_sglang_kernel_cache_identity_partitions_by_compile_config_digest(monkeypatch, source_type):
+    prefill = _sglang_kernel_cache_identity(monkeypatch, source_type, "prefill")
+    decode = _sglang_kernel_cache_identity(monkeypatch, source_type, "decode")
+
+    assert prefill.compile_config_digest == "prefill"
+    assert compute_mx_source_id(prefill) != compute_mx_source_id(decode)
+
+
+@pytest.mark.parametrize("source_type", SGLANG_KERNEL_CACHE_SOURCE_TYPES)
+def test_sglang_kernel_cache_identity_without_digest_keeps_existing_source_id(monkeypatch, source_type):
+    identity = _sglang_kernel_cache_identity(monkeypatch, source_type, None)
+    without_field = p2p_pb2.SourceIdentity()
+    without_field.CopyFrom(identity)
+    without_field.ClearField("compile_config_digest")
+
+    assert identity.compile_config_digest == ""
+    assert compute_mx_source_id(identity) == compute_mx_source_id(without_field)
