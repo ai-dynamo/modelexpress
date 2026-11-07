@@ -1116,6 +1116,14 @@ agent.release_xfer_handle(handle)
 
 ## FP8 Model Handling (DeepSeek-V3)
 
+Iterator-based vLLM loading owns buffered FP8 indexer weights and scales before
+replaying complete pairs. BF16 weights and pre-fused projections pass through;
+an FP8 indexer weight missing its scale fails explicitly. The partial pair replay
+suppresses MTP completeness checks only for that second load; the initial
+checkpoint load retains draft-layer validation. A CUDA integration test checks
+that replay through the real vLLM fused loader preserves both projection shards;
+it skips when CUDA or vLLM is unavailable.
+
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
 
 The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers transferable accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout and receives the real data, including hidden quant config tensors, via RDMA.
