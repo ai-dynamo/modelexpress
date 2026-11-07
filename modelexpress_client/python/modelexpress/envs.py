@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     MX_METADATA_BACKEND: str
     MX_METADATA_PORT: int
     MX_WORKER_GRPC_PORT: int
+    MX_MAX_TENSOR_READERS: int
     MX_WORKER_HOST: str
     MX_HEARTBEAT_INTERVAL_SECS: int
     MX_PUBLISH_TIMEOUT_SECS: int
@@ -282,6 +283,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
     "MX_WORKER_GRPC_PORT": lambda: _env_int("MX_WORKER_GRPC_PORT", 6555),
+    # Peers one published tensor source serves at once during RL weight updates; plain
+    # inference P2P loading takes no read lease and is not limited. 0 serves any number.
+    "MX_MAX_TENSOR_READERS": lambda: _env_int("MX_MAX_TENSOR_READERS", 0),
     "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
     "MX_HEARTBEAT_INTERVAL_SECS": lambda: _env_int("MX_HEARTBEAT_INTERVAL_SECS", 30),
     "MX_P2P_COLD_START": lambda: _env_bool("MX_P2P_COLD_START", False),

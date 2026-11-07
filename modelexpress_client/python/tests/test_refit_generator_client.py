@@ -86,6 +86,9 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.fail_mesh_lookup = False
         self.fail_lease_deletion = False
         self.fail_registration = False
+        self.trainer_readers_full = False
+        self.trainer_read_claims = []
+        self.read_sources = []
         self.lease_events = []
         self.omit_base_version = False
         self.additional_versions = {}
@@ -172,6 +175,11 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
             context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION, "generator not registered"
             )
+        self.read_sources.append(request.read_source)
+        if request.read_source == refit_pb2.VERSION_READ_SOURCE_TRAINER:
+            self.trainer_read_claims.append(request.reader_group)
+            if self.trainer_readers_full:
+                context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, "trainer readers full")
         lease_id = f"lease-{request.worker_id}"
         self.active_leases.add(lease_id)
         self.lease_registrations += 1
@@ -1091,6 +1099,87 @@ def test_generator_releases_lease_when_manifest_is_invalid(monkeypatch):
     assert service.lease_registrations == 2
     assert service.lease_deletions == 2
     assert adapter.stage_calls == []
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_generator_claims_a_trainer_read_before_reading_the_trainer(monkeypatch, full):
+    server, endpoint, service = _start_server()
+    service.trainer_readers_full = full
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    try:
+        if full:
+            with pytest.raises(grpc.RpcError) as refused:
+                generator.stage_weight(version=WeightVersionRef("version-a"))
+            assert refused.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED
+        else:
+            generator.stage_weight(version=WeightVersionRef("version-a")).release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert (service.trainer_read_claims, len(adapter.stage_calls), service.active_leases) == (
+        [""],
+        0 if full else 1,
+        set(),
+    )
+
+
+def test_generator_moves_to_a_peer_when_its_trainer_read_is_refused(monkeypatch):
+    server, endpoint, service = _start_server()
+    service.trainer_readers_full = True
+    _add_generator_peer(service)
+    adapter = _Adapter(service)
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.TRAINER, WeightSource.GENERATOR),
+    )
+
+    try:
+        generator.stage_weight(version=WeightVersionRef("version-a")).release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert (service.read_sources, len(adapter.peer_stage_calls), adapter.stage_calls) == (
+        [refit_pb2.VERSION_READ_SOURCE_TRAINER, refit_pb2.VERSION_READ_SOURCE_GENERATOR],
+        1,
+        [],
+    )
+
+
+def test_generator_lease_renewal_keeps_the_trainer_read_mark(monkeypatch):
+    server, endpoint, service = _start_server()
+    adapter = _Adapter(service)
+    # Renewal ticks every lease_ttl / 3 = 1 s.
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        lease_ttl_seconds=3,
+        source_order=(WeightSource.TRAINER,),
+    )
+
+    try:
+        staged = generator.stage_weight(version=WeightVersionRef("version-a"))
+        deadline = time.monotonic() + 5
+        while len(service.read_sources) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        staged.release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert len(service.read_sources) >= 2
+    assert set(service.read_sources) == {refit_pb2.VERSION_READ_SOURCE_TRAINER}
 
 
 def test_generator_fetches_trainer_manifest_larger_than_grpc_default(monkeypatch):
@@ -2285,6 +2374,60 @@ def test_generator_tries_next_peer_after_manifest_mismatch(monkeypatch):
         "good-agent",
     ]
     assert adapter.stage_calls == []
+
+
+class _BusySource(grpc.RpcError):
+    def code(self) -> grpc.StatusCode:
+        return grpc.StatusCode.RESOURCE_EXHAUSTED
+
+
+def test_generator_tries_next_peer_after_a_busy_peer(monkeypatch):
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.source.generator.random.Random.shuffle",
+        lambda _random, _sources: None,
+    )
+    server, endpoint, service = _start_server()
+    for index in range(2):
+        service.p2p.instances.append(
+            p2p_pb2.SourceInstanceRef(
+                mx_source_id=f"peer-source-{index}",
+                worker_id=f"peer-{index}",
+                worker_rank=0,
+            )
+        )
+        service.p2p.metadata[(f"peer-source-{index}", f"peer-{index}")] = (
+            p2p_pb2.WorkerMetadata(
+                worker_rank=0,
+                agent_name=f"peer-agent-{index}",
+                worker_grpc_endpoint="peer:50051",
+            )
+        )
+    adapter = _Adapter(service)
+
+    def stage_peer(source):
+        adapter.peer_stage_calls.append(source)
+        if source.agent_name == "peer-agent-0":
+            raise _BusySource()
+        return {"peer": source}
+
+    adapter.stage_peer_weight = stage_peer
+    generator = _initialize(
+        monkeypatch,
+        endpoint,
+        adapter,
+        source_order=(WeightSource.GENERATOR,),
+    )
+
+    try:
+        generator.stage_weight(version=WeightVersionRef("version-a")).release()
+    finally:
+        generator.close()
+        server.stop(grace=None).wait()
+
+    assert [source.agent_name for source in adapter.peer_stage_calls] == [
+        "peer-agent-0",
+        "peer-agent-1",
+    ]
 
 
 def test_generator_randomizes_and_limits_peers_before_trainer_fallback(monkeypatch):

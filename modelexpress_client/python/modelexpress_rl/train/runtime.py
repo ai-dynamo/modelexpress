@@ -101,6 +101,7 @@ class TrainerRuntime:
         process_group: Any,
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         rpc_timeout_seconds: float,
+        release_after_trainer_reads: bool = False,
     ) -> TrainerRuntime:
         if object_storage is not None:
             read_seed_tensor, _ = make_tensor_reader(
@@ -160,6 +161,7 @@ class TrainerRuntime:
                     service=service,
                     worker_id=worker_id,
                     rpc_timeout_seconds=rpc_timeout_seconds,
+                    release_after_trainer_reads=release_after_trainer_reads,
                 )
 
             return cls(
@@ -254,9 +256,10 @@ class TrainerRuntime:
             if payload is not None:
                 self._last_full_tensor_metrics = _flatten_timing(payload)
 
-    def release(self, *, version: WeightVersionRef) -> None:
+    def release(self, *, version: WeightVersionRef, timeout: float | None = None) -> bool:
         if isinstance(self.method, FullTensorNixlPublicationMethod):
-            self.method.release(version=version)
+            return self.method.release(version=version, timeout=timeout)
+        return True
 
     def pop_metrics(self) -> dict[str, int | float]:
         if isinstance(self.method, CanonicalDeltaPublicationMethod):

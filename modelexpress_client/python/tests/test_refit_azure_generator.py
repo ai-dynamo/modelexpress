@@ -53,7 +53,7 @@ def azure_control():
     versions = {version.version_id: version}
     leases = []
 
-    def start_lease(_version_id):
+    def start_lease(_version_id, **_):
         lease = SimpleNamespace(close=Mock())
         leases.append(lease)
         return lease

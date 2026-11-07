@@ -7,7 +7,8 @@
 -- ARGV: uid, model_name, idempotency_key, payload_format,
 --       base_version_id,
 --       object_storage_uri, initial_state, state, created_at_unix_ms, trainer_mesh_id,
---       version_number, object_storage_type, s3_uri
+--       version_number, object_storage_type, s3_uri, releasing_state,
+--       max_trainer_readers
 --
 -- Returns:
 --   CREATED              this invocation created the version
@@ -15,7 +16,9 @@
 --   COLLISION            the selected version ID already exists
 --
 -- Redis executes the script atomically, so two MX server replicas cannot create
--- different versions for the same idempotency key.
+-- different versions for the same idempotency key. Creating a mesh-backed
+-- version also deletes the mesh's retired versions, so a trainer that keeps
+-- publishing does not grow the version list readers poll.
 
 local existing = redis.call('GET', KEYS[2])
 if existing then
@@ -55,8 +58,17 @@ redis.call('HSET', KEYS[1],
   'trainer_mesh_generation', generation,
   'version_number', ARGV[11],
   'object_storage_type', ARGV[12],
-  's3_uri', ARGV[13])
+  's3_uri', ARGV[13],
+  'max_trainer_readers', ARGV[15])
 if ARGV[10] ~= '' then
+  local clock = redis.call('TIME')
+  local now = clock[1] * 1000 + math.floor(clock[2] / 1000)
+  for _, version_id in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+    if version_retired(version_id, ARGV[14], now) then
+      delete_version(version_id)
+      redis.call('SREM', KEYS[4], version_id)
+    end
+  end
   redis.call('SADD', KEYS[4], ARGV[1])
 end
 redis.call('SET', KEYS[2], ARGV[1])

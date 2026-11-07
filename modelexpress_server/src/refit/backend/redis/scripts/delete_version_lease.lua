@@ -2,10 +2,12 @@
 --
 -- KEYS[1]: lease hash
 -- KEYS[2]: active lease expiry sorted set for the version
+-- KEYS[3]: trainer reader lease expiry sorted set for the version
 -- ARGV: lease_id, version_id, worker_id
 
 if redis.call('EXISTS', KEYS[1]) == 0 then
   redis.call('ZREM', KEYS[2], ARGV[1])
+  redis.call('ZREM', KEYS[3], ARGV[1])
   return 'NOT_FOUND'
 end
 
@@ -19,4 +21,5 @@ end
 
 redis.call('DEL', KEYS[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('ZREM', KEYS[3], ARGV[1])
 return 'DELETED'

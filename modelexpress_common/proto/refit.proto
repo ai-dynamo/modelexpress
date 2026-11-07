@@ -176,6 +176,10 @@ message CreateWeightVersionRequest {
   // Required for worker publication; absent for object-storage versions.
   optional string trainer_mesh_id = 9;
   optional int64 version_number = 10;
+  // Fleet-wide limit on reader groups reading the version from the trainer at once,
+  // so a new version spreads through peers instead of every generator reading the
+  // trainer. 0 admits any number.
+  uint32 max_trainer_readers = 11;
 }
 
 message ListWeightVersionsRequest {
@@ -290,6 +294,10 @@ message DeleteWeightVersionShardRequest {
   string version_id = 1;
   string logical_shard_id = 2;
   string worker_id = 3;
+  // Delete once no lease marked as reading the trainer remains, instead of once no
+  // lease at all remains, so generators reading the version from peers do not hold
+  // the trainer's buffers. Safe only when every generator marks its trainer reads.
+  bool wait_for_trainer_readers_only = 4;
 }
 
 message DeleteWeightVersionShardResponse {
@@ -304,10 +312,30 @@ message VersionLease {
   uint64 expires_at_unix_ms = 4;
 }
 
+// Where a lease's holder reads the version from. UNSPECIFIED counts as a trainer
+// read, so a client that predates this field never has the trainer's buffers freed
+// under its read.
+enum VersionReadSource {
+  VERSION_READ_SOURCE_UNSPECIFIED = 0;
+  VERSION_READ_SOURCE_TRAINER = 1;
+  VERSION_READ_SOURCE_GENERATOR = 2;
+  VERSION_READ_SOURCE_OBJECT_STORAGE = 3;
+}
+
 message RegisterVersionLeaseRequest {
   string version_id = 1;
   string worker_id = 2;
   uint32 ttl_seconds = 3;
+  // A trainer or unspecified read is marked: it
+  // counts against the version's max_trainer_readers and holds the trainer's
+  // buffers while a release waits only for trainer readers. Renewal with the same
+  // source keeps the mark, re-admitting it if the lease lapsed.
+  VersionReadSource read_source = 4;
+  reserved 5;
+  reserved "max_trainer_readers";
+  // Leases sharing a group, such as the workers of one engine, count as one trainer
+  // reader. Empty counts the lease's worker alone.
+  string reader_group = 6;
 }
 
 message RegisterVersionLeaseResponse {

@@ -47,6 +47,14 @@ The selected download worker count must be a positive integer. An invalid
 Azure's per-blob concurrency and connection pool remain controlled by
 `MX_AZURE_DOWNLOAD_CONCURRENCY` and `MX_AZURE_MAX_POOL_CONNECTIONS`.
 
+## Trainer reader caps
+
+A version created with `create_weight_version(max_trainer_readers=N)` lets at most `N` generator reader groups read it from the trainer at once; `0` admits any number. The cap lives on the version, so every generator sees the same limit. Each generator lease records where its holder reads from, and a trainer read over the cap fails its trainer source with `RESOURCE_EXHAUSTED` so the generator can read the version from a peer that already installed it. With `MX_MAX_TENSOR_READERS` bounding readers per peer, updates spread through the fleet instead of every generator sharing the trainer's network.
+
+A trainer with `ModelExpressTrainerConfig.release_after_trainer_reads` releases a shard once no trainer reader remains, so generators reading from peers do not hold its buffers. A lease that names no source, such as one from an older client, counts as a trainer reader, so a mixed fleet stays safe. `release_version(version=..., timeout=...)` waits up to `timeout` seconds for trainer readers and returns False if one remains; without a timeout it waits up to the RPC timeout and raises.
+
+The caps admit or refuse; the integration owns the rest. On the generator side, `stage_weight` fails with `RESOURCE_EXHAUSTED` while every source it may use is full, so the caller retries later. The ranks of one engine count as one reader only when they all pass the same `ModelExpressGeneratorConfig.reader_group`, otherwise each rank counts alone. Each rank is admitted and picks its source on its own, so one rank can stage while another is refused: stage on every rank, apply only if all succeeded, and otherwise release everywhere, or the engine ends up serving mixed versions. On the trainer side, choose how long to wait for trainer readers before publishing into a shard they still read.
+
 ## Collective Refit (NCCL M2N) Environment Variables
 
 Client-side policy for the NCCL M2N collective refit path
