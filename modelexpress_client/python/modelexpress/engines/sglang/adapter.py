@@ -223,7 +223,7 @@ class SglangAdapter(EngineAdapter):
         else:
             loader = RunaiModelStreamerLoader(stream_config)
         loader.target_device_str = str(self.target_device)
-        yield from loader._get_all_weights(stream_model_config, model)
+        return loader._get_all_weights(stream_model_config, model)
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):

@@ -49,6 +49,15 @@ SAFETENSORS_DTYPE_MAP: dict[str, torch.dtype] = {
 }
 
 
+def _torch_dtype(name: str, st_dtype: str) -> torch.dtype:
+    torch_dtype = SAFETENSORS_DTYPE_MAP.get(st_dtype)
+    if torch_dtype is None:
+        raise RuntimeError(
+            f"Unsupported safetensors dtype '{st_dtype}' for tensor '{name}'"
+        )
+    return torch_dtype
+
+
 class MxGdsLoader:
     """
     Load model weights from safetensors files directly to GPU via GDS.
@@ -89,8 +98,10 @@ class MxGdsLoader:
         revision: str | None = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """
-        Yield (tensor_name, gpu_tensor) pairs loaded via GDS.
+        Return an iterator of (tensor_name, gpu_tensor) pairs loaded via GDS.
 
+        Path resolution, GDS setup and header parsing run before this
+        returns, so their errors raise here and not from the iterator.
         Each safetensors file is batch-loaded through a single GDS
         transfer, then its tensors are yielded one by one.
         """
@@ -115,12 +126,21 @@ class MxGdsLoader:
                 for name in tensor_names
                 if name in header_info
             }
+            for name, info in file_tensors.items():
+                _torch_dtype(name, info["dtype"])
             if file_tensors:
                 file_jobs.append((file_path, file_tensors))
 
         if not file_jobs:
-            return
+            return iter(())
+        return self._iter_file_jobs(file_jobs, use_tqdm, load_start)
 
+    def _iter_file_jobs(
+        self,
+        file_jobs: list[tuple[str, dict[str, dict]]],
+        use_tqdm: bool,
+        load_start: float,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         # Prefetch pipeline: load file[i+1] while yielding file[i]
         total_files = len(file_jobs)
         pbar = None
@@ -303,13 +323,7 @@ class MxGdsLoader:
         tensor_meta = []
         for name in sorted_names:
             info = tensor_infos[name]
-            st_dtype = info["dtype"]
-            torch_dtype = SAFETENSORS_DTYPE_MAP.get(st_dtype)
-            if torch_dtype is None:
-                raise RuntimeError(
-                    f"Unsupported safetensors dtype '{st_dtype}' "
-                    f"for tensor '{name}'"
-                )
+            torch_dtype = _torch_dtype(name, info["dtype"])
             tensor_list.append((info["file_offset"], info["size"]))
             tensor_meta.append((name, torch_dtype, info["shape"]))
 

@@ -112,7 +112,7 @@ class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
         model: torch.nn.Module | None = None,
     ) -> Iterator[tuple[str, torch.Tensor]]:
         logger.info(f"[Worker {ctx.global_rank}] Streaming weights from {model_uri}")
-        yield from ctx.adapter.build_model_streamer_weight_iter(
+        return ctx.adapter.build_model_streamer_weight_iter(
             model_uri,
             model=model,
         )
