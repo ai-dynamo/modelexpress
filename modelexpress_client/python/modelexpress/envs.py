@@ -174,6 +174,25 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    """As :func:`_env_int`, for a variable that has to be a positive interval.
+
+    Zero or a negative value would make the loop it paces run with no wait at
+    all, so the documented default is used instead and the warning says which
+    value was ignored.
+    """
+    value = _env_int(name, default)
+    if value <= 0:
+        logger.warning(
+            "Invalid %s=%r; must be a positive integer, using default %d",
+            name,
+            os.environ.get(name),
+            default,
+        )
+        return default
+    return value
+
+
 def _env_float(name: str, default: float) -> float:
     """Parse a float env var, falling back to ``default`` (and warning) on error.
 
@@ -283,7 +302,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
     "MX_WORKER_GRPC_PORT": lambda: _env_int("MX_WORKER_GRPC_PORT", 6555),
     "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
-    "MX_HEARTBEAT_INTERVAL_SECS": lambda: _env_int("MX_HEARTBEAT_INTERVAL_SECS", 30),
+    "MX_HEARTBEAT_INTERVAL_SECS": lambda: _env_positive_int(
+        "MX_HEARTBEAT_INTERVAL_SECS", 30
+    ),
     "MX_P2P_COLD_START": lambda: _env_bool("MX_P2P_COLD_START", False),
     "MX_P2P_COLD_START_WAIT_TIMEOUT_SECS": _cold_start_wait_timeout,
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
