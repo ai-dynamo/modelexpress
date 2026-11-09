@@ -55,6 +55,7 @@ READY_POLL_SECS = 5
 CACHE_SETTLE_SECS = 5
 
 ArtifactEntry = tuple[ArtifactTransfer, p2p_pb2.SourceIdentity]
+ArtifactPublicationKey = tuple[int, int | str]
 InstallCompleted = Callable[[ArtifactTransfer, p2p_pb2.SourceIdentity], None]
 _publish_leases: dict[Path, TextIO] = {}
 
@@ -205,7 +206,7 @@ def schedule_artifact_publish(
     artifact_publish_fn: Callable[
         [ArtifactTransfer, p2p_pb2.SourceIdentity], PublicationHandle
     ],
-    scheduled_publishers: dict[tuple[int, int], PublisherThread],
+    scheduled_publishers: dict[ArtifactPublicationKey, PublisherThread],
     log: logging.Logger = logger,
 ) -> None:
     """Schedule readiness-gated publication of local cache artifacts."""
@@ -235,7 +236,7 @@ def schedule_artifact_publish(
         if marker_path is None:
             continue
 
-        key = (ctx.device_id, transfer.mx_source_type)
+        key = _artifact_publication_key(ctx, transfer, identity)
         previous = scheduled_publishers.pop(key, None)
         if previous is not None:
             previous.stop()
@@ -329,7 +330,7 @@ def publish_artifact(
     *,
     engine_label: str,
     accelerator: str,
-    published_sources: dict[tuple[int, int], PublicationHandle],
+    published_sources: dict[ArtifactPublicationKey, PublicationHandle],
     log: logging.Logger = logger,
 ) -> PublicationHandle:
     """Prepare and publish one artifact through the selected transport."""
@@ -360,7 +361,7 @@ def publish_artifact(
     transport.check_publishable()
     start = time.perf_counter()
     bundle = transfer.prepare_source()
-    key = (ctx.device_id, transfer.mx_source_type)
+    key = _artifact_publication_key(ctx, transfer, identity)
     previous = published_sources.pop(key, None)
     if previous is not None:
         previous.stop()
@@ -390,6 +391,14 @@ def publish_artifact(
         elapsed,
     )
     return published
+
+
+def _artifact_publication_key(
+    ctx: LoadContext, transfer: ArtifactTransfer, identity: p2p_pb2.SourceIdentity
+) -> ArtifactPublicationKey:
+    if transfer.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_FRAMEWORK_CACHE:
+        return ctx.device_id, compute_mx_source_id(identity)
+    return ctx.device_id, transfer.mx_source_type
 
 
 def artifact_ready_fn(

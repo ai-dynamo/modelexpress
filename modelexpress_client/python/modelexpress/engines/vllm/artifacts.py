@@ -28,6 +28,7 @@ from ...metadata.artifact_transfer import (
     torch_compile_cache_artifact_transfer,
 )
 from ...metadata.artifact_transport import PublicationHandle
+from ...metadata.framework_cache import framework_cache_entries
 from ...metadata.publisher import PublisherThread
 
 logger = logging.getLogger("modelexpress.engines.vllm.artifacts")
@@ -35,8 +36,8 @@ logger = logging.getLogger("modelexpress.engines.vllm.artifacts")
 _DEFAULT_READY_URL = "http://127.0.0.1:8000/health"
 _CACHE_SETTLE_SECS = _artifact_lifecycle.CACHE_SETTLE_SECS
 
-_published_sources: dict[tuple[int, int], PublicationHandle] = {}
-_scheduled_publishers: dict[tuple[int, int], PublisherThread] = {}
+_published_sources: dict[_artifact_lifecycle.ArtifactPublicationKey, PublicationHandle] = {}
+_scheduled_publishers: dict[_artifact_lifecycle.ArtifactPublicationKey, PublisherThread] = {}
 # torch.compile cache directories created by an install, keyed by device id.
 # Values are POSIX-style paths relative to the torch.compile cache root, at every
 # depth. Compared against the directory vLLM actually selects once the engine is
@@ -363,7 +364,7 @@ def _vllm_artifact_transfers(
             ),
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE),
         ),
-    ]
+    ] + framework_cache_entries(ctx, bundle_root)
 
 
 def _torch_compile_cache_root() -> Path:

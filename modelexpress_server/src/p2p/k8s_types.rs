@@ -55,6 +55,7 @@ impl ModelMetadataSpec {
             Ok(MxSourceType::CuteDslCache) => "cute_dsl_cache",
             Ok(MxSourceType::FlashinferCache) => "flashinfer_cache",
             Ok(MxSourceType::TvmFfiCache) => "tvm_ffi_cache",
+            Ok(MxSourceType::FrameworkCache) => "framework_cache",
             Err(_) => "unknown",
         }
         .to_string()
@@ -345,6 +346,10 @@ mod tests {
 
     #[test]
     fn test_source_type_name_from_proto() {
+        assert_eq!(
+            ModelMetadataSpec::source_type_name_from_proto(10),
+            "framework_cache"
+        );
         assert_eq!(ModelMetadataSpec::source_type_name_from_proto(0), "weights");
         assert_eq!(
             ModelMetadataSpec::source_type_name_from_proto(3),

@@ -29,6 +29,7 @@ from ...metadata.artifact_transfer import (
     torch_compile_cache_artifact_transfer,
 )
 from ...metadata.artifact_transport import PublicationHandle
+from ...metadata.framework_cache import framework_cache_entries
 from ...metadata.publisher import PublisherThread
 
 logger = logging.getLogger("modelexpress.engines.sglang.artifacts")
@@ -161,7 +162,7 @@ def _sglang_artifact_transfers(
             ),
             _artifact_identity(ctx, p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE),
         ),
-    ]
+    ] + framework_cache_entries(ctx, bundle_root)
 
 
 def _torch_compile_cache_root() -> Path:

@@ -91,21 +91,25 @@ const (
 	MxSourceType_MX_SOURCE_TYPE_CUTE_DSL_CACHE      MxSourceType = 7 // CuTe DSL compiled kernel cache files
 	MxSourceType_MX_SOURCE_TYPE_FLASHINFER_CACHE    MxSourceType = 8 // FlashInfer JIT workspace cache files
 	MxSourceType_MX_SOURCE_TYPE_TVM_FFI_CACHE       MxSourceType = 9 // TVM-FFI compiled SGLang kernel modules
+	// Framework-owned file caches. SourceIdentity.extra_parameters identifies
+	// the cache name and format; no new enum value is needed for each cache.
+	MxSourceType_MX_SOURCE_TYPE_FRAMEWORK_CACHE MxSourceType = 10
 )
 
 // Enum value maps for MxSourceType.
 var (
 	MxSourceType_name = map[int32]string{
-		0: "MX_SOURCE_TYPE_WEIGHTS",
-		1: "MX_SOURCE_TYPE_LORA",
-		2: "MX_SOURCE_TYPE_CUDA_GRAPH",
-		3: "MX_SOURCE_TYPE_TORCH_COMPILE_CACHE",
-		4: "MX_SOURCE_TYPE_TRITON_CACHE",
-		5: "MX_SOURCE_TYPE_DEEP_GEMM_CACHE",
-		6: "MX_SOURCE_TYPE_TILELANG_CACHE",
-		7: "MX_SOURCE_TYPE_CUTE_DSL_CACHE",
-		8: "MX_SOURCE_TYPE_FLASHINFER_CACHE",
-		9: "MX_SOURCE_TYPE_TVM_FFI_CACHE",
+		0:  "MX_SOURCE_TYPE_WEIGHTS",
+		1:  "MX_SOURCE_TYPE_LORA",
+		2:  "MX_SOURCE_TYPE_CUDA_GRAPH",
+		3:  "MX_SOURCE_TYPE_TORCH_COMPILE_CACHE",
+		4:  "MX_SOURCE_TYPE_TRITON_CACHE",
+		5:  "MX_SOURCE_TYPE_DEEP_GEMM_CACHE",
+		6:  "MX_SOURCE_TYPE_TILELANG_CACHE",
+		7:  "MX_SOURCE_TYPE_CUTE_DSL_CACHE",
+		8:  "MX_SOURCE_TYPE_FLASHINFER_CACHE",
+		9:  "MX_SOURCE_TYPE_TVM_FFI_CACHE",
+		10: "MX_SOURCE_TYPE_FRAMEWORK_CACHE",
 	}
 	MxSourceType_value = map[string]int32{
 		"MX_SOURCE_TYPE_WEIGHTS":             0,
@@ -118,6 +122,7 @@ var (
 		"MX_SOURCE_TYPE_CUTE_DSL_CACHE":      7,
 		"MX_SOURCE_TYPE_FLASHINFER_CACHE":    8,
 		"MX_SOURCE_TYPE_TVM_FFI_CACHE":       9,
+		"MX_SOURCE_TYPE_FRAMEWORK_CACHE":     10,
 	}
 )
 
@@ -279,7 +284,12 @@ type SourceIdentity struct {
 	Dtype string `protobuf:"bytes,8,opt,name=dtype,proto3" json:"dtype,omitempty"`
 	// Quantization method (e.g., "fp8", "awq", "gptq", or empty)
 	Quantization string `protobuf:"bytes,9,opt,name=quantization,proto3" json:"quantization,omitempty"`
-	// Escape hatch for framework-specific config
+	// Escape hatch for framework-specific config. FRAMEWORK_CACHE sources require
+	// framework_cache_name and framework_cache_schema here, plus a non-UNKNOWN
+	// backend_framework, backend_framework_version, and compile_config_digest.
+	// These existing hash fields keep new cache kinds compatible with older
+	// coordinators that preserve unknown enum values. Local install paths are
+	// resolved by the receiving framework and are not part of source identity.
 	ExtraParameters map[string]string `protobuf:"bytes,10,rep,name=extra_parameters,json=extraParameters,proto3" json:"extra_parameters,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Content-addressed revision of the model weights (e.g., HuggingFace
 	// commit SHA, S3 object version, or any deployer-provided version
@@ -3364,7 +3374,7 @@ const file_p2p_proto_rawDesc = "" +
 	"\x19BACKEND_FRAMEWORK_UNKNOWN\x10\x00\x12\x1a\n" +
 	"\x16BACKEND_FRAMEWORK_VLLM\x10\x01\x12\x1c\n" +
 	"\x18BACKEND_FRAMEWORK_SGLANG\x10\x02\x12\x1d\n" +
-	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\xdc\x02\n" +
+	"\x19BACKEND_FRAMEWORK_TRT_LLM\x10\x03*\x80\x03\n" +
 	"\fMxSourceType\x12\x1a\n" +
 	"\x16MX_SOURCE_TYPE_WEIGHTS\x10\x00\x12\x17\n" +
 	"\x13MX_SOURCE_TYPE_LORA\x10\x01\x12\x1d\n" +
@@ -3375,7 +3385,9 @@ const file_p2p_proto_rawDesc = "" +
 	"\x1dMX_SOURCE_TYPE_TILELANG_CACHE\x10\x06\x12!\n" +
 	"\x1dMX_SOURCE_TYPE_CUTE_DSL_CACHE\x10\a\x12#\n" +
 	"\x1fMX_SOURCE_TYPE_FLASHINFER_CACHE\x10\b\x12 \n" +
-	"\x1cMX_SOURCE_TYPE_TVM_FFI_CACHE\x10\t*{\n" +
+	"\x1cMX_SOURCE_TYPE_TVM_FFI_CACHE\x10\t\x12\"\n" +
+	"\x1eMX_SOURCE_TYPE_FRAMEWORK_CACHE\x10\n" +
+	"*{\n" +
 	"\fSourceStatus\x12\x19\n" +
 	"\x15SOURCE_STATUS_UNKNOWN\x10\x00\x12\x1e\n" +
 	"\x1aSOURCE_STATUS_INITIALIZING\x10\x01\x12\x17\n" +

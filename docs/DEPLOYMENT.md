@@ -868,7 +868,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_METADATA_PORT` | `5555` | Base NIXL listen port; effective port is `MX_METADATA_PORT + device_id` |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
-| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. The SGLang NIXL loader uses the same artifact lifecycle for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. |
+| `MX_ARTIFACT_TRANSFER` | `0` | Opt in to cache artifact transfer. The vLLM loader uses it for torch compile, Triton, DeepGEMM, TileLang, CuTe DSL, and FlashInfer JIT caches, including persistent autotune files when supported by vLLM. Supported vLLM releases also transfer startup plans when `VLLM_ENABLE_STARTUP_PLAN=1`. The SGLang NIXL loader uses the same artifact lifecycle for compatible torch compile, Triton, TVM-FFI, DeepGEMM, TileLang, CuTe DSL, and FlashInfer caches. |
 | `MX_ARTIFACT_BACKEND` | `nixl` | Select exactly one artifact backend: `nixl` or `mooncake`. There is no fallback. |
 | `MX_ARTIFACT_TRANSFER_CHUNK_SIZE` | `67108864` | Artifact transfer chunk size in bytes. Default is 64 MiB; maximum is 4 GiB. Larger values reduce manifest/RPC overhead but increase registered DRAM buffer memory, approximately `chunk_size * max_inflight_chunks` per source and target worker. |
 | `MX_ARTIFACT_BUNDLE_ROOT` | `$TMPDIR/modelexpress-artifacts` | Staging root for tarred cache artifact bundles. |
@@ -973,6 +973,50 @@ exercised against a real engine.
 ### Collective Refit (NCCL M2N) Environment Variables
 
 The collective refit environment variables are documented in the [RL configuration guide](rl/CONFIGURATION.md#collective-refit-nccl-m2n-environment-variables).
+
+### vLLM startup plans
+
+With `VLLM_ENABLE_STARTUP_PLAN=1`, vLLM saves each rank's memory-profiling
+result (the KV-cache size and the free memory it was measured against) under
+`VLLM_CACHE_ROOT/startup_plan/` and later boots apply it, skipping memory
+profiling and the CUDA-graph memory estimation pass. Enable both
+`MX_ARTIFACT_TRANSFER=1` and `VLLM_ENABLE_STARTUP_PLAN=1` on source and target
+to share those plans as a `startup_plan` framework cache. The existing artifact
+backend and readiness settings apply.
+
+ModelExpress detects the installed `vllm.v1.worker.startup_plan` module rather
+than assuming a release number implies support. Schema `1` with the native
+fingerprint, path, save and apply functions is supported. A missing or
+incompatible API skips only this cache with a warning. ModelExpress does not
+enable startup plans itself and skips this cache when `kv_cache_memory_bytes` is
+set explicitly, since vLLM then never reads a plan.
+
+The compatibility key is computed on the main model's adapter before model
+initialization. It combines vLLM's native fingerprint with the exact vLLM
+version, the cache, model and scheduler configuration, worker and backend
+choices, native compile-environment factors, the node rank and the local GPU
+type. Speculative decoding adds its control settings and the draft model and
+parallel hashes. Model credentials and local model or tokenizer locations are
+excluded. The key therefore also partitions settings the native fingerprint
+omits, such as `gpu_memory_utilization`, so a fetched plan always comes from
+the same settings. Speculative draft loads never register this cache.
+
+A target installs fetched plans into its own `VLLM_CACHE_ROOT/startup_plan/`,
+which may differ from the source's path, and keeps plans already there. vLLM
+then applies a plan only if its rank fingerprint matches and enough device
+memory is free; otherwise it profiles normally. A successful artifact install
+does not prove a plan was applied: look for vLLM's
+`Applying persisted startup plan` message.
+
+A source publishes after readiness. It computes its ranks' native fingerprints
+then, because model construction can change them, and publishes only the plan
+files with those names that the current boot saved. Plans left by earlier boots,
+which may come from settings the native fingerprint does not distinguish, are
+not published. A boot that applied an installed plan saves none and publishes
+nothing for this cache.
+
+Plan reuse skips memory profiling and CUDA-graph memory estimation; CUDA graph
+capture and kernel warmup still run.
 
 ### NIXL Backend Selection
 

@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
@@ -160,7 +161,13 @@ class ArtifactTransfer(Protocol):
 
 @dataclass(frozen=True)
 class TarredArtifactTransfer(ArtifactTransfer):
-    """Tar-backed artifact used by all transport backends."""
+    """Tar-backed artifact used by all transport backends.
+
+    ``include``, when set, selects the files packaged from every source root.
+    It receives each file's POSIX path relative to its root. The primary root
+    must then contribute at least one file, so an artifact is never published
+    without the files that make it useful.
+    """
 
     name: str
     mx_source_type: int
@@ -168,6 +175,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
     bundle_root: Path
     chunk_size: int | None = None
     tar_name: str = "artifact.tar"
+    include: Callable[[str], bool] | None = None
 
     def prepare_source(self) -> ArtifactBundle:
         """Tar the source directories into bundle_root and build their manifest."""
@@ -215,7 +223,15 @@ class TarredArtifactTransfer(ArtifactTransfer):
                 with tarfile.open(tar_path, "w"):
                     pass
                 continue
-            entries, skipped = _tar_source_entries(resolved_source)
+            entries, skipped = _tar_source_entries(resolved_source, self.include)
+            if (
+                self.include is not None
+                and tar_name == self.tar_name
+                and not _has_file_entries(entries)
+            ):
+                raise LookupError(
+                    f"artifact {self.name} selected no files under {resolved_source}"
+                )
             _log_skipped_entries(tar_name, skipped)
             _write_tar_from_entries(tar_path, resolved_source, entries)
 
@@ -1009,7 +1025,10 @@ class _SkippedEntry:
     detail: str
 
 
-def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
+def _tar_source_entries(
+    source_root: Path,
+    include: Callable[[str], bool] | None = None,
+) -> tuple[bytes, list[_SkippedEntry]]:
     """Enumerate the archive members under source_root for tar --null -T.
 
     Only regular files and directories are listed, which keeps the
@@ -1020,12 +1039,17 @@ def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
     caches this packs they are derived state that the engine rebuilds. Both
     this walk and tar stop at a symlinked directory, so dropping one costs the
     link entry alone, never a subtree tar would otherwise have archived.
+
+    With ``include``, only the root directory and the selected files are
+    listed; extraction recreates the parent directories of selected files.
+    Files that ``include`` rejects are not reported as skipped.
     """
     names: list[str] = []
     skipped: list[_SkippedEntry] = []
     for dirpath, dirnames, filenames in os.walk(source_root, followlinks=False):
         directory = Path(dirpath)
-        names.append(_tar_member_name(directory, source_root))
+        if include is None or directory == source_root:
+            names.append(_tar_member_name(directory, source_root))
         kept: list[str] = []
         for name in sorted(dirnames):
             path = directory / name
@@ -1036,11 +1060,20 @@ def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
         dirnames[:] = kept
         for name in sorted(filenames):
             path = directory / name
+            if include is not None and not include(
+                path.relative_to(source_root).as_posix()
+            ):
+                continue
             if path.is_symlink() or not path.is_file():
                 skipped.append(_classify_skipped_entry(path, source_root))
                 continue
             names.append(_tar_member_name(path, source_root))
     return b"\0".join(name.encode() for name in names) + b"\0", skipped
+
+
+def _has_file_entries(entries: bytes) -> bool:
+    # The root directory is always the first member and is listed as "./".
+    return any(name and name != b"./" for name in entries.split(b"\0"))
 
 
 def _tar_member_name(path: Path, source_root: Path) -> str:
