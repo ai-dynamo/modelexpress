@@ -14,6 +14,7 @@ from modelexpress.tensor_utils import (
     adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
+    host_resident_parameters,
     safe_checksum,
     storage_view,
 )
@@ -306,6 +307,30 @@ class TestStorageView:
         view = base.T  # non-contiguous
         sv = storage_view(view)
         assert sv.numel() == base.numel() * base.element_size()
+
+
+# ---------------------------------------------------------------------------
+# host_resident_parameters
+# ---------------------------------------------------------------------------
+
+
+class TestHostResidentParameters:
+    def test_lists_non_empty_parameters_outside_accelerator(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_accel = nn.Parameter(torch.empty(4, device="meta"))
+        model.on_host = nn.Parameter(torch.empty(4))
+        model.empty_on_host = nn.Parameter(torch.empty(0))
+        model.register_buffer("host_buffer", torch.empty(4))
+        assert host_resident_parameters(model, backend) == ["on_host"]
+
+    def test_empty_when_all_parameters_on_accelerator(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        assert host_resident_parameters(nn.Linear(4, 4), backend) == []
 
 
 # ---------------------------------------------------------------------------

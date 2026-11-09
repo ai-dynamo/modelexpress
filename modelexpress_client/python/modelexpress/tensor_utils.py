@@ -327,6 +327,24 @@ def iter_module_tensors(
     return results
 
 
+def host_resident_parameters(
+    module: nn.Module,
+    accelerator_backend: AcceleratorBackend | None = None,
+) -> list[str]:
+    """Return names of non-empty parameters outside accelerator memory.
+
+    RDMA discovers and transfers accelerator tensors only, so a target keeps
+    its initial values for these (e.g. DeepSeek V4.1 Engram tables in pinned
+    host memory).
+    """
+    backend = _resolve_accelerator_backend(accelerator_backend)
+    return [
+        name
+        for name, param in module.named_parameters()
+        if param.numel() > 0 and not backend.is_accel_tensor(param)
+    ]
+
+
 def storage_view(tensor: torch.Tensor) -> torch.Tensor:
     """Return a flat contiguous uint8 view of a tensor's underlying storage.
 
