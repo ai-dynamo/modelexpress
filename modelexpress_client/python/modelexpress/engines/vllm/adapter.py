@@ -34,6 +34,10 @@ _VLLM_PRE_RDMA_FINALIZER_NAMES = (
     # discovery and RDMA registration so the target exposes the same regions
     # that the source published.
     "finalize_mega_moe_weights",
+    # DeepSeek V4.1 permutes wq_b rows and wo_a columns (and their scales)
+    # for FlashMLA mega attention. Native load_weights() runs it before quant
+    # post-processing; the later model-level post-load hook is then a no-op.
+    "finalize_mega_attn_weights",
 )
 
 _VLLM_POST_RDMA_FINALIZER_NAMES = (
