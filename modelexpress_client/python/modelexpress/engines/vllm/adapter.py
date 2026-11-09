@@ -406,7 +406,6 @@ class VllmAdapter(EngineAdapter):
         result = self._finalize_model_specific_weights(
             result, _VLLM_PRE_RDMA_FINALIZER_NAMES
         )
-        result = self._finalize_online_quantization(result)
         return self._process_weights_after_loading(result)
 
     def after_rdma_receive(self, result: LoadResult) -> LoadResult:
@@ -543,11 +542,11 @@ class VllmAdapter(EngineAdapter):
         return result
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
-        result = self._finalize_online_quantization(result)
+        self._release_loader_cache()
         return self._process_weights_after_loading(result)
 
     def after_native_load(self, result: LoadResult) -> LoadResult:
-        result = self._finalize_online_quantization(result)
+        self._release_loader_cache()
         return self._process_weights_after_loading(result)
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
@@ -583,12 +582,25 @@ class VllmAdapter(EngineAdapter):
         self,
         result: LoadResult,
     ) -> LoadResult:
+        """Run the post-load steps of vLLM's ``BaseModelLoader.load_model``.
+
+        ModelExpress loads through the standalone ``load_weights`` API, so it
+        also runs the layerwise finalizer that native loading applies to online
+        quantized models. Without it, post-load processing can receive Meta
+        tensors.
+        """
         if result.model is None:
             raise RuntimeError("vLLM post-load processing requires result.model")
 
+        from vllm.model_executor.model_loader.base_loader import _has_online_quant
+        from vllm.model_executor.model_loader.reload import (
+            finalize_layerwise_processing,
+        )
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
         with capture_tensor_attrs(self.accelerator_backend):
+            if _has_online_quant(result.model):
+                finalize_layerwise_processing(result.model, self.model_config)
             process_weights_after_loading(
                 result.model,
                 self.model_config,
@@ -596,31 +608,15 @@ class VllmAdapter(EngineAdapter):
             )
         return result
 
-    def _finalize_online_quantization(self, result: LoadResult) -> LoadResult:
-        """Match vLLM's native loader lifecycle for online quantized weights.
+    def _release_loader_cache(self) -> None:
+        """Release allocator blocks cached by checkpoint loading.
 
-        vLLM's ``BaseModelLoader.load_model`` finalizes layerwise loading before
-        ``process_weights_after_loading`` when a quant method uses meta-device
-        parameters. ModelExpress loads through ``load_weights`` so it must run
-        this step explicitly; otherwise post-load quantization can receive
-        unmaterialized Meta tensors.
+        Native vLLM does this between ``load_weights`` and post-processing.
+        RDMA target preparation skips it and releases the cache only after a
+        successful receive.
         """
-        if result.model is None:
-            raise RuntimeError("vLLM layerwise finalization requires result.model")
-
-        if not any(
-            getattr(getattr(module, "quant_method", None), "uses_meta_device", False)
-            for module in result.model.modules()
-        ):
-            return result
-
-        from vllm.model_executor.model_loader.reload import (
-            finalize_layerwise_processing,
-        )
-
-        with capture_tensor_attrs(self.accelerator_backend):
-            finalize_layerwise_processing(result.model, self.model_config)
-        return result
+        gc.collect()
+        self.accelerator_backend.empty_cache()
 
     def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
         if result.model is None:
