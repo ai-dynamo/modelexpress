@@ -179,7 +179,7 @@ def _install_artifact_via_transports(
         context = _artifact_transport_context(ctx)
         try:
             staged = transport.fetch(transfer, identity, context)
-            transfer.install(staged.header)
+            installed = transfer.install(staged.header)
             _write_artifact_install_state(
                 marker_path,
                 ArtifactInstallState(
@@ -187,6 +187,7 @@ def _install_artifact_via_transports(
                     artifact_id=staged.header.artifact_id,
                 ),
             )
+            record_install_receipt(transfer, identity, installed)
             if on_install_completed is not None:
                 on_install_completed(transfer, identity)
             return staged.header, staged.transport
@@ -303,8 +304,9 @@ def install_artifact_once(
                 node_rank=ctx.node_rank,
                 accelerator=ctx.accelerator_backend.name,
             )
-            transfer.install(header)
+            installed = transfer.install(header)
             _write_artifact_install_marker(marker_path, header.artifact_id)
+            record_install_receipt(transfer, identity, installed)
             if on_install_completed is not None:
                 on_install_completed(transfer, identity)
             return header
@@ -579,6 +581,71 @@ def artifact_marker_path(
         f"{action}-{transfer.name}-"
         f"{artifact_marker_key(transfer, identity, action)}.done"
     )
+
+
+def install_receipt_path(
+    transfer: ArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+) -> Path:
+    """Return where the files installed for an artifact identity are recorded."""
+    return artifact_marker_path(transfer, identity, "install-receipt")
+
+
+def record_install_receipt(
+    transfer: ArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+    installed: list[str] | None,
+) -> None:
+    """Record digests of installed files so that a filtered transfer relays them.
+
+    A transfer with an ``include`` filter publishes only selected files; the
+    receipt lets a NIXL node also republish what it installed for the same
+    identity. Transfers without a filter publish their whole root and need no
+    receipt. Installation has already succeeded, so failures are only logged.
+    """
+    if getattr(transfer, "include", None) is None or not installed:
+        return
+    root = transfer.roots[0].target_root
+    try:
+        digests = {}
+        for name in installed:
+            digest = file_digest(root / name)
+            if digest is not None:
+                digests[name] = digest
+        _write_marker_atomically(
+            install_receipt_path(transfer, identity),
+            json.dumps(digests, sort_keys=True),
+        )
+    except OSError as exc:
+        logger.warning(
+            "Could not record the install receipt for artifact %s; this node "
+            "will not relay its installed files: %s",
+            transfer.name,
+            exc,
+        )
+
+
+def read_install_receipt(path: Path) -> dict[str, str]:
+    """Return the installed file digests recorded at ``path``, or none."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        name: digest
+        for name, digest in value.items()
+        if isinstance(name, str) and isinstance(digest, str)
+    }
+
+
+def file_digest(path: Path) -> str | None:
+    """Return the SHA-256 of a file's content, or None if it cannot be read."""
+    try:
+        return sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def _read_artifact_install_state(marker_path: Path) -> ArtifactInstallState:

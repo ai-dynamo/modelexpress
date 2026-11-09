@@ -18,7 +18,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .. import envs, p2p_pb2
@@ -43,10 +43,13 @@ class FrameworkCacheArtifact:
     must cover every setting that makes the cache content invalid elsewhere.
     Local paths are placement policy and never enter the identity.
 
-    ``include`` optionally selects which files under the root are published.
-    It receives each file's POSIX path relative to the root and is evaluated
-    when the bundle is prepared, after the engine has finished starting.
-    Installation always extracts into ``root`` and keeps unrelated files.
+    ``include`` optionally selects which locally produced files under the root
+    are published. It receives each file's POSIX path relative to the root and
+    is evaluated when the bundle is prepared, after the engine has finished
+    starting. Files installed for the same identity are published as well
+    while their content is unchanged, so NIXL peers relay them like any other
+    cache. Without ``include`` the whole root is published. Installation
+    always extracts into ``root`` and keeps unrelated files.
     """
 
     name: str
@@ -97,8 +100,12 @@ class FrameworkCacheArtifact:
                 bundle_root / "framework_caches" / self.name
                 / compute_mx_source_id(identity)
             ),
-            include=self.include,
         )
+        if self.include is not None:
+            transfer = replace(
+                transfer,
+                include=_SelectedOrInstalled(self.include, transfer, identity),
+            )
         return transfer, identity
 
 
@@ -108,6 +115,53 @@ def framework_cache_entries(
     """Return artifact entries for the caches the engine adapter registered."""
     caches = getattr(getattr(ctx, "adapter", None), "framework_cache_artifacts", ())
     return [cache.entry(ctx.identity.model_name, bundle_root) for cache in caches]
+
+
+class _SelectedOrInstalled:
+    """Publish files the engine selects plus files installed for this identity.
+
+    The artifact lifecycle records an install receipt for filtered transfers.
+    Files listed there are relayed while their content is unchanged, so NIXL
+    peers republish what they fetched like any other cache. The receipt is
+    parsed again only when it changes.
+    """
+
+    def __init__(
+        self,
+        include: Callable[[str], bool],
+        transfer: ArtifactTransfer,
+        identity: p2p_pb2.SourceIdentity,
+    ) -> None:
+        self._include = include
+        self._transfer = transfer
+        self._identity = identity
+        self._receipt: Path | None = None
+        self._installed: tuple[int, dict[str, str]] | None = None
+
+    def __call__(self, relative_path: str) -> bool:
+        # Imported lazily: the lifecycle module pulls in engine-facing loading
+        # code that cache descriptors do not otherwise need.
+        from .artifact_lifecycle import file_digest
+
+        expected = self._installed_files().get(relative_path)
+        if expected is not None:
+            root = self._transfer.roots[0].target_root
+            if file_digest(root / relative_path) == expected:
+                return True
+        return self._include(relative_path)
+
+    def _installed_files(self) -> dict[str, str]:
+        from .artifact_lifecycle import install_receipt_path, read_install_receipt
+
+        if self._receipt is None:
+            self._receipt = install_receipt_path(self._transfer, self._identity)
+        try:
+            version = self._receipt.stat().st_mtime_ns
+        except OSError:
+            return {}
+        if self._installed is None or self._installed[0] != version:
+            self._installed = (version, read_install_receipt(self._receipt))
+        return self._installed[1]
 
 
 def _compile_config_digest(compatibility_key: str) -> str:

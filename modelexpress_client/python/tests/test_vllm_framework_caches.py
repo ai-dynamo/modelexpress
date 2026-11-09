@@ -22,8 +22,15 @@ import torch
 from modelexpress import p2p_pb2
 from modelexpress.engines.vllm import adapter as adapter_module
 from modelexpress.engines.vllm import framework_caches
+from modelexpress.metadata import artifact_lifecycle
 from modelexpress.metadata.framework_cache import framework_cache_entries
+from modelexpress.metadata.publisher import PublicationNotNeeded
 from modelexpress.metadata.source_id import compute_mx_source_id
+
+
+@pytest.fixture(autouse=True)
+def receipt_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(artifact_lifecycle, "artifact_lock_root", lambda: tmp_path / "markers")
 
 
 @pytest.fixture
@@ -185,13 +192,15 @@ def _archived_files(bundle) -> list[str]:
         return sorted(Path(member.name).name for member in archive.getmembers() if member.isfile())
 
 
-def _install(transfer, bundle) -> None:
+def _install(entry, bundle) -> None:
+    """Install as the artifact lifecycle does, including the install receipt."""
+    transfer, identity = entry
     (staged,) = transfer.target_file_paths()
     staged.write_bytes(bundle.tar_path.read_bytes())
     received = p2p_pb2.ArtifactManifestFile()
     received.CopyFrom(bundle.manifest.files[0])
     received.path = str(staged)
-    transfer.install(
+    installed = transfer.install(
         p2p_pb2.GetArtifactManifestHeaderResponse(
             artifact_id=bundle.artifact_id,
             mx_source_type=transfer.mx_source_type,
@@ -199,6 +208,7 @@ def _install(transfer, bundle) -> None:
             total_size=received.size,
         )
     )
+    artifact_lifecycle.record_install_receipt(transfer, identity, installed)
 
 
 def test_startup_plan_uses_native_directory_and_framework_identity(native, tmp_path):
@@ -236,13 +246,48 @@ def test_round_trip_installs_plans_that_native_apply_uses(native, tmp_path):
     native.stage["value"] = "preinit"
     (target,) = framework_caches.build_framework_cache_artifacts(native.config)
     receiver, receiver_identity = target.entry("model", tmp_path / "receiver-bundle")
-    _install(receiver, bundle)
+    _install((receiver, receiver_identity), bundle)
     native.stage["value"] = "postinit"
     workers = [_worker(copy.deepcopy(native.config), rank) for rank in (0, 1)]
     for worker in workers:
         native.plan.maybe_apply_startup_plan(worker)
 
     assert compute_mx_source_id(sender_identity) == compute_mx_source_id(receiver_identity)
+    assert [worker.cache_config.kv_cache_memory_bytes for worker in workers] == [900, 800]
+
+
+def test_installed_plans_are_relayed_to_the_next_peer(native, tmp_path):
+    (source,) = framework_caches.build_framework_cache_artifacts(native.config)
+    native.stage["value"] = "postinit"
+    for rank, size in ((0, 900), (1, 800)):
+        native.plan.maybe_save_startup_plan(_worker(native.config, rank), size)
+    bundle = source.entry("model", tmp_path / "source-bundle")[0].prepare_source()
+
+    # A peer installs and applies the plans, so its boot saves none.
+    native.runtime.VLLM_CACHE_ROOT = str(tmp_path / "peer")
+    native.stage["value"] = "preinit"
+    (peer,) = framework_caches.build_framework_cache_artifacts(native.config)
+    _install(peer.entry("model", tmp_path / "peer-install"), bundle)
+    # Installed files keep the source's older modification times.
+    old = time.time() - 3600
+    for plan_file in (tmp_path / "peer" / "startup_plan").iterdir():
+        os.utime(plan_file, (old, old))
+    native.stage["value"] = "postinit"
+    relay = peer.entry("model", tmp_path / "peer-publish")[0].prepare_source()
+
+    # A third host starts from the peer's publication.
+    native.runtime.VLLM_CACHE_ROOT = str(tmp_path / "third")
+    native.stage["value"] = "preinit"
+    (third,) = framework_caches.build_framework_cache_artifacts(native.config)
+    _install(third.entry("model", tmp_path / "third-install"), relay)
+    native.stage["value"] = "postinit"
+    workers = [_worker(copy.deepcopy(native.config), rank) for rank in (0, 1)]
+    for worker in workers:
+        native.plan.maybe_apply_startup_plan(worker)
+
+    assert _archived_files(relay) == [
+        "startup_plan_postinit-r0-of2.json", "startup_plan_postinit-r1-of2.json",
+    ]
     assert [worker.cache_config.kv_cache_memory_bytes for worker in workers] == [900, 800]
 
 
@@ -280,7 +325,7 @@ def test_boot_without_saved_plans_publishes_nothing(native, tmp_path):
     (_plan_dir(native) / "startup_plan_unrelated.json").write_text("{}")
     transfer, _ = cache.entry("model", tmp_path / "bundle")
 
-    with pytest.raises(LookupError):
+    with pytest.raises(PublicationNotNeeded):
         transfer.prepare_source()
 
 

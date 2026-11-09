@@ -40,7 +40,7 @@ from .artifact_manifest import (
     build_artifact_manifest,
 )
 from .payload import accelerators_compatible
-from .publisher import PublisherThread
+from .publisher import PublicationNotNeeded, PublisherThread
 from .publish import _get_worker_host, _publish_metadata_to_server
 from .worker_server import (
     WorkerGrpcServer,
@@ -152,8 +152,12 @@ class ArtifactTransfer(Protocol):
     def install(
         self,
         header: p2p_pb2.GetArtifactManifestHeaderResponse,
-    ) -> None:
-        """Install a transferred artifact into the target root."""
+    ) -> list[str] | None:
+        """Install a transferred artifact into the target root.
+
+        Return the files installed into the primary root, relative to it,
+        when the transfer knows them.
+        """
 
     def target_file_paths(self) -> list[Path]:
         """Return local staging paths used by file-oriented transports."""
@@ -165,8 +169,8 @@ class TarredArtifactTransfer(ArtifactTransfer):
 
     ``include``, when set, selects the files packaged from every source root.
     It receives each file's POSIX path relative to its root. The primary root
-    must then contribute at least one file, so an artifact is never published
-    without the files that make it useful.
+    must then contribute at least one file. Otherwise preparation raises
+    ``PublicationNotNeeded``, which ends publication without retrying.
     """
 
     name: str
@@ -229,7 +233,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
                 and tar_name == self.tar_name
                 and not _has_file_entries(entries)
             ):
-                raise LookupError(
+                raise PublicationNotNeeded(
                     f"artifact {self.name} selected no files under {resolved_source}"
                 )
             _log_skipped_entries(tar_name, skipped)
@@ -264,7 +268,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
     def install(
         self,
         header: p2p_pb2.GetArtifactManifestHeaderResponse,
-    ) -> None:
+    ) -> list[str]:
         start = time.perf_counter()
         root_archives = self._root_archives()
         self._validate_archive_names(root_archives)
@@ -279,6 +283,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
                 f"{sorted(files_by_name)} != {sorted(expected_names)}"
             )
         installed_targets = []
+        installed_files: list[str] = []
         validate_total = 0.0
         extract_total = 0.0
         for tar_name, root in root_archives:
@@ -292,7 +297,9 @@ class TarredArtifactTransfer(ArtifactTransfer):
             # the target filesystem. One number could not say which is slow.
             step_start = time.perf_counter()
             with install_metrics.time_artifact_install_step(self.name, root.name, "validate"):
-                _validate_tar_members(tar_file)
+                members = _validate_tar_members(tar_file)
+            if tar_name == self.tar_name:
+                installed_files = members
             validate_seconds = time.perf_counter() - step_start
             step_start = time.perf_counter()
             with install_metrics.time_artifact_install_step(self.name, root.name, "extract"):
@@ -323,6 +330,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
             extract_total,
             elapsed,
         )
+        return installed_files
 
     def target_file_paths(self) -> list[Path]:
         root_archives = self._root_archives()
@@ -1156,7 +1164,9 @@ def _write_tar_from_entries(
         member_list.unlink(missing_ok=True)
 
 
-def _validate_tar_members(tar_path: Path) -> None:
+def _validate_tar_members(tar_path: Path) -> list[str]:
+    """Reject unsafe members and return the regular files' relative paths."""
+    files = []
     with tarfile.open(tar_path, mode="r:") as archive:
         for member in archive:
             name = member.name
@@ -1167,6 +1177,9 @@ def _validate_tar_members(tar_path: Path) -> None:
                 raise ValueError(f"unsafe tar member path: {member.name}")
             if not (member.isfile() or member.isdir()):
                 raise ValueError(f"unsupported tar member type: {member.name}")
+            if member.isfile():
+                files.append(name)
+    return files
 
 
 def _run_tar(args: list[str]) -> None:

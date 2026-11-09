@@ -208,9 +208,15 @@ types. Python and Go bindings include the new symbolic enum value.
 Paths are not compatibility fields and are never supplied as remote installation
 instructions. The source packages its local directory; the receiving adapter
 supplies its own, which can differ across pods. Installation extracts into that
-directory and keeps files already there. An `include` filter, evaluated when the
-bundle is prepared after readiness, selects which files a source publishes; a
-bundle that selects no file is not published. Generic bundle paths use a
+directory and keeps files already there. Whether and how often a node publishes
+is the transport's policy, as for kernel caches: Mooncake publishes once after a
+confirmed miss, while every NIXL node publishes what it holds. Without an
+`include` filter the whole directory is published. An `include` filter,
+evaluated when the bundle is prepared after readiness, selects which locally
+produced files belong to the identity. Files installed for the same identity
+are recorded in a receipt beside the node's artifact markers and published as
+well while their content is unchanged, so NIXL peers relay them. When nothing
+is selected, publication ends without retrying. Generic bundle paths use a
 dedicated `framework_caches/<name>/<source_id>` namespace, separate from legacy
 artifact bundles. Publication handles are scoped by source identity so several
 framework caches can coexist on one worker.
@@ -220,6 +226,10 @@ To add a framework cache:
 1. Write a provider that returns a `FrameworkCacheArtifact`, or `None` when the
    running engine does not support the cache. Its compatibility key must cover
    every setting that makes the cache content invalid on another process.
+   Leave `include` unset when files of other configurations in the directory
+   are harmless, as with hash-addressed kernel caches. Set it only when they
+   could be mistaken for this identity's files; it then judges locally produced
+   files, and installed files are handled by the receipt.
 2. Register the provider. For vLLM, add it to `_PROVIDERS` in
    `engines/vllm/framework_caches.py`; the main-model adapter exposes the result
    as `framework_cache_artifacts`. An SGLang or TRT-LLM adapter sets the same

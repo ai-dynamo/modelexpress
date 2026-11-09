@@ -20,6 +20,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("modelexpress.metadata.publisher")
 
+
+class PublicationNotNeeded(Exception):
+    """Raised by a publish function when there is nothing to publish.
+
+    Unlike other publication failures, the publisher then stops without
+    retrying and releases its resources.
+    """
+
 READY_POLL_SECS = 5
 
 # How many heartbeats in a row the server must reject (success=false) before
@@ -371,6 +379,13 @@ class PublisherThread:
                 f"(mx_source_id={self._mx_source_id})"
             )
             return True
+        except PublicationNotNeeded as exc:
+            logger.info(
+                f"[Worker {self._worker_rank}] Nothing to publish; stopping: {exc}"
+            )
+            self._stop_event.set()
+            self._cleanup()
+            return False
         except Exception as exc:
             if not self._retry_publish_on_failure:
                 logger.error(

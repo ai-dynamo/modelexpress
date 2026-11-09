@@ -19,11 +19,19 @@ from modelexpress.metadata.artifact_transfer import (
     ArtifactCacheRoot,
     triton_cache_artifact_transfer,
 )
+from modelexpress.metadata.publisher import PublicationNotNeeded
 from modelexpress.metadata.framework_cache import (
     FrameworkCacheArtifact,
     framework_cache_entries,
 )
 from modelexpress.metadata.source_id import compute_mx_source_id
+
+
+@pytest.fixture(autouse=True)
+def receipt_dir(monkeypatch, tmp_path):
+    markers = tmp_path / "markers"
+    monkeypatch.setattr(artifact_lifecycle, "artifact_lock_root", lambda: markers)
+    return markers
 
 
 def _cache(tmp_path, **overrides):
@@ -362,20 +370,25 @@ def test_legacy_publications_keep_source_type_registry_key(monkeypatch, tmp_path
     assert published == {key: current}
 
 
-def _install(transfer, bundle) -> None:
+def _staged_header(transfer, bundle):
     (staged,) = transfer.target_file_paths()
     staged.write_bytes(bundle.tar_path.read_bytes())
     received_file = p2p_pb2.ArtifactManifestFile()
     received_file.CopyFrom(bundle.manifest.files[0])
     received_file.path = str(staged)
-    transfer.install(
-        p2p_pb2.GetArtifactManifestHeaderResponse(
-            artifact_id=bundle.artifact_id,
-            mx_source_type=transfer.mx_source_type,
-            files=[received_file],
-            total_size=received_file.size,
-        )
+    return p2p_pb2.GetArtifactManifestHeaderResponse(
+        artifact_id=bundle.artifact_id,
+        mx_source_type=transfer.mx_source_type,
+        files=[received_file],
+        total_size=received_file.size,
     )
+
+
+def _install(entry, bundle) -> None:
+    """Install as the artifact lifecycle does, including the install receipt."""
+    transfer, identity = entry
+    installed = transfer.install(_staged_header(transfer, bundle))
+    artifact_lifecycle.record_install_receipt(transfer, identity, installed)
 
 
 def test_include_publishes_only_selected_files(tmp_path):
@@ -404,7 +417,7 @@ def test_include_without_selected_files_does_not_publish(tmp_path):
     (source / "other.json").write_text("{}")
     transfer, _ = _entry(tmp_path, include=lambda path: False)
 
-    with pytest.raises(LookupError, match="selected no files"):
+    with pytest.raises(PublicationNotNeeded, match="selected no files"):
         transfer.prepare_source()
 
 
@@ -417,7 +430,7 @@ def test_install_keeps_unrelated_files_in_the_framework_root(tmp_path):
     (target / "plan_a.json").write_text("stale")
     (target / "plan_b.json").write_text("local")
     sender, _ = _entry(tmp_path, include=lambda path: path == "plan_a.json")
-    receiver, _ = replace(_cache(tmp_path), root=target).entry(
+    receiver = replace(_cache(tmp_path), root=target).entry(
         "deepseek-ai/DeepSeek-V3", tmp_path / "receiver-bundle"
     )
 
@@ -449,3 +462,121 @@ def test_framework_cache_entries_follow_the_adapter_registration(tmp_path):
 
     assert [transfer.name for transfer, _ in entries] == ["startup_plan", "execution_plan"]
     assert framework_cache_entries(SimpleNamespace(adapter=None), tmp_path) == []
+
+
+def _archive_names(bundle) -> list[str]:
+    with tarfile.open(bundle.tar_path) as archive:
+        return sorted(member.name for member in archive.getmembers() if member.isfile())
+
+
+def _peer(tmp_path, bundle_name, **overrides):
+    values = {"root": tmp_path / "peer", "include": lambda path: False}
+    values.update(overrides)
+    return replace(_cache(tmp_path), **values).entry(
+        "deepseek-ai/DeepSeek-V3", tmp_path / bundle_name
+    )
+
+
+def test_installed_files_are_published_again_for_peer_relay(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plan.json").write_text("fetched")
+    sender, _ = _entry(tmp_path, include=lambda path: True)
+    _install(_peer(tmp_path, "peer-install"), sender.prepare_source())
+
+    relay = _peer(tmp_path, "peer-publish")[0].prepare_source()
+
+    assert _archive_names(relay) == ["./plan.json"]
+
+
+def test_rewritten_installed_files_are_not_published_again(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plan.json").write_text("fetched")
+    sender, _ = _entry(tmp_path, include=lambda path: True)
+    _install(_peer(tmp_path, "peer-install"), sender.prepare_source())
+    (tmp_path / "peer" / "plan.json").write_text("written by another configuration")
+
+    with pytest.raises(PublicationNotNeeded):
+        _peer(tmp_path, "peer-publish")[0].prepare_source()
+
+
+def test_install_receipts_are_scoped_to_the_identity(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plan.json").write_text("fetched")
+    sender, _ = _entry(tmp_path, include=lambda path: True)
+    _install(_peer(tmp_path, "peer-install"), sender.prepare_source())
+
+    with pytest.raises(PublicationNotNeeded):
+        _peer(tmp_path, "other-key", compatibility_key="other-settings")[0].prepare_source()
+
+
+def test_unfiltered_caches_publish_the_whole_root_without_receipts(tmp_path, receipt_dir):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plan.json").write_text("fetched")
+    sender, _ = _entry(tmp_path)
+    receiver = replace(_cache(tmp_path), root=tmp_path / "target").entry(
+        "deepseek-ai/DeepSeek-V3", tmp_path / "receiver-bundle"
+    )
+    _install(receiver, sender.prepare_source())
+
+    assert receiver[0].include is None
+    assert not receipt_dir.exists()
+
+
+def test_receipt_failure_is_logged_without_failing(monkeypatch, tmp_path, caplog):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plan.json").write_text("fetched")
+    sender, _ = _entry(tmp_path, include=lambda path: True)
+    peer = _peer(tmp_path, "peer-install")
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("")
+    monkeypatch.setattr(
+        artifact_lifecycle, "install_receipt_path", lambda *_args: blocker / "receipt.done"
+    )
+
+    with caplog.at_level("WARNING"):
+        _install(peer, sender.prepare_source())
+
+    assert (tmp_path / "peer" / "plan.json").read_text() == "fetched"
+    assert "Could not record the install receipt for artifact startup_plan" in caplog.text
+
+
+def test_installation_is_marked_complete_before_its_receipt(monkeypatch, tmp_path, caplog):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plan.json").write_text("fetched")
+    sender, _ = _entry(tmp_path, include=lambda path: True)
+    transfer, identity = _peer(tmp_path, "peer-install")
+    header = _staged_header(transfer, sender.prepare_source())
+    transport = MagicMock()
+    transport.fetch.return_value = SimpleNamespace(header=header, transport="nixl")
+    marker = artifact_lifecycle.artifact_marker_path(transfer, identity, "install-attempted")
+    states = []
+    record = artifact_lifecycle.record_install_receipt
+
+    def observe_then_fail(*args):
+        states.append(artifact_lifecycle._read_artifact_install_state(marker).status)
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("")
+        monkeypatch.setattr(
+            artifact_lifecycle, "install_receipt_path", lambda *_args: blocker / "receipt.done"
+        )
+        record(*args)
+
+    monkeypatch.setattr(artifact_lifecycle, "record_install_receipt", observe_then_fail)
+    with caplog.at_level("WARNING"):
+        installed, transport_name = artifact_lifecycle._install_artifact_via_transports(
+            SimpleNamespace(node_rank=0, accelerator_backend=None),
+            transfer,
+            identity,
+            transport=transport,
+            on_install_completed=None,
+        )
+
+    assert installed is header and transport_name == "nixl"
+    assert states == [artifact_lifecycle.ArtifactInstallStatus.INSTALLED]
+    assert "Could not record the install receipt" in caplog.text

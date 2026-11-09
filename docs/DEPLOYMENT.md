@@ -1010,10 +1010,12 @@ does not prove a plan was applied: look for vLLM's
 
 A source publishes after readiness. It computes its ranks' native fingerprints
 then, because model construction can change them, and publishes only the plan
-files with those names that the current boot saved. Plans left by earlier boots,
-which may come from settings the native fingerprint does not distinguish, are
-not published. A boot that applied an installed plan saves none and publishes
-nothing for this cache.
+files with those names that the current boot saved, plus plans it installed for
+the same compatibility key whose content is unchanged. NIXL nodes therefore
+relay the plans they fetched; Mooncake publishes once after a confirmed miss.
+Plans left by earlier boots, which may come from settings the native
+fingerprint does not distinguish, are not published. When a node has no such
+plan, publication of this cache ends without retrying.
 
 Plan reuse skips memory profiling and CUDA-graph memory estimation; CUDA graph
 capture and kernel warmup still run.
