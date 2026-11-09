@@ -101,8 +101,11 @@ class CaptureResult:
     not enough to tell an unexpressible fused layout apart from a loader that
     merely touched one op outside the allowlist.
     ``unattributed`` = copy_ calls fired with no active loader stamp. Either
-    condition makes the update fail closed in the current receiver; there is no
-    fallback path that serves those tensors by another route."""
+    condition makes a traced update fail closed.
+
+    ``loader_replay`` = no loader was traced: each copy stages one whole source,
+    and installation hands the staged sources to vLLM's own ``load_weights``. Its destinations are staging slots, not engine parameters,
+    and installation checks coverage against vLLM's per-layer load counts."""
 
     copies: list = field(default_factory=list)
     unsupported: list = field(default_factory=list)
@@ -112,3 +115,4 @@ class CaptureResult:
     source_replay: bool = False
     replay_id: UUID = field(default_factory=uuid4)
     destination_layouts: dict[str, tuple[tuple, tuple]] = field(default_factory=dict)
+    loader_replay: bool = False
