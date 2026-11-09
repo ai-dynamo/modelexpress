@@ -17,7 +17,7 @@ import torch.nn as nn
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import log_tensor_summary
+from ..tensor_utils import host_resident_parameters, log_tensor_summary
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
@@ -317,6 +317,20 @@ def register_tensors(
             if result.model is None:
                 logger.info(
                     f"[Worker {ctx.global_rank}] No model available, skipping NIXL registration"
+                )
+                return
+
+            # Discovery collects accelerator tensors only, so a peer would
+            # receive everything except these and keep its dummy values.
+            host_params = host_resident_parameters(
+                result.model, ctx.accelerator_backend
+            )
+            if host_params:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] {len(host_params)} parameters "
+                    f"are outside accelerator memory (first: {host_params[0]}); "
+                    "skipping NIXL registration, worker will continue without "
+                    "P2P serving"
                 )
                 return
 
