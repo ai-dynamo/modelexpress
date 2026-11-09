@@ -320,19 +320,18 @@ def register_tensors(
                 )
                 return
 
-            # Discovery collects accelerator tensors only, so a peer would
-            # receive everything except these and keep its dummy values.
+            # Only accelerator tensors are transferred, so a peer would keep
+            # dummy values for host parameters. Raise instead of returning so
+            # the handler below also releases a manager that artifact install
+            # already created.
             host_params = host_resident_parameters(
                 result.model, ctx.accelerator_backend
             )
             if host_params:
-                logger.warning(
-                    f"[Worker {ctx.global_rank}] {len(host_params)} parameters "
-                    f"are outside accelerator memory (first: {host_params[0]}); "
-                    "skipping NIXL registration, worker will continue without "
-                    "P2P serving"
+                raise RuntimeError(
+                    f"{len(host_params)} parameters are outside accelerator "
+                    f"memory (first: {host_params[0]})"
                 )
-                return
 
             ctx.tensors = ctx.adapter.discover_tensors(result)
             if ctx.p2p_role == "draft":

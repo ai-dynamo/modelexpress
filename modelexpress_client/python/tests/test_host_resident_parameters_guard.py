@@ -76,6 +76,41 @@ def test_source_with_host_parameters_does_not_register_or_publish(patched, backe
     publish.assert_not_called()
 
 
+def test_source_releases_a_manager_created_before_registration(patched, backend):
+    """Artifact install can create the manager before the strategy chain runs.
+
+    Left in place, publish_metadata() would advertise a source with no weights.
+    """
+    ctx = _ctx(backend)
+    artifact_manager = MagicMock()
+    ctx.nixl_manager = artifact_manager
+    model = _model(host_table=True)
+
+    base.register_tensors(LoadResult(value=model, model=model), ctx)
+    with patch.object(base, "publish_metadata_and_ready") as publish:
+        base.publish_metadata(ctx)
+
+    artifact_manager.shutdown.assert_called_once()
+    artifact_manager.register_tensors.assert_not_called()
+    assert ctx.nixl_manager is None
+    publish.assert_not_called()
+
+
+def test_draft_with_host_parameters_keeps_the_shared_manager(patched, backend):
+    """The main load still serves from the agent a draft pass shares."""
+    ctx = _ctx(backend)
+    ctx.p2p_role = "draft"
+    shared = MagicMock()
+    ctx.shared_nixl_manager = shared
+    model = _model(host_table=True)
+
+    base.register_tensors(LoadResult(value=model, model=model), ctx)
+
+    shared.shutdown.assert_not_called()
+    shared.register_additional_tensors.assert_not_called()
+    assert ctx.nixl_manager is None
+
+
 def test_source_with_accelerator_parameters_registers(patched, backend):
     ctx = _ctx(backend)
     model = _model(host_table=False)
@@ -112,3 +147,31 @@ def test_target_with_host_parameters_falls_back_before_receiving(
     assert excinfo.value.mutated is True
     ctx.adapter.discover_tensors.assert_not_called()
     init.assert_not_called()
+
+
+def test_target_with_artifact_manager_falls_back_before_receiving(
+    patched, backend, monkeypatch
+):
+    """An existing manager must not let an empty registration pass as ready.
+
+    A same-family receive that matches no tensors returns success, so the
+    target would finalize and serve its dummy weights.
+    """
+    ctx = _ctx(backend)
+    ctx.is_reload = False
+    artifact_manager = MagicMock()
+    ctx.nixl_manager = artifact_manager
+    model = _model(host_table=True)
+    monkeypatch.setattr(rdma_strategy, "worker_tensor_descriptors", lambda _w: [])
+
+    with pytest.raises(StrategyFailed, match="NIXL registration failed"):
+        RdmaStrategy()._receive_from_peer(
+            LoadResult(value=model, model=model),
+            ctx,
+            SimpleNamespace(worker_grpc_endpoint="", nixl_metadata=b""),
+            "mx-source",
+            "worker",
+        )
+
+    artifact_manager.shutdown.assert_called_once()
+    artifact_manager.receive_from_source.assert_not_called()
