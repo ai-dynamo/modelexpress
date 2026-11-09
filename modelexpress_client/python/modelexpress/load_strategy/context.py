@@ -80,6 +80,7 @@ class LoadContext:
     mx_client: MxClientBase
     worker_id: str
     mx_server_url: str | None = None
+    donor_lease: Any = None
     node_rank: int = 0
     # Head address from the engine's own distributed config (for vLLM,
     # parallel_config.master_addr). Non-head nodes rewrite a pod-local
@@ -101,6 +102,8 @@ class LoadContext:
     draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
     # False keeps a load out of P2P entirely (no registration, no RDMA).
     p2p_enabled: bool = True
+    # Replica-wide cold-start fallback skips peer reads but still publishes.
+    skip_rdma: bool = False
     # Draft pass only: the main load's already-initialized NIXL manager. The
     # draft registers into it instead of binding MX_METADATA_PORT + device_id
     # a second time.

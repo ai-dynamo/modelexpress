@@ -11,9 +11,10 @@ use crate::p2p::backend::SourceInstanceInfo;
 use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
 use crate::p2p::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::{
-    GetMetadataRequest, GetMetadataResponse, ListSourcesRequest, ListSourcesResponse,
-    PublishMetadataRequest, PublishMetadataResponse, SourceInstanceRef, SourceStatus,
-    UpdateStatusRequest, UpdateStatusResponse, WorkerMetadata, p2p_service_server::P2pService,
+    DonorLeaseAction, DonorLeaseRequest, DonorLeaseResponse, GetMetadataRequest,
+    GetMetadataResponse, ListSourcesRequest, ListSourcesResponse, PublishMetadataRequest,
+    PublishMetadataResponse, SourceInstanceRef, SourceStatus, UpdateStatusRequest,
+    UpdateStatusResponse, WorkerMetadata, p2p_service_server::P2pService,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -37,6 +38,8 @@ fn tagged<T>(body: T, outcome: RpcOutcome) -> Result<Response<T>, Status> {
     response.extensions_mut().insert(outcome);
     Ok(response)
 }
+
+const MAX_DONOR_LEASE_TTL_SECONDS: u64 = 600;
 
 /// P2P Service implementation
 pub struct P2pServiceImpl {
@@ -80,6 +83,53 @@ fn legacy_worker_tensor_count(worker: &WorkerMetadata) -> usize {
 
 #[tonic::async_trait]
 impl P2pService for P2pServiceImpl {
+    async fn donor_lease(
+        &self,
+        request: Request<DonorLeaseRequest>,
+    ) -> Result<Response<DonorLeaseResponse>, Status> {
+        let req = request.into_inner();
+        let identity = req
+            .identity
+            .ok_or_else(|| Status::invalid_argument("identity is required"))?;
+        validate_identity(&identity).map_err(Status::invalid_argument)?;
+        if req.owner_token.is_empty() {
+            return Err(Status::invalid_argument("owner_token is required"));
+        }
+        let source_id = compute_mx_source_id(&identity)
+            .map_err(|err| Status::internal(format!("failed to compute source id: {err}")))?;
+        let action = DonorLeaseAction::try_from(req.action)
+            .map_err(|_| Status::invalid_argument("invalid lease action"))?;
+        if matches!(action, DonorLeaseAction::Acquire | DonorLeaseAction::Renew)
+            && !(1..=MAX_DONOR_LEASE_TTL_SECONDS).contains(&req.ttl_seconds)
+        {
+            return Err(Status::invalid_argument(format!(
+                "lease TTL must be between 1 and {MAX_DONOR_LEASE_TTL_SECONDS} seconds"
+            )));
+        }
+        let result = match action {
+            DonorLeaseAction::Acquire => {
+                let duration = std::time::Duration::from_secs(req.ttl_seconds);
+                self.state
+                    .try_acquire_donor_lease(&source_id, &req.owner_token, duration)
+                    .await
+            }
+            DonorLeaseAction::Renew => {
+                let duration = std::time::Duration::from_secs(req.ttl_seconds);
+                self.state
+                    .renew_donor_lease(&source_id, &req.owner_token, duration)
+                    .await
+            }
+            DonorLeaseAction::Release => {
+                self.state
+                    .release_donor_lease(&source_id, &req.owner_token)
+                    .await
+            }
+            _ => return Err(Status::invalid_argument("invalid lease action")),
+        }
+        .map_err(|err| Status::unavailable(format!("donor lease backend: {err}")))?;
+        Ok(Response::new(DonorLeaseResponse { success: result }))
+    }
+
     async fn publish_metadata(
         &self,
         request: Request<PublishMetadataRequest>,
@@ -252,6 +302,9 @@ impl P2pService for P2pServiceImpl {
             Ok(v) => v,
             Err(e) => {
                 error!("Failed to list workers: {}", e);
+                if req.strict {
+                    return Err(Status::unavailable(format!("metadata backend: {e}")));
+                }
                 return tagged(
                     ListSourcesResponse {
                         instances: Vec::new(),
@@ -515,6 +568,132 @@ mod tests {
         SourceIdentity {
             mx_source_type: MxSourceType::TorchCompileCache as i32,
             ..test_identity()
+        }
+    }
+
+    #[tokio::test]
+    async fn donor_lease_service_validates_ttl() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_try_acquire_donor_lease()
+            .times(2)
+            .returning(|_, _, _| Ok(true));
+        mock.expect_renew_donor_lease()
+            .times(2)
+            .returning(|_, _, _| Ok(true));
+        mock.expect_release_donor_lease()
+            .times(2)
+            .returning(|_, _| Ok(true));
+        let svc = make_service(mock);
+        let request = |action: DonorLeaseAction, ttl| {
+            Request::new(DonorLeaseRequest {
+                identity: Some(test_identity()),
+                owner_token: "owner".to_string(),
+                action: action as i32,
+                ttl_seconds: ttl,
+            })
+        };
+        for action in [DonorLeaseAction::Acquire, DonorLeaseAction::Renew] {
+            for ttl in [0, MAX_DONOR_LEASE_TTL_SECONDS + 1, u64::MAX] {
+                assert_eq!(
+                    svc.donor_lease(request(action, ttl))
+                        .await
+                        .expect_err("invalid TTL")
+                        .code(),
+                    tonic::Code::InvalidArgument
+                );
+            }
+            for ttl in [1, MAX_DONOR_LEASE_TTL_SECONDS] {
+                assert!(
+                    svc.donor_lease(request(action, ttl))
+                        .await
+                        .expect("valid TTL")
+                        .into_inner()
+                        .success
+                );
+            }
+        }
+        for ttl in [0, u64::MAX] {
+            assert!(
+                svc.donor_lease(request(DonorLeaseAction::Release, ttl))
+                    .await
+                    .expect("release")
+                    .into_inner()
+                    .success
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn donor_lease_service_rejects_invalid_action() {
+        let svc = make_service(MockMetadataBackend::new());
+        for action in [DonorLeaseAction::Unspecified as i32, i32::MAX] {
+            let request = Request::new(DonorLeaseRequest {
+                identity: Some(test_identity()),
+                owner_token: "owner".to_string(),
+                action,
+                ttl_seconds: 0,
+            });
+            let error = svc.donor_lease(request).await.expect_err("invalid action");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert_eq!(error.message(), "invalid lease action");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Redis at MX_TEST_REDIS_URL"]
+    async fn donor_lease_service_uses_redis_and_fences_owners() {
+        use crate::metrics::backend::BackendMetrics;
+        use crate::p2p::backend::instrumented::InstrumentedMetadataBackend;
+        use crate::p2p::backend::redis::RedisBackend;
+        use prometheus_client::registry::Registry;
+
+        let url = std::env::var("MX_TEST_REDIS_URL")
+            .unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+        let metrics = BackendMetrics::register(&mut Registry::default());
+        let backend = InstrumentedMetadataBackend::wrap(Arc::new(RedisBackend::new(&url)), metrics);
+        let svc = P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(backend)));
+        let mut identity = test_identity();
+        identity.model_name = uuid::Uuid::new_v4().to_string();
+        let request = |action: DonorLeaseAction, owner: &str, ttl| {
+            Request::new(DonorLeaseRequest {
+                identity: Some(identity.clone()),
+                owner_token: owner.to_string(),
+                action: action as i32,
+                ttl_seconds: ttl,
+            })
+        };
+        for (action, owner, ttl, expected) in [
+            (DonorLeaseAction::Acquire, "first", 10, true),
+            (DonorLeaseAction::Acquire, "second", 10, false),
+            (DonorLeaseAction::Renew, "first", 10, true),
+            (DonorLeaseAction::Renew, "second", 10, false),
+            (DonorLeaseAction::Release, "second", 0, false),
+            (DonorLeaseAction::Release, "first", 0, true),
+            (DonorLeaseAction::Acquire, "second", 10, true),
+            (DonorLeaseAction::Release, "second", 0, true),
+        ] {
+            assert_eq!(
+                svc.donor_lease(request(action, owner, ttl))
+                    .await
+                    .expect("lease RPC")
+                    .into_inner()
+                    .success,
+                expected
+            );
+        }
+        for invalid in [
+            Request::new(DonorLeaseRequest::default()),
+            request(DonorLeaseAction::Acquire, "", 10),
+            request(DonorLeaseAction::Acquire, "first", 0),
+            request(DonorLeaseAction::Unspecified, "first", 10),
+        ] {
+            assert_eq!(
+                svc.donor_lease(invalid)
+                    .await
+                    .expect_err("invalid request")
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
         }
     }
 
@@ -893,6 +1072,7 @@ mod tests {
                 min_training_step: Some(40),
                 min_updated_at: Some(1_700_000_000_000),
                 limit: Some(2),
+                strict: false,
             }))
             .await
             .expect("rpc")
@@ -1094,17 +1274,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_sources_backend_error_returns_empty() {
+    async fn test_list_sources_backend_error_respects_strict() {
         let mut mock = MockMetadataBackend::new();
         mock.expect_list_workers_filtered()
-            .once()
+            .times(2)
             .returning(|_, _, _, _, _, _, _| Err("backend down".into()));
 
         let svc = make_service(mock);
+        let error = svc
+            .list_sources(Request::new(ListSourcesRequest {
+                identity: Some(test_identity()),
+                strict: true,
+                ..Default::default()
+            }))
+            .await
+            .expect_err("strict request should report backend failure");
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+        assert!(error.message().contains("backend down"));
+
         let response = svc
             .list_sources(Request::new(ListSourcesRequest {
                 identity: Some(test_identity()),
-                status_filter: None,
+                strict: false,
                 ..Default::default()
             }))
             .await

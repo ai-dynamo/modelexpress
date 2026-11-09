@@ -175,3 +175,18 @@ def test_dir_lists_registered_names():
     assert "MX_NIXL_BACKEND" in names
     assert "VLLM_ATTENTION_BACKEND" in names
     assert names == sorted(names)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "invalid", "1500", "1501"])
+def test_cold_start_wait_invalid_uses_default(monkeypatch, value):
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", value)
+    assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 600
+
+
+def test_cold_start_wait_default_and_override(monkeypatch):
+    monkeypatch.delenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", raising=False)
+    assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 600
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "12.5")
+    assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 12.5
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "1499.9")
+    assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 1499.9

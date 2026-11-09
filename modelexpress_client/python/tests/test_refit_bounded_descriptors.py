@@ -283,7 +283,9 @@ def test_warm_descriptors_still_transfer_new_values(
 @pytest.mark.parametrize("harness", [None], indirect=True)
 def test_full_copy_reuses_workspace_until_reset(harness, monkeypatch) -> None:
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     first = harness.prepare()
     harness.transfer.stage(first)
     for values in harness.sources.values():
@@ -310,7 +312,9 @@ def test_full_copy_reuses_workspace_until_reset(harness, monkeypatch) -> None:
 @pytest.mark.parametrize("harness", [None, StreamingSettings(1024, "cpu")], indirect=True)
 def test_native_conversion_composes_with_transfer(harness, native_conversion, monkeypatch):
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     prepared = harness.prepare()
     if harness.streaming is None:
         installed = install_replay(harness.transfer.stage(prepared).tensors, harness.layout)
@@ -602,7 +606,9 @@ def _collect_agent_registration(harness, prepared) -> dict:
 @pytest.mark.parametrize("harness", [None, StreamingSettings(1024, "cpu")], indirect=True)
 def test_next_generation_replaces_agent_registration_before_read(harness, monkeypatch) -> None:
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     first = _agent_registration_snapshot(harness, generation=1)
     _check_values(harness, _collect_agent_registration(harness, _prepare_agent_registration(harness, first)), check_padding=harness.streaming is not None)
     for tensor in harness.sources.values():
@@ -646,7 +652,9 @@ def test_native_replacement_failure_cleans_up_and_retries(harness, monkeypatch, 
 @pytest.mark.parametrize("harness", [None, StreamingSettings(1024, "cpu"), StreamingSettings(2048, "cpu", 2)], indirect=True)
 def test_replica_switch_reuses_matching_group_descriptors(harness, monkeypatch):
     monkeypatch.setattr(harness.transfer, "_device", torch.device("cpu"))
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     replicas = {
         worker: {name: tensor[start:start + 2].clone() + delta for name, tensor in harness.sources.items()}
         for worker, start, delta in (("a1", 0, 0), ("a2", 0, 100), ("b1", 2, 0))

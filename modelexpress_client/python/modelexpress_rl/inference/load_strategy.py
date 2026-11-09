@@ -31,7 +31,6 @@ from .receiver import (
 )
 from .version_chain import resolve_replay_chain
 
-_MAX_REPLAY_CHAIN_LENGTH = 64
 logger = logging.getLogger(__name__)
 
 
@@ -495,7 +494,7 @@ def _resolve_object_storage_replay_chain(
         chain = resolve_replay_chain(
             target_version_id=target_version_uid,
             fetch_ready_version=fetch_ready_version,
-            max_chain_length=_MAX_REPLAY_CHAIN_LENGTH,
+            max_chain_length=envs.MX_MAX_REPLAY_CHAIN_LENGTH,
         )
         if len({version.object_storage.storage_type for version in chain}) != 1:
             raise RuntimeError(
