@@ -399,9 +399,11 @@ context parallelism greater than one, elastic EP and larger external-DP groups
 are rejected by the opt-in path. The opt-in source
 identity includes DP and prefill/decode context parallelism, so it does not reuse
 sources published without the opt-in. Speculative drafts do not run election:
-same-checkpoint drafts use the existing publication gate, while separate draft
-checkpoints use the ordinary storage fallback. TP, DP, and PP have been
-validated on GPUs; expert parallelism has not been validated end to end on GPUs.
+same-checkpoint drafts use the existing publication gate. With vLLM,
+separate-checkpoint drafts can join the main publication and use P2P when
+`MX_ENABLE_SEPARATE_DRAFT_P2P=1`; otherwise they use the ordinary storage
+fallback. This opt-in has no effect on SGLang. TP, DP, and PP have been validated
+on GPUs; expert parallelism has not been validated end to end on GPUs.
 
 ### RL refit service
 
