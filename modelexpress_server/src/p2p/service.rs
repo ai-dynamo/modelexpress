@@ -24,7 +24,7 @@ use tracing::{debug, error, info, warn};
 ///
 /// `PublishMetadataRequest` carries `pod_name`, `pod_uid` and `pod_namespace`,
 /// which the caller fills in from the downward API and which become the
-/// `ownerReference` on the `ModelMetadata` CR. Nothing downstream checks them
+/// `ownerReference` on the `ModelMetadata` CR. Nothing else checks them
 /// against the caller the auth layer verified, so a publisher can claim to be
 /// any pod and re-parent an existing record. These are the three answers.
 #[derive(Debug, PartialEq, Eq)]
@@ -43,9 +43,9 @@ enum PodClaimCheck {
 /// Check a publisher's self-asserted pod identity against the authenticated one.
 ///
 /// `caller` is `None` when the auth layer is not enabled, in which case there is
-/// no verified identity to compare against and behavior is unchanged from
-/// before this check existed. That is deliberate: gRPC auth is opt-in, and a
-/// server without it configured must keep publishing.
+/// no verified identity to compare against and the claim is accepted as-is.
+/// That is deliberate: gRPC auth is opt-in, and a server without it configured
+/// must keep publishing.
 fn check_pod_claim(
     caller: Option<&CallerIdentity>,
     pod_name: &str,
@@ -225,7 +225,8 @@ impl P2pService for P2pServiceImpl {
                     caller_namespace = caller.as_ref().map(|c| c.namespace.as_str()),
                     caller_service_account = caller.as_ref().map(|c| c.service_account.as_str()),
                     worker_id = %req.worker_id,
-                    "PublishMetadata: rejected pod ownership claim: {reason}"
+                    reason = %reason,
+                    "PublishMetadata: rejected pod ownership claim"
                 );
                 return tagged(
                     PublishMetadataResponse {
@@ -628,7 +629,7 @@ mod tests {
     fn pod_claim_is_unchanged_when_auth_is_disabled() {
         // gRPC auth is opt-in. With no verified caller there is nothing to
         // compare against, and a server without auth configured must keep
-        // publishing exactly as it did before this check existed.
+        // publishing with the claim accepted as-is.
         assert_eq!(
             check_pod_claim(None, "someone-elses-pod", "someone-elses-uid", "team-b"),
             PodClaimCheck::Accept

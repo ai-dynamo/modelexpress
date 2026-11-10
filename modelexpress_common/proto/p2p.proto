@@ -540,7 +540,9 @@ message PublishMetadataRequest {
 
   // Unique identifier for this running instance (UUID).
   // Differentiates multiple replicas with identical SourceIdentity.
-  // If empty, the server rejects the request.
+  // At most 63 bytes of lowercase alphanumerics, '-' and '.', where every
+  // dot-separated segment starts and ends with an alphanumeric. A UUID
+  // satisfies this. The server rejects an empty or non-conforming value.
   string worker_id = 3;
 
   // Kubernetes pod name of the calling worker, set via the downward API.

@@ -42,9 +42,9 @@ const WORKER_ID_MAX_LEN: usize = 63;
 /// The value is interpolated into a Kubernetes object name and written as a
 /// label value, so it is constrained to the intersection of what both accept:
 /// lowercase alphanumerics, `-` and `.`, with alphanumeric boundaries on every
-/// dot-separated segment. Object
-/// names are DNS-1123 and reject uppercase, which is why the lowercase rule is
-/// not merely stylistic. The documented producer is a UUID, which satisfies it.
+/// dot-separated segment. Object names are DNS-1123 and reject uppercase,
+/// which is why the lowercase rule is not merely stylistic. The documented
+/// producer is a UUID, which satisfies it.
 ///
 /// This rejects rather than sanitizes, unlike the model-name path. Rewriting
 /// the value would change which object name a previously-published worker maps
