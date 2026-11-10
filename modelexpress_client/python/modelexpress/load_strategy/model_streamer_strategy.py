@@ -39,8 +39,8 @@ class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
     """Load weights by streaming safetensors via runai-model-streamer.
 
     Activated by setting MX_MODEL_URI, which is also the preferred streaming
-    URI. Engine model configuration is used only when the environment value is
-    unavailable. Engine adapters provide the concrete ModelStreamer iterator.
+    URI. A separate draft pass uses its engine-configured URI after the strategy
+    has been enabled. Engine adapters provide the concrete ModelStreamer iterator.
     """
 
     name = "model_streamer"
@@ -60,17 +60,12 @@ class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
         return True
 
     def is_available(self, ctx: LoadContext) -> bool:
-        if not self.supports_explicit_uri(ctx):
-            return False
-        model_uri = (
-            _resolve_model_uri(ctx)
-            if ctx.use_model_config_uri
-            else envs.MX_MODEL_URI or ""
-        )
-        if not model_uri:
+        if not envs.MX_MODEL_URI:
             logger.info(
                 f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"
             )
+            return False
+        if not self.supports_explicit_uri(ctx):
             return False
         return True
 

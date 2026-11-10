@@ -1353,6 +1353,13 @@ class TestMtpDrafterSecondLoad:
         manifest = [
             TensorDescriptor("model.layers.0.w", 1, 4, 0, "torch.float32"),
             TensorDescriptor("mx_draft::model.layers.0.w", 2, 4, 0, "torch.float32"),
+            TensorDescriptor(
+                "mx_draft::eagle-hash::model.layers.0.w",
+                3,
+                4,
+                0,
+                "torch.float32",
+            ),
         ]
         main_ctx = _make_load_context()
         assert [t.name for t in RdmaStrategy._scope_source_tensors(main_ctx, manifest)] == [
@@ -1365,9 +1372,36 @@ class TestMtpDrafterSecondLoad:
             "mx_draft::model.layers.0.w"
         ]
 
+        eagle_ctx = self._draft_ctx(self._populated_manager())
+        eagle_ctx.draft_tensor_namespace = "mx_draft::eagle-hash::"
+        eagle_ctx.tensors = {
+            "mx_draft::eagle-hash::model.layers.0.w": MagicMock()
+        }
+        assert [
+            t.name for t in RdmaStrategy._scope_source_tensors(eagle_ctx, manifest)
+        ] == ["mx_draft::eagle-hash::model.layers.0.w"]
+
         draft_ctx.tensors["mx_draft::model.layers.1.w"] = MagicMock()
         with pytest.raises(RuntimeError, match="lacks 1 of 2 draft tensors"):
             RdmaStrategy._scope_source_tensors(draft_ctx, manifest)
+
+    def test_mtp_draft_rejects_separate_draft_manifest(self):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = self._draft_ctx(self._populated_manager())
+        source = p2p_pb2.WorkerMetadata(
+            tensors=[
+                p2p_pb2.TensorDescriptor(
+                    name="mx_draft::eagle-hash::model.layers.0.w",
+                    addr=0x1000,
+                    size=1024,
+                    device_id=0,
+                    dtype="bfloat16",
+                )
+            ]
+        )
+
+        assert RdmaStrategy._may_serve_draft(ctx, source) is False
 
     def test_draft_rdma_miss_falls_back_to_model_streamer(self):
         """A draft whose RDMA attempt finds no source carrying draft tensors

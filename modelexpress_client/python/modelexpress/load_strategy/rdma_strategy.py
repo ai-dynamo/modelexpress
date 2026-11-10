@@ -42,12 +42,20 @@ from .base import (
     clear_exception_tracebacks,
     register_tensors,
 )
-from .context import LoadResult, is_draft_tensor_name
+from .context import DRAFT_TENSOR_PREFIX, LoadResult, is_draft_tensor_name
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
 MAX_DRAFT_SOURCE_METADATA_LOOKUPS = 10
+
+
+def _matches_draft_namespace(ctx: LoadContext, name: str) -> bool:
+    namespace = ctx.draft_tensor_namespace
+    if not name.startswith(namespace):
+        return False
+    return namespace != DRAFT_TENSOR_PREFIX or "::" not in name[len(namespace):]
+
 
 # Fallback when MX_TRANSFER_TIMEOUT is unset or unusable. Matches the value this
 # path used when the timeout was hard-coded, so behaviour is unchanged by default.
@@ -555,9 +563,7 @@ class RdmaStrategy(LoadStrategy):
         descriptors = worker_tensor_descriptors(source_worker)
         if not descriptors:
             return True
-        return any(
-            t.name.startswith(ctx.draft_tensor_namespace) for t in descriptors
-        )
+        return any(_matches_draft_namespace(ctx, t.name) for t in descriptors)
 
     @staticmethod
     def _scope_source_tensors(
@@ -575,7 +581,7 @@ class RdmaStrategy(LoadStrategy):
             return [t for t in source_tensors if not is_draft_tensor_name(t.name)]
         scoped = [
             t for t in source_tensors
-            if t.name.startswith(ctx.draft_tensor_namespace)
+            if _matches_draft_namespace(ctx, t.name)
         ]
         missing = set(ctx.tensors) - {t.name for t in scoped}
         if missing:
