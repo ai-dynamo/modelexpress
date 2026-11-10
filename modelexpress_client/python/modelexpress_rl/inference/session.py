@@ -18,12 +18,19 @@ from modelexpress.types import ManifestMismatchError
 from ..control import WeightVersion
 from ..train import WeightPayloadFormat
 from .plan import (
+    RefitSourceUnavailable,
     ResolvedSource,
     EngineInstaller,
     SourceResolver,
     UpdateMethod,
     WeightSource,
     WeightUpdatePlan,
+)
+
+# A source at its reader cap, draining, or holding a retired version can't serve now, though a retry may find
+# another source or a newer version.
+_SOURCE_UNAVAILABLE_CODES = frozenset(
+    {grpc.StatusCode.NOT_FOUND, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.UNAVAILABLE}
 )
 
 logger = logging.getLogger("modelexpress_rl.inference.session")
@@ -111,6 +118,11 @@ class WeightUpdateSession:
                 ManifestMismatchError,
             ) as error:
                 if index == len(self._resolvers) - 1:
+                    if isinstance(error, grpc.RpcError) and error.code() in _SOURCE_UNAVAILABLE_CODES:
+                        raise RefitSourceUnavailable(
+                            f"no refit source can serve weight version {version.version_id!r} now: "
+                            f"{error.code().name}"
+                        ) from error
                     raise
                 logger.info(
                     "ModelExpress active refit version=%s source=%s unavailable: %s",
@@ -211,9 +223,10 @@ class WeightUpdateSession:
         resolver: SourceResolver,
     ) -> tuple[WeightUpdatePlan, Any]:
         last_error = None
-        if resolver.supports(version):
+        seen = 0
+        supported = resolver.supports(version)
+        if supported:
             candidates = iter(resolver.candidates(version))
-            seen = 0
             only_source = None
             for _ in range(self._max_transfer_attempts):
                 try:
@@ -256,9 +269,12 @@ class WeightUpdateSession:
                 return plan, prepared
         if last_error is not None:
             raise last_error
-        raise RuntimeError(
-            f"no usable refit source for weight version {version.version_id!r}"
-        )
+        message = f"no usable refit source for weight version {version.version_id!r}"
+        # Nothing serves the version yet, which a peer install or a free trainer slot can change; a source that
+        # exists but no method can install is permanent.
+        if supported and seen == 0:
+            raise RefitSourceUnavailable(message)
+        raise RuntimeError(message)
 
     def _stage_replay_chain(
         self,
