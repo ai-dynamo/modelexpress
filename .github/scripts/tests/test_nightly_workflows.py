@@ -256,7 +256,7 @@ class NightlyWorkflowTests(unittest.TestCase):
         results = {job: {"result": "success"} for job in status["needs"]}
         results["manual-release-approval"]["result"] = "skipped"
         environment = {"RELEASE": "false", "RUN_TESTS": "true", "SKIP_GITLAB": "false"}
-        script = status["steps"][0]["run"]
+        script = next(step["run"] for step in status["steps"] if step.get("name") == "Verify results")
         result, _ = execute(script, {**environment, "RESULTS": json.dumps(results)})
         self.assertEqual(result.returncode, 0, result.stderr)
         for suite in ["core-tests", "inference-tests", "rl-tests"]:
@@ -269,6 +269,95 @@ class NightlyWorkflowTests(unittest.TestCase):
             results[suite]["result"] = "skipped"
         result, _ = execute(script, {**environment, "RUN_TESTS": "false", "RESULTS": json.dumps(results)})
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_python_toolchain_setup_is_bounded_and_failure_is_not_hidden(self):
+        job = workflow("modelexpress-core-ci.yml")["jobs"]["python-test"]
+        setup = next(step for step in job["steps"] if step.get("name") == "Install C toolchain")
+        self.assertEqual(setup["timeout-minutes"], "5")
+        self.assertLess(int(setup["timeout-minutes"]), int(job["timeout-minutes"]))
+        stubs = """
+command() { return "$COMPILER_MISSING"; }
+sudo() { printf '%s\n' "$*"; return "$APT_STATUS"; }
+g++() { echo compiler-ready; }
+"""
+        for missing, apt_status in [("0", "0"), ("1", "0"), ("1", "23")]:
+            with self.subTest(missing=missing, apt_status=apt_status):
+                result, _ = execute(stubs + setup["run"], {
+                    "COMPILER_MISSING": missing, "APT_STATUS": apt_status,
+                })
+                self.assertEqual(result.returncode, int(apt_status))
+                if missing == "0":
+                    self.assertNotIn("apt-get", result.stdout)
+                elif apt_status == "0":
+                    self.assertIn("--no-install-recommends g++", result.stdout)
+                    self.assertIn("Acquire::http::Timeout=30", result.stdout)
+                else:
+                    self.assertNotIn("compiler-ready", result.stdout)
+
+    def test_release_qualification_blocks_failed_missing_and_skipped_prerequisites(self):
+        jobs = workflow("nightly-ci.yml")["jobs"]
+        gate = jobs["trigger-gitlab-release"]
+        self.assertTrue({"core-tests", "inference-tests", "rl-tests"} <= set(gate["needs"]))
+        steps = gate["steps"]
+        qualify = next(step for step in steps if step.get("name") == "Verify release qualification")
+        trigger = next(step for step in steps if step.get("name") == "Trigger GitLab pipeline")
+        self.assertLess(steps.index(qualify), steps.index(trigger))
+        environment = {"RELEASE": "true", "RUN_TESTS": "true"}
+        results = {job: {"result": "success"} for job in gate["needs"]}
+        results["manual-release-approval"]["result"] = "skipped"
+
+        def check(values, **modes):
+            return execute(qualify["run"], {**environment, **modes, "RESULTS": json.dumps(values)})[0]
+
+        self.assertEqual(check(results).returncode, 0)
+        for job in gate["needs"]:
+            if job in {"manual-release-approval", "notify-slack-start"}:
+                continue
+            for conclusion in ["failure", "cancelled", "skipped", None]:
+                changed = dict(results)
+                if conclusion is None:
+                    del changed[job]
+                else:
+                    changed[job] = {"result": conclusion}
+                with self.subTest(job=job, conclusion=conclusion):
+                    self.assertNotEqual(check(changed).returncode, 0)
+        disabled = {**results, "inference-tests": {"result": "skipped"}, "rl-tests": {"result": "skipped"}}
+        self.assertEqual(check(disabled, RUN_TESTS="false").returncode, 0)
+        disabled["core-tests"] = {"result": "skipped"}
+        self.assertNotEqual(check(disabled, RUN_TESTS="false").returncode, 0)
+        for modes in [{"RELEASE": ""}, {"RUN_TESTS": ""}, {"RUN_TESTS": "unknown"}]:
+            self.assertNotEqual(check(results, **modes).returncode, 0)
+
+    def test_release_handoff_rejects_missing_artifact_metadata_before_posting(self):
+        job = workflow("nightly-ci.yml")["jobs"]["trigger-gitlab-release"]
+        trigger = next(step for step in job["steps"] if step.get("name") == "Trigger GitLab pipeline")
+        script = "curl() { echo posted >&2; echo '{\"id\":123,\"status\":\"pending\"}'; }\n" + trigger["run"]
+        environment = {name: "test-value" for name in trigger["env"]}
+        environment.update({
+            "GITLAB_TRIGGER_URL": "https://gitlab.invalid/trigger",
+            "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123",
+        })
+        required = [
+            "ARTIFACTORY_WHEEL_REPO", "ARTIFACTORY_PATH", "NGC_STAGING_ORG",
+            "NIGHTLY_TAG", "WHEEL_VERSION", "CRATE_VERSION", "HELM_CHART_VERSION",
+            "STAGED_CONTAINERS", "STAGED_CRATES", "STAGED_HELM",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            environment["GITHUB_STEP_SUMMARY"] = str(Path(directory) / "summary")
+            result, values = execute(script, environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(values["artifacts"], "wheel,container,crate,helm")
+            self.assertIn("posted", result.stderr)
+            for name in required:
+                with self.subTest(name=name):
+                    result, _ = execute(script, {**environment, name: ""})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("posted", result.stderr)
+
+    def test_release_authorization_still_requires_the_current_attempt(self):
+        gate = workflow("nightly-ci.yml")["jobs"]["trigger-gitlab-release"]
+        self.assertIn("needs.manual-release-approval.outputs.approved_attempt == github.run_attempt", gate["if"])
+        self.assertIn("github.event_name == 'schedule' && github.run_attempt == '1'", gate["if"])
 
 
 class StageReleaseRcWorkflowTests(unittest.TestCase):

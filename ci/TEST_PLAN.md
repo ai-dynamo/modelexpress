@@ -20,7 +20,7 @@ Coverage matrix for the ModelExpress CI infrastructure. Reflects what's currentl
 | 5.1 | Parallelism > 1 — TP (multi-node preferred) | vLLM, SGLang | **Configured; new SGLang lane awaits GPU qualification** — single-node TP2 uses GLM for vLLM and SGLang on full GPUs. The `large` partition runs cross-node TP2 with two source and two target pods on a100a: vLLM uses Ray; SGLang uses native `--nnodes 2 --node-rank` and a headless rendezvous Service. Same-rank source/target anti-affinity requires cross-host RDMA; both lanes run MMLU score comparison | TRT-LLM; GPU qualification of new SGLang lane |
 | 5.2 | Parallelism > 1 — DP | vLLM, SGLang | **Configured; new SGLang lane awaits GPU qualification** — The framework partitions run native DP2/TP1 on a100b, using two full GPUs per replica. Both DP cores share rank-0 model identity and pull the complete weights. SGLang uses `--dp-size 2 --load-balance-method round_robin`. Shared P2P transfer assertions and MMLU source/target scores apply | A single endpoint cannot address each internal DP core separately; TRT-LLM |
 | 5.3 | Parallelism > 1 — EP | vLLM, SGLang | **Configured; new SGLang lane awaits GPU qualification** — The framework partitions run vLLM and SGLang GLM-4.7-Flash with TP2/EP2 on a100b. SGLang uses `--tp 2 --ep-size 2`; vLLM uses `--tensor-parallel-size 2 --enable-expert-parallel`. Requires rank-paired RDMA and MMLU score comparison | Per-expert subset verification; cross-node TP × EP; TRT-LLM |
-| 6 | Model Streamer — S3 *(direct streaming, no server cache)* | vLLM, SGLang | **In CI** — direct-streaming matrix entries run for vLLM and SGLang on `prod-modelexpress-tester-amd-gpu-v1` in a single Docker container with no vCluster or MX server. IRSA provides S3 access; the first run uploads safetensors to `s3://ai-dynamo-modelexpress-ci/models/...`. The shared composite action dispatches vLLM's `modelexpress` load format or SGLang's `remote_instance` + `backend=modelexpress` command, then verifies the MX ModelStreamer completion marker, server health, and text inference. vLLM uses `--language-model-only` because the staged S3 model assets do not include a vision processor. After loading, a separate 300-second readiness budget covers compilation and CUDA-graph warmup; each health request is limited to 5 seconds. TRT-LLM remains gated because it has no `build_model_streamer_weight_iter` adapter ([MX-299](https://linear.app/nvidia/issue/MX-299/trt-llm-adapter)). | — |
+| 6 | Model Streamer — S3 *(direct streaming, no server cache)* | vLLM, SGLang | **In CI** — direct-streaming matrix entries run for vLLM and SGLang on `prod-modelexpress-tester-amd-gpu-v1` in a single Docker container with no vCluster or MX server. IRSA provides S3 access; the first run uploads safetensors to `s3://ai-dynamo-modelexpress-ci/models/...`. The shared composite action dispatches vLLM's `modelexpress` load format or SGLang's `remote_instance` + `backend=modelexpress` command, then verifies the MX ModelStreamer completion marker, server health, and a deterministic 32-token decode (temperature/seed zero, EOS ignored). Empty output, early termination, and API errors fail the test. Standalone streamer jobs have a 30-minute deadline. vLLM uses `--language-model-only` because the staged S3 model assets do not include a vision processor. After loading, a separate 300-second readiness budget covers compilation and CUDA-graph warmup; each health request is limited to 5 seconds. TRT-LLM remains gated because it has no `build_model_streamer_weight_iter` adapter ([MX-299](https://linear.app/nvidia/issue/MX-299/trt-llm-adapter)). | — |
 | 7 | Dynamo aggregated serving | vLLM, SGLang | **Configured; Dynamo 1.5.1 upgrade and new SGLang lane await GPU qualification** — both frameworks build from Dynamo 1.5.1 runtime images with matching frontends. The Dynamo partitions scale the serving worker from one to two, require MX transfer, and compare worker-pinned MMLU source/target scores | TRT-LLM; runtime compatibility with the existing CI operator |
 | 8 | Dynamo disaggregated serving | vLLM, SGLang | **Configured; Dynamo 1.5.1 upgrade and new SGLang lane await GPU qualification** — separate prefill/decode workers use NIXL KV transfer. The shared action scales the framework-specific decode component and compares pinned original/new decode workers using MMLU | TRT-LLM; TP × disaggregation; runtime compatibility with the existing CI operator |
 | 9.1 | Metadata Backend — K8s CRD | — | **Covered implicitly** — exercised by the active P1 and P3 runs (mx-server uses `MX_METADATA_BACKEND=kubernetes`) | — |
@@ -196,8 +196,14 @@ Ordinary comments do not start RL builds, GPU tests, or Vime jobs.
 Scheduled and manual runs authorize only their exact event SHA and use the run ID
 for GPU slot selection. They remain outside PR supersession, while the GPU
 capacity queues are shared with PR tests. The nightly status gate
-requires all selected test suites and accepts skipping them only when
-`run_tests=false`. RL evidence uploads are disabled for nightly calls.
+uses the same qualification script as the GitLab release handoff. Every selected
+suite must pass before handoff, and release runs require core tests even with
+`run_tests=false`. Wheels, containers, crates, Helm, and compliance must all pass
+before publication is requested. Missing mode outputs fail qualification, so a
+partial rerun cannot silently disable checks. Existing current-attempt release
+approval requirements still apply. Handoff success means GitLab accepted the
+pipeline; downstream scanning/publication must be checked there. RL evidence
+uploads are disabled for nightly calls.
 
 ## CI build caches
 
@@ -260,10 +266,11 @@ slots; A100b defaults to one concurrent test requiring four full GPUs at peak.
 modulo the configured limit; RL refit and Vime use PR-based slots per Kubernetes
 context. One complete workload occupies each slot through execution and cleanup.
 Builds and independent cleanup remain outside these queues. GitHub's `queue: max`
-retains pending jobs. After all 15 small Kubernetes GPU cases in the same run succeed, five large cases
-become eligible: multi-node TP2, Dynamo disaggregated, the 15-worker fleet, and the
-vLLM and SGLang 5-worker rolling tests. Their required builds and vCluster setup
-must have succeeded. These cases share the separate `modelexpress-gpu-a100a-large-workload`
+retains pending jobs. After all 13 small Kubernetes GPU cases in the same run
+succeed, seven large cases become eligible: vLLM and SGLang multi-node TP2, both
+Dynamo disaggregated variants, the 15-worker vLLM fleet, and the vLLM and SGLang
+5-worker rolling tests. Their required builds and vCluster setup must have
+succeeded. These cases share the separate `modelexpress-gpu-a100a-large-workload`
 group and `large-workload` cleanup lane. Only one of these tests runs across PRs at a time. Ordinary A100a tests keep their
 eight-slot limit; small tests from other PRs may still run alongside a large test.
 Model Streamer and RL use separate pools and do not gate this phase.

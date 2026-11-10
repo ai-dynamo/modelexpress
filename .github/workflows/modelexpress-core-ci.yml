@@ -264,14 +264,23 @@ jobs:
       run: pip install uv
 
     - name: Install C toolchain
+      timeout-minutes: 5
       # setup.py builds _alloc_ext with $CXX (default g++), not cc.
-      run: command -v g++ >/dev/null || { sudo apt-get update && sudo apt-get install -y build-essential; }
+      run: |
+        set -euo pipefail
+        if ! command -v g++ >/dev/null; then
+          APT_OPTIONS=(-o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+          sudo apt-get "${APT_OPTIONS[@]}" update
+          sudo apt-get "${APT_OPTIONS[@]}" install -y --no-install-recommends g++
+        fi
+        g++ --version
 
     - name: Install dependencies
       working-directory: modelexpress_client/python
       run: |
         uv venv .venv --python 3.12
         uv pip install -e ".[dev]" '${{ matrix.protobuf_spec }}'
+        .venv/bin/python -c 'from modelexpress.vmm import _alloc_ext; print(_alloc_ext.__file__)'
 
     - name: Run tests
       working-directory: modelexpress_client/python
