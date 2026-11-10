@@ -1907,7 +1907,7 @@ def test_sglang_draft_register_never_binds_a_second_port(monkeypatch):
     with patch(
         "modelexpress.load_strategy.base.is_nixl_available", return_value=True
     ), patch("modelexpress.load_strategy.base._init_nixl_manager") as init:
-        register_tensors(nn.Linear(2, 2), ctx)
+        register_tensors(nn.Module(), ctx)
 
     init.assert_not_called()
     assert ctx.nixl_manager is shared
@@ -1933,7 +1933,7 @@ def test_sglang_draft_registration_and_receive_use_only_matching_namespace(
     ctx.adapter.discover_tensors.return_value = {"w": torch.ones(1)}
     monkeypatch.setenv("MX_SERVER_ADDRESS", "localhost:8001")
     with patch("modelexpress.load_strategy.base.is_nixl_available", return_value=True):
-        register_tensors(nn.Linear(1, 1), ctx)
+        register_tensors(nn.Module(), ctx)
 
     assert list(ctx.tensors) == ["mx_draft::compatible::w"]
     manifest = [

@@ -1244,6 +1244,10 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source crashed/restarted (stale rkeys), UCX transport misconfiguration, premature target connection. Fix: use robust ready coordination, check for restarts, enable `UCX_LOG_LEVEL=DEBUG`.
 
+### Parameters in Host Memory Skip RDMA
+
+Tensor discovery only collects accelerator tensors, so a parameter in host memory is never transferred and the target would serve its dummy values. `register_tensors()` therefore skips NIXL registration when the model has any non-empty parameter outside accelerator memory: such a worker serves inference but never publishes itself as a P2P source, so targets fall back to the next strategy. A target whose own model has such parameters skips registration the same way and falls back instead of receiving. Known case: DeepSeek V4.1 Engram tables, which vLLM keeps in pinned host memory by default. `--engram-config '{"cpu_offload": false}'` keeps them on the GPU so RDMA can transfer them, at the cost of the tables' GPU memory on every rank.
+
 ### Long Source Warmup
 
 DeepSeek-V3 takes ~40 minutes to warm up (loading + DeepGemm + CUDA graphs). Target must wait via ready coordination.
