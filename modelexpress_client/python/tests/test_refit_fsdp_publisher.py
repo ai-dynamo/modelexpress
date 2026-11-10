@@ -38,17 +38,22 @@ class _ServedOn:
         return 2
 
 
-def test_capture_publishes_full_copies_and_skips_non_float():
+def test_capture_publishes_full_copies_of_every_tensor():
     state_dict = {
         "w": torch.arange(8, dtype=torch.float32).reshape(2, 4),
         "b": torch.ones(4, dtype=torch.bfloat16),
-        "step": torch.arange(4, dtype=torch.long),  # non-float: skipped
+        # Integer state, such as a hash router's token-to-expert table, is model state too.
+        "tid2eid": torch.arange(4, dtype=torch.long),
     }
 
     shards = capture_local_shards(state_dict)
 
     by_name = {s.name: s for s in shards}
-    assert set(by_name) == {"w", "b"}
+    assert {name: s.source_tensor.dtype for name, s in by_name.items()} == {
+        "w": torch.float32,
+        "b": torch.bfloat16,
+        "tid2eid": torch.long,
+    }
     for shard in shards:
         # Plain (non-DTensor) tensors are held in full by every rank.
         assert shard.shard_offset == (0,) * len(shard.global_shape)
