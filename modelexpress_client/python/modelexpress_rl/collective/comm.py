@@ -509,7 +509,7 @@ def _stream_handle(stream: Any) -> int:
     """A raw stream handle; None is the legacy default stream."""
     if stream is None:
         return 0
-    return int(getattr(stream, "cuda_stream", stream))
+    return stream_handle(stream)
 
 
 def _device_ordinal(device: Any) -> int:
