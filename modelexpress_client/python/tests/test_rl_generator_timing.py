@@ -15,6 +15,10 @@ import logging
 from contextlib import nullcontext
 from types import SimpleNamespace
 
+from uuid import uuid4
+
+from tests.helpers.refit_replay import consume_stream
+
 import pytest
 
 from modelexpress_rl.refit import (
@@ -134,12 +138,7 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
         def prepare(self, **_kwargs) -> SimpleNamespace:
             return SimpleNamespace(
                 metrics={"plan_cache_hits": next(self.hits)},
-                batches=[
-                    SimpleNamespace(
-                        layouts=({"weight": None},),
-                        transfer_plan=SimpleNamespace(source_replay=False),
-                    )
-                ],
+                replay_id=uuid4(),
             )
 
         def stage(self, _prepared) -> SimpleNamespace:
@@ -158,7 +157,8 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
         layout_signature="layout",
         payload_format=WeightPayloadFormat.FULL_TENSOR,
     )
-    for label, expected in (("v1", "cold"), ("v2", "warm")):
+    cycles = (("v1", "cold"),) if outcome == "error" else (("v1", "cold"), ("v2", "warm"))
+    for label, expected in cycles:
         recorder = RefitTimingRecorder(backend="rl_generator", version=label, rank=0)
         with use_refit_timing(recorder):
             prepared = method.prepare(version=version, source=source)
@@ -169,14 +169,24 @@ def test_transfer_timing_reports_cache_reuse_and_consumed_bytes(bounded, outcome
             with expected_error, method.installation_context(prepared):
                 if bounded:
                     assert recorder.as_dict()["bytes"] == 0
-                    batches = prepared.batches()
-                    assert next(batches) == {"weight": 7}
-                    if outcome == "error":
-                        next(batches)
-                    elif outcome == "complete":
-                        assert list(batches) == []
-                    batches.close()
-            method.release(prepared)
+                    class StopConsumption(Exception):
+                        pass
+
+                    def install(batch):
+                        assert batch == {"weight": 7}
+                        if outcome == "close":
+                            raise StopConsumption
+
+                    if outcome == "close":
+                        with pytest.raises(StopConsumption):
+                            consume_stream(prepared, install)
+                    else:
+                        consume_stream(prepared, install)
+            if outcome == "error":
+                with pytest.raises(RuntimeError, match="reset the process"):
+                    method.release(prepared)
+            else:
+                method.release(prepared)
         record = recorder.as_dict()
         assert record["cold_warm"] == expected
         assert record["stages"]["transfer_planning"]["count"] == 1

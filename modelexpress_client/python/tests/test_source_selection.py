@@ -1536,3 +1536,44 @@ def test_required_zone_all_sources_cross_domain_falls_through_chain(monkeypatch)
     assert NextStrategy.calls == [model]
     ctx.mx_client.get_metadata.assert_not_called()
     rdma._load_as_target.assert_not_called()
+
+
+def test_cold_start_fallback_skips_rdma_but_publishes(monkeypatch):
+    from modelexpress.load_strategy import execute_load_strategies
+
+    published = []
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.publish_source_if_supported",
+        lambda result, ctx: published.append((result.value, ctx)),
+    )
+
+    class StorageStrategy:
+        name = "storage"
+
+        def is_available(self, ctx):
+            return True
+
+        def prepare(self, result, ctx):
+            pass
+
+        def load(self, result, ctx):
+            return result
+
+        def finalize(self, result, ctx):
+            pass
+
+        def abort(self, result, ctx):
+            pass
+
+        def rollback(self, ctx):
+            pass
+
+    ctx = SimpleNamespace(
+        p2p_enabled=True,
+        skip_rdma=True,
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+    )
+    model = MagicMock()
+    assert execute_load_strategies(model, ctx, [RdmaStrategy(), StorageStrategy()]) is model
+    assert published == [(model, ctx)]

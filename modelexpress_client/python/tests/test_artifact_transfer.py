@@ -101,6 +101,66 @@ def test_transfer_artifact_from_worker_reconstructs_file_and_releases_leases(tmp
     assert chunk_manager.released_chunks == [0, 1, 2, 3]
 
 
+def test_transfer_artifact_from_worker_reuses_one_channel(tmp_path, monkeypatch):
+    """One transfer must not open one TCP connection per chunk RPC.
+
+    The per-chunk prepare/release RPCs used to open a fresh channel each, so a
+    transfer of N chunks dialed the same endpoint 2N+ times. Repeated transfers
+    then piled up TIME_WAIT sockets until connects failed with EADDRNOTAVAIL.
+    """
+    chunk_count = 64
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"x" * (16 * chunk_count))
+    manifest = build_artifact_manifest(
+        tmp_path,
+        chunk_size=16,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
+    )
+    assert len(manifest.chunks) == chunk_count
+    artifact_id = artifact_manifest_id(manifest)
+    source_bytes_by_path = {
+        file.path: artifact_file.read_bytes() for file in manifest.files
+    }
+    chunk_manager = _FakeArtifactChunkManager(source_bytes_by_path)
+    target_nixl = _FakeTargetNixlManager(chunk_manager)
+    servicer = WorkerServiceServicer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        artifact_manifests={artifact_id: manifest},
+        artifact_chunk_manager=chunk_manager,
+        metadata_endpoint="127.0.0.1:5555",
+        agent_name="source-agent",
+        worker_rank=0,
+    )
+    server, port = _start_server(servicer)
+
+    real_insecure_channel = grpc.insecure_channel
+    opened = []
+
+    def counting_channel(*args, **kwargs):
+        opened.append(args[0] if args else kwargs.get("target"))
+        return real_insecure_channel(*args, **kwargs)
+
+    monkeypatch.setattr(grpc, "insecure_channel", counting_channel)
+    try:
+        transfer_artifact_from_worker(
+            f"127.0.0.1:{port}",
+            mx_source_id="source-123",
+            artifact_id=artifact_id,
+            nixl_manager=target_nixl,
+            timeout=5.0,
+        )
+    finally:
+        server.stop(grace=None)
+
+    assert len(opened) == 1, (
+        f"transferring a {chunk_count}-chunk artifact opened {len(opened)} "
+        f"connections to the same endpoint; the transfer should share one channel"
+    )
+    assert not chunk_manager.leases
+    assert artifact_file.read_bytes() == b"x" * (16 * chunk_count)
+
+
 def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path):
     artifact_file = tmp_path / "cache.bin"
     artifact_file.write_bytes(b"compiled-cache")

@@ -126,3 +126,8 @@ def test_mtp_rejects_incomplete_main(monkeypatch):
 def test_mtp_skips_when_not_requested():
     with pytest.raises(pytest.skip.Exception):
         test_p2p_k8s.test_mtp_load_phases("test", False, 1)
+
+
+def test_mtp_accepts_sglang_main_and_draft_logs(monkeypatch):
+    lines = _phase(0, "main") + _phase(0, "draft")
+    _check(monkeypatch, [line.replace("MxModelLoader", "SGLang MxModelLoader") for line in lines])

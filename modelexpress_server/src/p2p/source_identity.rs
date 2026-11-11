@@ -6,18 +6,17 @@
 //! Computes a 16-char hex `mx_source_id` from a `SourceIdentity` proto by
 //! normalizing all fields and taking the first 16 chars of SHA256.
 
+use modelexpress_common::digest::{DigestError, sha256_hex};
 use modelexpress_common::grpc::p2p::SourceIdentity;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Compute the `mx_source_id` for a `SourceIdentity`.
 ///
 /// Normalizes the identity (lowercased strings, sorted map keys) then hashes
 /// with SHA256. Returns the first 16 hex characters of the digest.
-pub fn compute_mx_source_id(identity: &SourceIdentity) -> String {
+pub fn compute_mx_source_id(identity: &SourceIdentity) -> Result<String, DigestError> {
     let canonical = canonical_json(identity);
-    let digest = Sha256::digest(canonical.as_bytes());
-    format!("{:x}", digest)[..16].to_string()
+    Ok(sha256_hex(canonical.as_bytes())?[..16].to_string())
 }
 
 /// Validate that a `SourceIdentity` has required fields set.
@@ -122,15 +121,15 @@ mod tests {
 
     #[test]
     fn test_id_is_16_chars() {
-        let id = compute_mx_source_id(&base_identity());
+        let id = compute_mx_source_id(&base_identity()).expect("source id");
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn test_deterministic() {
-        let id1 = compute_mx_source_id(&base_identity());
-        let id2 = compute_mx_source_id(&base_identity());
+        let id1 = compute_mx_source_id(&base_identity()).expect("source id");
+        let id2 = compute_mx_source_id(&base_identity()).expect("source id");
         assert_eq!(id1, id2);
     }
 
@@ -140,8 +139,8 @@ mod tests {
         upper.model_name = "DEEPSEEK-AI/DEEPSEEK-V3".to_string();
         upper.dtype = "BFLOAT16".to_string();
         assert_eq!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&upper)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&upper).expect("source id")
         );
     }
 
@@ -150,8 +149,8 @@ mod tests {
         let mut tp4 = base_identity();
         tp4.tensor_parallel_size = 4;
         assert_ne!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&tp4)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&tp4).expect("source id")
         );
     }
 
@@ -160,8 +159,8 @@ mod tests {
         let mut fp8 = base_identity();
         fp8.dtype = "float8_e4m3fn".to_string();
         assert_ne!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&fp8)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&fp8).expect("source id")
         );
     }
 
@@ -170,14 +169,17 @@ mod tests {
         let mut lora = base_identity();
         lora.mx_source_type = 1; // LoRA
         assert_ne!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&lora)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&lora).expect("source id")
         );
     }
 
     #[test]
     fn test_empty_artifact_fields_preserve_existing_id() {
-        assert_eq!(compute_mx_source_id(&base_identity()), "e0d1bc7459cb4cde");
+        assert_eq!(
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            "e0d1bc7459cb4cde"
+        );
     }
 
     #[test]
@@ -196,8 +198,8 @@ mod tests {
         different_torch.torch_version = "2.9.0+cu128".to_string();
 
         assert_ne!(
-            compute_mx_source_id(&artifact),
-            compute_mx_source_id(&different_torch)
+            compute_mx_source_id(&artifact).expect("source id"),
+            compute_mx_source_id(&different_torch).expect("source id")
         );
     }
 
@@ -215,7 +217,10 @@ mod tests {
         lower.backend_framework_version = "vllm-0.10.0".to_string();
         lower.gpu_arch = "sm90".to_string();
 
-        assert_eq!(compute_mx_source_id(&upper), compute_mx_source_id(&lower));
+        assert_eq!(
+            compute_mx_source_id(&upper).expect("source id"),
+            compute_mx_source_id(&lower).expect("source id")
+        );
     }
 
     #[test]
@@ -232,7 +237,10 @@ mod tests {
         b.extra_parameters
             .insert("z_key".to_string(), "val".to_string());
 
-        assert_eq!(compute_mx_source_id(&a), compute_mx_source_id(&b));
+        assert_eq!(
+            compute_mx_source_id(&a).expect("source id"),
+            compute_mx_source_id(&b).expect("source id")
+        );
     }
 
     #[test]
@@ -240,8 +248,8 @@ mod tests {
         let mut pinned = base_identity();
         pinned.revision = "abc123def4567890".to_string();
         assert_ne!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&pinned)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&pinned).expect("source id")
         );
     }
 
@@ -251,7 +259,10 @@ mod tests {
         upper.revision = "ABC123DEF4567890".to_string();
         let mut lower = base_identity();
         lower.revision = "abc123def4567890".to_string();
-        assert_eq!(compute_mx_source_id(&upper), compute_mx_source_id(&lower));
+        assert_eq!(
+            compute_mx_source_id(&upper).expect("source id"),
+            compute_mx_source_id(&lower).expect("source id")
+        );
     }
 
     // Cross-checked against modelexpress_client/python/tests/test_source_id.py.
@@ -260,14 +271,20 @@ mod tests {
     // the mismatch is caught in CI.
     #[test]
     fn test_python_cross_check_base_identity() {
-        assert_eq!(compute_mx_source_id(&base_identity()), "e0d1bc7459cb4cde");
+        assert_eq!(
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            "e0d1bc7459cb4cde"
+        );
     }
 
     #[test]
     fn test_python_cross_check_with_revision() {
         let mut pinned = base_identity();
         pinned.revision = "abc123def4567890".to_string();
-        assert_eq!(compute_mx_source_id(&pinned), "96db7e109daf9e53");
+        assert_eq!(
+            compute_mx_source_id(&pinned).expect("source id"),
+            "96db7e109daf9e53"
+        );
     }
 
     #[test]
@@ -283,7 +300,10 @@ mod tests {
             .insert("Foo".to_string(), "a".to_string());
         id.extra_parameters
             .insert("foo".to_string(), "b".to_string());
-        assert_eq!(compute_mx_source_id(&id), "f4eeab03e859b088");
+        assert_eq!(
+            compute_mx_source_id(&id).expect("source id"),
+            "f4eeab03e859b088"
+        );
     }
 
     #[test]

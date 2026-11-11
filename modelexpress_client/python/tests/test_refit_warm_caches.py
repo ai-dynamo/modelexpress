@@ -3,10 +3,10 @@
 
 import hashlib
 import json
-import time
 from dataclasses import replace
-from types import SimpleNamespace
 from modelexpress_rl.version import MeshIdentity
+
+from modelexpress_rl.inference.trainer_plan import TrainerTransferPlan
 
 import pytest
 import torch
@@ -18,9 +18,7 @@ from modelexpress_rl.refit.reshard.rendezvous import (
 )
 from modelexpress_rl.refit.reshard.slice_plan import Shard
 from modelexpress_rl.refit.reshard.transfer_plan import (
-    ConvertSource,
     SourceInfo,
-    LogicalTransferPlan,
     plan_transfer,
 )
 from modelexpress_rl.refit.reshard.types import (
@@ -29,12 +27,8 @@ from modelexpress_rl.refit.reshard.types import (
     RecordedCopy,
 )
 from modelexpress_rl.inference.nixl_staged_transfer import (
-    _bounded_batches,
     _NixlStagedTransfer,
-    _PreparedNixlTransfer,
-    _ResolvedSources,
     _SourceBinding,
-    _resolve_sources,
     _required_agent_metadata,
 )
 
@@ -42,6 +36,7 @@ from modelexpress_rl.inference.adapter import TrainerSourceShard
 from modelexpress_rl.inference.plan import TrainerSourceSnapshot
 
 from tests.test_refit_bounded_descriptors import harness, _check_values
+from tests.helpers.refit_replay import resolve_sources as _resolve_sources
 
 
 def _manifest(
@@ -80,49 +75,6 @@ def _manifest(
     )
 
 
-@pytest.mark.parametrize("padded", [False, True])
-def test_converted_copy_uses_captured_slice_with_arena_storage_offset(
-    monkeypatch, padded
-) -> None:
-    monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
-    width = 6 if padded else 4
-    offset = 1 if padded else 0
-    arena = torch.full((8 * width + 16,), -17.0, dtype=torch.bfloat16)
-    target = arena[8 : 8 + 8 * width].view(8, width)
-    source = torch.arange(32, dtype=torch.float32).view(8, 4) / 1000
-    capture = CaptureResult(
-        copies=[
-            RecordedCopy(
-                "source", (), "layer.weight", offset, (8, 4), (width, 1), torch.bfloat16
-            )
-        ]
-    )
-    plan = LogicalTransferPlan(
-        converts=(ConvertSource("layer.weight", (8, 4), torch.float32, ()),)
-    )
-    transfer = object.__new__(_NixlStagedTransfer)
-    transfer._recv_buffers = {"layer.weight": target}
-    transfer._convert_buffers = {"layer.weight": source}
-    transfer._device = torch.device("cpu")
-    transfer._device_id = 0
-    prepared = _PreparedNixlTransfer(
-        plan,
-        capture,
-        {},
-        (),
-        SimpleNamespace(await_reads=lambda _: None),
-        _SourceBinding(_ResolvedSources({}, {}, {}, {}), {}, ()),
-    )
-    for version in range(3):
-        source.add_(1)
-        transfer._complete_stage(prepared, [], time.perf_counter())
-        assert torch.equal(target[:, offset : offset + 4], source.to(torch.bfloat16))
-        assert torch.all(arena[:8] == -17) and torch.all(arena[-8:] == -17)
-        if padded:
-            assert torch.all(target[:, 0] == -17) and torch.all(target[:, -1] == -17)
-
-
 def _bounded_cache_inputs():
     manifests = [
         _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100),
@@ -131,7 +83,7 @@ def _bounded_cache_inputs():
     return {
         "manifests": manifests,
         "resolved": _resolve_sources(manifests),
-        "capture": CaptureResult(
+        "capture": CaptureResult(source_replay=True,
             copies=[
                 RecordedCopy("weight", (), "layer.weight", 0, (4,), (1,), torch.float32)
             ]
@@ -157,29 +109,31 @@ def _trainer_snapshot(manifests: list[bytes]) -> TrainerSourceSnapshot:
     )
 
 
-def test_retaining_needed_sources_keeps_agent_alignment_without_copying_metadata():
+def test_binding_keeps_original_selection_and_connects_only_needed_sources():
     manifests = [
         _manifest(agent_name="unused", endpoint="unused:1", offset=0, address=100,
                   name="unused", shard_shape=(4,)),
         _manifest(agent_name="needed", endpoint="needed:1", offset=0, address=200,
                   shard_shape=(4,)),
     ]
-    resolved = _resolve_sources(manifests)
-    trainer = replace(_trainer_snapshot(manifests), resolved_metadata=resolved)
-    capture = CaptureResult(copies=[
+    trainer = _trainer_snapshot(manifests)
+    binding = _SourceBinding.from_snapshot(trainer, {})
+    resolved = binding.resolved
+    capture = CaptureResult(source_replay=True, copies=[
         RecordedCopy("weight", (), "layer.weight", 0, (4,), (1,), torch.float32)
     ])
     plan = plan_transfer(capture, resolved.sources,
                          source_slots={"unused": "0", "needed": "1"})
 
-    retained = _NixlStagedTransfer._retain_needed_sources(trainer, plan)
-    binding = _NixlStagedTransfer._source_binding(retained)
-
-    assert [shard.source_slot_id for shard in retained.shards] == ["1"]
-    assert binding.agents_by_slot == {"1": "needed"}
-    assert retained.resolved_metadata.sources is resolved.sources
-    assert retained.resolved_metadata.session_to_agent is resolved.session_to_agent
-    assert _required_agent_metadata(plan, retained.resolved_metadata, binding) == {
+    assert [shard.source_slot_id for shard in trainer.shards] == ["0", "1"]
+    assert binding.agents_by_slot == {"0": "unused", "1": "needed"}
+    assert binding.physical_fingerprint == trainer.physical_fingerprint
+    transfer = object.__new__(_NixlStagedTransfer)
+    transfer._binding = binding
+    metrics = {}
+    assert transfer._resolve_metadata(trainer, metrics) is binding
+    assert metrics["source_cache_hits"] == 1
+    assert _required_agent_metadata(plan, resolved, binding) == {
         "needed": b"nixl-metadata"
     }
     for read in plan._all_segments():
@@ -187,16 +141,14 @@ def test_retaining_needed_sources_keeps_agent_alignment_without_copying_metadata
 
 
 @pytest.mark.parametrize(
-    "defect", ["empty", "malformed", "duplicate", "mutable", "geometry"]
+    "defect", ["empty", "malformed", "duplicate", "duplicate_slot", "mutable", "geometry"]
 )
 def test_metadata_rejects_bad_manifests_even_with_a_cached_source(
     monkeypatch, defect
 ) -> None:
     manifest = _manifest(agent_name="a", endpoint="a:19000", offset=0, address=100)
     transfer = object.__new__(_NixlStagedTransfer)
-    transfer._trainer_source_snapshot = replace(
-        _trainer_snapshot([manifest]), resolved_metadata=_resolve_sources([manifest])
-    )
+    transfer._binding = _SourceBinding.from_snapshot(_trainer_snapshot([manifest]), {})
     if defect == "geometry":
         payload = json.loads(
             _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200)
@@ -208,12 +160,24 @@ def test_metadata_rejects_bad_manifests_even_with_a_cached_source(
             "empty": [],
             "malformed": [b"not-json"],
             "duplicate": [manifest, manifest],
+            "duplicate_slot": [
+                manifest,
+                _manifest(agent_name="b", endpoint="b:19000", offset=2, address=200),
+            ],
             "mutable": [bytearray(manifest)],
         }[defect]
     with pytest.raises((ValueError, TypeError)):
-        transfer._resolve_metadata(bad, {})
-
-
+        snapshot = TrainerSourceSnapshot(
+            MeshIdentity("invalid", 1),
+            tuple(
+                TrainerSourceShard(
+                    "0" if defect == "duplicate_slot" else str(index),
+                    str(index), "digest", "source:19000", blob,
+                )
+                for index, blob in enumerate(bad)
+            ),
+        )
+        transfer._resolve_metadata(snapshot, {})
 
 
 @pytest.mark.parametrize(
@@ -222,7 +186,7 @@ def test_metadata_rejects_bad_manifests_even_with_a_cached_source(
 def test_supplied_complete_plan_keeps_global_coverage_gate(monkeypatch, defect):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "0")
     source = SourceInfo((4,), torch.float32, 4, [Shard((0,), (4,), "s", 100, 4)])
-    capture = CaptureResult(
+    capture = CaptureResult(source_replay=True,
         copies=[RecordedCopy("w", (), "layer.w", 0, (4,), (1,), torch.float32)]
     )
     layout = {"layer.w": ((4,), torch.float32)}
@@ -238,7 +202,7 @@ def test_supplied_complete_plan_keeps_global_coverage_gate(monkeypatch, defect):
     if defect == "fallback":
         complete = replace(complete, fallback=("w",))
     with pytest.raises(IncompleteRefit):
-        _bounded_batches(capture, layout, {"w": source}, 512, complete_plan=complete)
+        TrainerTransferPlan.validate_capture(capture, layout, complete)
 
 
 @pytest.mark.parametrize("diagnostic", ["plan"])

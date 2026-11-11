@@ -532,3 +532,21 @@ if [[ " $* " == *" delete namespace "* ]]; then touch "$FIXTURE/deleted"; fi
     assert result.returncode == 0, result.stdout + result.stderr
     assert int((tmp_path / "reads").read_text()) == 100
     assert "host pods are gone" in result.stdout
+
+
+def test_health_success_is_not_rejected_by_an_immediate_second_probe(tmp_path):
+    command = '''if [[ " $* " == *" get pods "* ]]; then
+  echo '{"items":[{"metadata":{"name":"worker"}}]}'; exit 0
+fi
+if [[ " $* " == *" exec "* ]]; then
+  count=$(cat "$FIXTURE/probes" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "$FIXTURE/probes"
+  if [ "$count" -eq 1 ]; then exit 0; else exit 28; fi
+fi
+exit 0
+'''
+    body = 'source .github/actions/run-mx-p2p-test/vram-sampling.sh\ntest_pod=\n'
+    body += 'wait_for_health Source fixture worker 8000 test_pod 900\n'
+    result = run_shell(tmp_path, body, command)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / "probes").read_text().strip() == "1"

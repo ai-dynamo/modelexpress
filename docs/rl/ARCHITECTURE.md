@@ -82,9 +82,17 @@ DIRECT installation and pipelined worker streaming are
 not implemented by this control-plane slice.
 NIXL manifest endpoints belong to their physical worker shards; a typed object
 storage source belongs directly to its durable `WeightVersion`. The protocol
-can identify S3, Azure Blob Storage, or GCS. The Refit service and trainer
-publication currently accept only S3. Generator checkpoint preparation accepts
-S3 and Azure Blob Storage; exact desired-version startup remains S3-only.
+can identify S3, Azure Blob Storage, or GCS. The Refit service accepts S3 and Azure
+publications; the trainer SDK currently publishes only to S3. Generator checkpoint
+preparation and exact desired-version startup accept S3 and Azure Blob Storage.
+Startup reconstructs the full root and ordered deltas before engine loading.
+The server allows different providers within a run, including across delta-base
+relationships. Generators do not support mixed-provider replay: every version in
+a replay chain must use the same storage provider.
+Redis stores `object_storage_uri` and `object_storage_type`, with `s3_uri` as an
+S3-only mirror for older servers. Readers fall back to `s3_uri` for older records
+without `object_storage_uri`. A missing provider still means S3; checkpoint bytes
+remain in object storage.
 On the NIXL path, weight bytes and full tensor manifests remain
 on trainer workers. On the S3 path, rank zero uploads the version's global index
 after every trainer rank has uploaded its owned shard. `XOR_DELTA` versions use
@@ -112,6 +120,18 @@ before shard download. Full versions use a standard safetensors index, carry
 optional per-tensor Adler-32 checksums under tensor-name keys in shard metadata
 when the index declares `checksum_format="adler32"`, and reset the exact base
 for later deltas.
+
+Canonical S3 artifact downloads default to a persistent TransferManager.
+`MX_S3_DOWNLOAD_BACKEND=preallocated` selects a preallocated-buffer implementation:
+HEAD supplies size and ETag, conditional data GETs share one per-client worker
+pool, and each response body has bounded streaming retries with jittered backoff. Small objects use
+one data GET; large objects use parallel byte ranges. Object changes and invalid
+range responses fail preparation. Both implementations return complete artifact
+bytes to the receiver before checkpoint validation and reconstruction. This
+selection does not change the normal ModelStreamer loader. The downloader
+implementations own their resources behind a shared `get`/`close` interface. See
+[S3 transfer tuning](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning).
+
 Canonical S3 versions are retained for rollout fault recovery. Trainer
 processes keep only the current base snapshot; older
 immutable S3 objects are governed by external bucket lifecycle policy.
@@ -198,6 +218,9 @@ preparation, without changing live weights. Trainer-source preparation receives
 a full copy; generator-peer preparation reserves a read that runs during apply.
 The handle owns the version lease through installation at the caller's safe
 point. Applying the weights or releasing an unapplied handle ends the lease.
+Successful installation commits the serving version even if subsequent lease
+cleanup fails. The cleanup error is reported; retrying apply retries lease cleanup
+without reinstalling weights or publishing the version again.
 With bounded staging configured, the same handle holds deferred batch reads;
 `apply_weight()` performs pipelined transfer and installation.
 
@@ -207,17 +230,58 @@ prevent untrusted clients from reaching MX server and worker gRPC endpoints.
 Transport authentication and TLS require a separate protocol and deployment
 design; they are not provided by this implementation.
 
-`GeneratorRuntime` composes three independent seams. Source resolvers discover
-candidate locations without moving bytes; update methods prepare a typed update;
-the engine installer commits it at the caller's safe point. Trainer and object-storage
-methods transfer or reconstruct private artifacts during preparation. The
-generator-peer method instead validates the peer and exact runtime tensor catalog
-during preparation, then transfers directly into live storage at the safe point.
-Source fallback and retry limits live in the planner/session rather than in
-engine integrations.
+`GeneratorRuntime` composes source resolvers, update methods, and an engine
+installer. Resolvers discover candidates without moving bytes; methods prepare
+updates; installers apply them at the engine safe point. `WeightUpdateSession`
+owns source order, compatibility matching, attempt budgets, fallback, replay
+preparation, and version leases. It treats prepared payloads as opaque and asks
+the method for metrics and release safety. Runtime initialization checks that the
+installer supports the configured full-copy or bounded artifact before allocating
+receive resources.
 
-- `nixl_staged_transfer.py` owns exact-manifest decoding, transfer planning,
-  reusable registered buffers, NIXL reads, transforms, and digest verification.
+### Refit class responsibilities
+
+Arrows show calls and resource ownership. Class docstrings describe each class's
+responsibility; the streaming and failure contracts are detailed [below](#staged-transfer-caching-and-failure-handling).
+
+```mermaid
+flowchart TD
+    S["WeightUpdateSession"]
+    M["UpdateMethod"]
+    A["PreparedArtifact"]
+    T["LoadTimeTensorNixlUpdateMethod"]
+    P["RuntimeTensorNixlUpdateMethod"]
+    I["_VllmInstaller"]
+    N["_NixlStagedTransfer"]
+    C["TrainerTransferPlan"]
+    TB["TransferBatch"]
+    SB["_SourceBinding"]
+    B["PreparedStreamingTensors"]
+    R["SourceInstallPlan"]
+    X["_InstallExecution"]
+    TM["NixlTransferManager (trainer)"]
+    EM["NixlTransferManager (engine)"]
+
+    S -->|Prepares trainer update| T
+    S -->|Prepares peer update| P
+    S -->|Passes opaque payload at safe point| I
+    S -->|Queries release safety and metrics| M
+    T -.->|Implements| M
+    P -.->|Implements| M
+    M -->|Prepares and manages| A
+    I -->|Interprets payload| A
+    T -->|Delegates receive work| N
+    N -->|Compiles geometry| C
+    C -->|Compiles bounded schedule| TB
+    N -->|Owns physical selection| SB
+    T -->|Creates bounded artifact| B
+    I -->|Consumes through callback| B
+    I -->|Owns captured plan| R
+    R -->|Creates per-update execution| X
+    N -->|Owns| TM
+    P -->|Borrows| EM
+```
+
 - `inference/checkpoint_store.py` owns the host-local immutable lineage layout,
   locking, temporary-directory promotion, atomic JSON persistence, artifact
   fingerprints, and activation state.
@@ -225,8 +289,6 @@ engine integrations.
   and XOR reconstruction into derived checkpoints.
 - `object_storage_reader.py` defines the shared checkpoint-reader interface
   implemented by `S3Client` and `AzureBlobReader`.
-- `inference/engines/vllm/installer.py` owns vLLM load-layout capture and
-  graph-safe installation through vLLM's layerwise reload and post-load path.
 - `inference/engines/sglang/installer.py` reloads a prepared canonical checkpoint
   through SGLang's native safetensors loader, using `DefaultModelLoader.Source`
   to retain the engine's source defaults, including weight-file pattern selection.
@@ -237,7 +299,6 @@ and share full-checkpoint validation, XOR delta replay, cache promotion, and
 activation. Every source in a replay chain must match the configured provider;
 a mismatch fails before downloads begin. Azure full checkpoints download to disk
 before installation. The optional full-checkpoint streaming path remains S3-only.
-Azure publication and exact desired-version startup require separate support.
 
 Canonical preparation requests queue on a separate `.prepare.lock`. Once the
 leader has reconstructed a target, followers verify and attach to that READY
@@ -301,41 +362,40 @@ incremental bucket submissions, a worker failure prevents publication. Use
 `ModelExpressGeneratorConfig.staging_buffer_bytes` sets bounded-streaming
 capacity per arena, and `staging_buffers_count` defaults to one. The streaming
 client uses their product as its total staging limit. `staging_device` selects
-CUDA or pinned host receive memory.
+engine-device (`None`, or the engine's device type) or pinned host (`"cpu"`)
+receive memory.
 
-The `stage_weight()` / `apply_weight()` generator APIs hold a version lease
-across metadata preparation and incremental installation. The NIXL receiver
-preserves recorded source-write order for vLLM and uses
-one or two registered byte arenas (`staging_buffers`) on CUDA or pinned host
-memory (`staging_device`). Receive tensors, wire-dtype conversion buffers,
-full-source reconstruction buffers, and alignment all count toward each
-buffer's capacity. With two arenas the READ for batch
-`i + 1` is posted before batch `i` is yielded for commit, allowing asynchronous
-READs to overlap installation; an arena is refilled only after its commit has
-synchronized. Host arenas are registered as NIXL DRAM and read with a DRAM local
-memory type. The vLLM installer copies each batch into engine-owned load-time
-tensors, then uses native post-load processing to restore existing kernel
-storage. Receive-arena views are never passed to engine callbacks. For trainer
-sources without bounded staging configured, `stage_weight()` transfers a full
-independent copy before installation.
+For trainer sources, `stage_weight()` prepares a complete private copy unless
+bounded staging is configured. In bounded mode it defers reads to `apply_weight()`;
+the [streaming installation contract](#bounded-vllm-streaming-installation)
+describes arena reuse, replay, and cleanup. Both modes retain the version lease
+through installation.
 
-The logical plan is cached for one mesh ID and generation and contains only the
-shard groups needed by the generator. Groups list all replicas in worker-ID
-order; metadata is fetched lazily when a published replica is selected.
-Changing replicas rebinds physical sources without recompiling logical reads.
-A mesh change rebuilds the logical plan. Native preparation failures discard
-physical state while retaining the logical plan; each update has fresh checksums
-and a lease.
+The NIXL receiver's owned agent, registered-buffer allocation scope, and
+completion fences come from the engine device's `AcceleratorBackend`, so CUDA
+and XPU generators share one path.
+
+`registered_buffer_alloc_scope()` selects the allocation scope for registered
+receive and staging buffers from `AcceleratorBackend.requires_classic_alloc_pool()`,
+which states a requirement rather than a capability. CUDA requires it and XPU
+does not: CUDA uses the classic-`cudaMalloc` pool in
+`modelexpress_rl/refit/reshard/cuda_pool.py` because its caching allocator under
+`expandable_segments:True` can return VMM ranges that register successfully but
+fail during RDMA WRITE when `nvidia_peermem` cannot pin the underlying pages (that
+module's docstring records the exact failure signature). XPU uses its normal
+allocator because no equivalent hazard is known or has been observed on XPU.
+Successful XPU registration does not prove the WRITE-time hazard absent, so ruling
+it out would take a real RDMA write into an XPU buffer allocated under an
+expandable-segment equivalent. `torch.xpu` does expose `MemPool` and
+`XPUPluggableAllocator`, so an alternate XPU pool could be implemented if that
+test ever says one is needed.
 
 `MX_REFIT_PREFETCH_REPLICA_METADATA` fetches all needed replicas up front.
 `MX_REFIT_DEBUG_VALIDATE_REPLICAS` checks equivalent canonical coverage.
 
-`MX_REFIT_PACK_MODULES` coalesces consecutive owning-module batches up to the
-same staging limit, trading a larger arena residency for fewer of them. It never
-changes which source bytes are read: the packed batch preserves source ranges,
-byte counts and descriptor counts, while destination offsets follow the packed
-arena layout. Modules that pull the same complete source stay in separate
-batches. It is on by default; disabling it retains one owning module per batch.
+Trainer transfers batch consecutive captured source writes up to the staging
+limit, preserving their recorded order. The legacy `MX_REFIT_PACK_MODULES`
+setting has no effect on ordered source replay.
 
 Before vLLM rebuilds per-module load-time parameter skeletons, the adapter records
 shared parameter objects and reconnects those aliases afterward. Alias owners
@@ -350,22 +410,13 @@ only while it still points to that exact committed object; a missing or rebound
 parameter is rejected. Installation reconnects shared bindings after each
 managed owner's kernel-storage restoration, before dependent hooks execute.
 
-Full-copy or bounded mode is fixed for the client's lifetime. Preparation retries
-retain one version lease and discard failed physical setup; installation failures
-fence the engine rather than retrying a partially committed update.
-
-Streaming is opt-in and trainer-only for supported vLLM models, including
-quantized models. It does not publish generator peers or roll back partially installed
-versions. An installation failure marks the client engine state uncertain and
-makes the failed handle unusable for another installation. A subsequent
-`stage_weight()` releases the failed transaction after proven cleanup, acquires
-a new version lease, rediscovers sources, and prepares a complete full-tensor
-replay. The engine stays uncertain until that fresh transaction installs
-successfully. Unproven transport or GPU cleanup retains resources and leases
-and requires a process restart. The hosting framework must keep all replicas
-paused throughout recovery. Only completion of all replicas
-permits resuming generation. The staging limit excludes live model weights,
-engine-owned post-load workspace, CUDA allocator overhead, and transport metadata.
+Full-copy or bounded mode is fixed for the client's lifetime. Streaming is
+opt-in and trainer-only for supported vLLM models, including quantized models.
+It does not publish generator peers. After proven cleanup of a failed install,
+`stage_weight()` can start a fresh, leased full-tensor transaction; the engine
+remains uncertain until that transaction succeeds. The hosting framework must
+keep every replica paused until complete recovery. Unproven cleanup requires a
+process restart; see the [failure and resource-lifetime rules](#bounded-vllm-streaming-installation).
 
 | RPC | Request | Response | Purpose |
 |-----|---------|----------|---------|
@@ -469,8 +520,11 @@ the full checkpoint path. See [the delta refit guide](S3_DELTA_WEIGHT_REFIT.md).
 
 The canonical receiver retains each full checkpoint and delta payload under its
 version, then writes a resolved chain manifest. A full target is directly
-installable. The first delta after a full checkpoint copies that immutable full
-checkpoint into a version-scoped derived checkpoint. On Linux the checkpoint
+installable. The first delta after a full checkpoint applies in place to a
+working copy of that immutable full checkpoint, which becomes a version-scoped
+derived checkpoint. [The delta refit guide](S3_DELTA_WEIGHT_REFIT.md#working-copies)
+lists the full checkpoints that get a working copy before that delta; for the
+others, the delta copies the full checkpoint once. On Linux the checkpoint
 store attempts `FICLONE` per regular file, sharing blocks copy-on-write where
 the filesystem supports reflinks. Unsupported filesystems, cross-mount copies,
 and other platforms use an ordinary copy. This includes `EBADF` from `FICLONE`
@@ -478,7 +532,14 @@ on already-opened files when the source filesystem cannot reflink.
 File metadata and symlink dereferencing
 retain `copytree`/`copy2` behavior; mutable files never use hard links. Clone I/O,
 permission, and capacity failures abort preparation and clean its temporary
-directory before promotion. Later sequential deltas
+directory before promotion. The background thread that copies the seed holds
+only the preparation lock, so other ranks can still initialize and install while the
+first delta waits for the copy and renames it. The copy is written in place and
+recorded last, and deltas use only a recorded copy, so a later preparation deletes a partial one under the
+store lock. A rank that prepares a full checkpoint or shuts down cancels its own
+copy between 256 MiB chunks or while it waits for a store lock; a streamed full
+checkpoint waits for the copy
+before writing the cache. Later sequential deltas
 rename the active materialization and apply only the incoming XOR delta in
 place, avoiding another full-model copy. Canonical artifacts are never modified
 during reconstruction, and derived checkpoints can be rebuilt from the lineage.
@@ -758,6 +819,9 @@ the bridge merges staging
 and installation metrics and logs each numeric `perf/` phase as a separate INFO
 line in deterministic key order. `perf/mx_receive_stage_weight_time` covers the
 complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
+`perf/mx_receive_prepare_lock_wait` is the part spent waiting for the node's
+preparation lock, which another rank's preparation, a streamed full checkpoint's
+cache writer, or the background seed copy may hold.
 
 The active vLLM refit installer lives in
 `modelexpress_rl.inference.engines.vllm.installer`. It captures canonical
@@ -797,8 +861,10 @@ The refit control plane owns worker registration, immutable version publication,
 and version leases; receivers resolve those manifests before planning transfers.
 Megatron and FSDP use this shared lifecycle.
 
-`modelexpress_rl/inference/nixl_staged_transfer.py` owns exact-manifest planning,
-trainer staging buffers, direct generator-peer transfer, and verification. The
+`modelexpress_rl/inference/trainer_plan.py` owns trainer-plan compilation and
+validation. `inference/nixl_staged_transfer.py` owns trainer source staging buffers,
+physical transport and verification. Direct generator-peer reads
+and donor lease cleanup belong to `inference/methods/runtime_tensor.py`. The
 vLLM-specific
 `installer.py` captures trainer load-time geometry through layerwise reload and
 installs it through `process_weights_after_loading`. For tensor and checkpoint
@@ -912,7 +978,7 @@ transformations.
 Receive-arena tensors are never attached to the model or passed to post-load
 callbacks. The copy boundary requires ordinary Tensor storage views and rejects
 custom dispatch modes. A callback may retain an engine-owned tensor without
-preventing arena reuse; CUDA completion is required before another READ overwrites
+preventing arena reuse; device completion is required before another READ overwrites
 an arena. Captured installation preserves aliases needed for tied parameters and
 runtime bindings. Alias validation distinguishes repeated paths to one slot from
 ties between distinct slots, and checks relevant edges after callbacks without
@@ -948,12 +1014,12 @@ copies constant integer list/tensor indices, preserving negative and empty-index
 semantics. Boolean masks and indices without concrete values remain unsupported.
 Basic integer, slice, ellipsis and new-axis indexing remain supported. Grouped
 plans inherit the complete plan's full-source verification policy.
-`plan_transfer_groups` derives module plans from a complete plan, keeping the
-shared source table and its index map inside the planner. Module batching and
-packing preserve the same read order for legacy captures. Source replay instead
-batches consecutive writes without regrouping by owner; module packing does not
-reorder those writes. Each write stages a representable source-view prefix, then
-locally replays the remaining operations.
+`plan_transfer_groups` remains available to general planner callers. The trainer
+receiver accepts ordered source replay only and batches consecutive writes
+without regrouping by owner. Each write stages a representable source-view
+prefix, then the installer locally replays the remaining operations. Full-copy
+and bounded staging both produce `SourceReplayBatch`; the receiver does not
+reconstruct a second representation of complete destination tensors.
 Before each bounded read, the receiver clears the used arena region once,
 preserving zero-filled gaps without a separate clear for each source write.
 Ordered replay digest verification leaves the normal reads and staging layout
@@ -976,10 +1042,24 @@ reads remain.
 The combined capture is the reusable capture artifact; ordered replay planning
 consumes it directly and does not separately compose trainer conversion with an
 installer capture. Capture, logical plan and physical binding have distinct
-lifetimes. The installer keeps one cached runtime-binding record and a source
-installation plan containing the targets and completion schedule. Installation
-follows recorded write order; no separate model-order index is retained. Bounded
-schedules retain only the batches that execute, including any module packing.
+lifetimes. `SourceInstallPlan` owns one captured engine generation: runtime
+bindings, load-time targets, persistent inputs, completion schedule and the isolated
+capture cache. Invalidating capture discards this plan together. Its execution
+owns pending inputs, ordered writes, owner materialization, native processing,
+and restoration; the installer consumes batches through `apply()` and `finish()`.
+Completion follows the validated schedule, consumed-write count and remaining
+active owners. Canonical slots initialize tied storage once, without separate
+installed-parameter or initialized-slot sets.
+Installation requires a captured source plan before entering native reload.
+It does not reconstruct targets or a completion schedule from a received batch.
+Installation follows recorded write order; no separate model-order index is retained. Bounded
+schedules retain only the batches that execute. `TrainerTransferPlan.compile()`
+validates the complete capture once, then partitions consecutive writes against
+per-arena capacity. Full-copy and bounded preparation consume the same compiled
+plan; partitioning does not replan or revalidate each subset. Each `TransferBatch`
+stores its logical reads and aligned byte ranges once, including raw tensor ends
+and padded arena capacity. Execution materializes views from those ranges without
+repeating packing arithmetic or constructing per-batch capture objects.
 Same-generation updates reuse the capture, logical plan and its replay
 scratch-memory estimate. A generation change rebuilds the logical plan and
 physical binding. Physical sessions and addresses are refreshed as needed. Per-update readiness, checksums, stream
@@ -1014,21 +1094,42 @@ additional memory, as do the live model and runtime state. The staging limit is
 therefore not a total GPU-memory bound. Two arenas can overlap the next READ with
 installation of the current group; the benefit must be measured on the target
 hardware. Trainer staging mode and receiver arena location are separate choices.
+Host receive arenas register as NIXL DRAM; device receive arenas register as VRAM.
 
 READ descriptors are cached by source group and replica while destinations
-remain valid. A replica switch builds only missing descriptors; returning to a
-cached replica reuses them. Each batch recreates views, zeroes padding and posts
-fresh READs. Mesh changes and destination teardown clear execution caches;
-failed attempts invalidate the active binding and retain only safe resources.
+remain valid. `TransferBindingCache` groups logical reads by source slot once and
+uses the same binder as `bind_transfer`. A replica switch builds only missing
+descriptors; returning to a cached replica reuses them. Binding preserves the
+original read order, including duplicate and zero-byte reads, without constructing
+filtered logical plans. Each batch recreates views, zeroes padding and posts
+fresh READs. Mesh changes and destination teardown clear execution caches.
+Transport-only failures discard the transport while retaining immutable decoded
+source metadata. Native resets and mesh retirement also discard physical bindings
+and descriptor caches.
 
 The resolver owns `_TrainerReplicaGroup` objects per logical slot, retaining all mesh members in worker order
 and cached stable metadata until `MeshIdentity` changes. Prefetch fills only group caches; selections get fresh checksums.
-Immutable snapshots hold no tensors, handles, checksums or leases. Compilation checks coverage and capacity.
+Immutable snapshots hold only the selected shard metadata and mesh identity;
+they hold no decoded executor state, tensors, handles, checksums or leases.
+`_SourceBinding` owns decoding and the direct slot-to-agent association. Its cache
+key retains the complete selected snapshot, including unused sources; only sources
+required by logical reads are connected. Preparation accepts that snapshot as its
+single source of manifest metadata. Compilation checks coverage and capacity.
 
 The prepared streaming artifact owns its iterator and remains protected by the
-version lease. An installation failure fences the engine and never falls back
-after a possible write. CUDA work must drain before iterator cleanup and source
-release. A failed drain, iterator close or source iteration retains the active
+version lease. Its `consume()` context covers the entire engine reload and final
+CUDA drain; the source opens only when `apply(install_batch)` first consumes it.
+The artifact retains the current borrowed batch, calls the installer, and drains
+GPU reads before releasing that batch or advancing its private source. Callers
+cannot consume the producer directly and do not manually commit or drop batches.
+This is the single consumption fence per batch; the executor separately fences
+arena zeroing before NIC writes and waits for RDMA completion. The final reload
+fence remains after all batches finish.
+An installer exception still holds the batch through the final fence; a failed
+fence retains the batch and iterator. The method interprets retained stream state;
+the session asks the method for release safety. An installation failure fences
+the engine and never falls back after a possible write. CUDA work must drain
+before iterator cleanup and source release. A failed drain, iterator close or source iteration retains the active
 handle, receive workspace and source lease and requires a process restart: CUDA
 synchronization alone cannot prove failed RDMA reads have completed. Simultaneous
 installation and cleanup errors preserve the original exception with the cleanup
@@ -1040,7 +1141,14 @@ reconstruction rejects them before transfer. Capture does not maintain a second
 canonical coordinate representation.
 
 vLLM load-time tensor installation accepts only `SourceReplayBatch`, for both
-staged and bounded updates. Completed layer-tensor dictionaries are rejected;
+staged and bounded updates. Each batch carries only its ordered writes and the
+captured replay UUID. Capture creates this identity once; cache deep copies,
+logical planning and bounded partitioning preserve it. The installer owns
+coverage, copy count and completion metadata, and checks the identity before each
+batch's writes. Recapture changes the identity, including after a failed capture;
+weight-version updates and physical replica switches do not change a reused
+capture's identity. A foreign or missing batch identity fails before that batch
+can write live storage. Completed layer-tensor dictionaries are rejected;
 there is no separate complete-layer installer. Writes run in captured order,
 and tied owners finish native processing before their runtime tensors are
 restored. Runtime-tensor and checkpoint artifacts use their own installation APIs.
@@ -1062,8 +1170,9 @@ the transfer owns bindings, transport and descriptor caches. Reset preserves geo
 binding reuse requires successful setup. Optional debug checks revalidate coverage.
 
 Metadata or planning failures leave existing connections and storage intact.
-Native setup failure resets an owned manager before releasing its storage;
-borrowed managers cannot be reset. Failed preparation or READ discards physical
+Native setup failure resets the trainer executor's owned manager before releasing
+its storage. Generator-peer reads borrow the engine manager in their separate
+update method. Failed preparation or READ discards physical
 state while retaining the logical plan. Undrained resources and leases remain
 protected by the installation failure rules.
 
@@ -1237,7 +1346,7 @@ generator = ModelExpressGeneratorClient.initialize(
         source_order=(WeightSource.TRAINER,),
         staging_buffer_bytes=4 * 1024**3,
         staging_buffers_count=2,
-        staging_device="cuda",  # or "cpu" for pinned host staging
+        staging_device=None,  # engine device; or "cpu" for pinned host staging
     )
 )
 # Pause generation on every replica before installing live weights.
@@ -1257,8 +1366,10 @@ generator worker. A module larger than one buffer fails during preparation. Engi
 post-load workspaces and live weights require additional headroom; the limit is
 not a total process-memory cap.
 
-`staging_device` selects where the arenas live. `"cuda"` (default) lands RDMA
-in VRAM and commits with a device copy. `"cpu"` allocates pinned host memory,
+`staging_device` selects where the arenas live. `None` (default) lands RDMA in
+the engine's device memory and commits with a device copy; `"cuda"` or `"xpu"`
+selects the same placement explicitly and must match the engine's device type.
+`"cpu"` allocates pinned host memory,
 registers it as NIXL DRAM, and commits with a host-to-device copy, so the arena
 costs no VRAM. Host staging adds a host-to-device copy and depends on the
 available host-memory and CPU-to-GPU bandwidth. `staging_buffers_count=2` posts the
@@ -1299,7 +1410,7 @@ Streaming reports independent `streaming_total_s`, `streaming_prepare_s`,
 `source_metadata_s`, `layout_capture_s`, `transfer_planning_s`, and
 `connection_registration_s`; the remaining preparation time includes version
 discovery and lease/control operations. Application contains NIXL `wire_s`,
-`reconstruct_s`, `install_commit_s` (including CUDA completion), `reload_s`, and
+`reconstruct_s`, `install_commit_s` (including device completion), `reload_s`, and
 `post_install_sync_s`. In the generic installer, vLLM's post-load processing
 refreshes attention-derived weights within `reload_s`. The ordinary
 `perf/mx_receive_install_time` is not emitted for streaming installation because
@@ -1307,7 +1418,7 @@ its application interval includes network reads. With refit timing enabled,
 DIRECT updates emit the same stage record as staged updates. The installation
 stage's `materialization_s`, `receive_copy_s`, and `post_load_processing_s`
 metadata report host-call durations inside the native engine lifecycle. They
-exclude subsequent CUDA completion waits and are not standalone GPU latencies.
+exclude subsequent device completion waits and are not standalone GPU latencies.
 Do not sum nested parent and child intervals or maxima from different ranks.
 Preserve raw samples and expose residual/unattributed time against the independent
 total rather than describing the entire streaming operation as wire or install.

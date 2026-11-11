@@ -180,3 +180,21 @@ def test_expert_parallel_config_never_reads_a_nonexistent_attribute():
     parallel.expert_parallel_size = 99
 
     assert _derive_expert_parallel_size(parallel) == 2
+
+
+@pytest.mark.parametrize("field", [
+    "data_parallel_size", "prefill_context_parallel_size", "decode_context_parallel_size"
+])
+def test_cold_start_identity_scopes_parallel_topology(monkeypatch, field):
+    monkeypatch.setenv("MX_P2P_COLD_START", "1")
+    first = build_source_identity(_vllm_config(_parallel_config()), _model_config())
+    second = build_source_identity(
+        _vllm_config(_parallel_config(**{field: 2})), _model_config()
+    )
+    assert first.extra_parameters != second.extra_parameters
+
+
+def test_default_identity_remains_unchanged(monkeypatch):
+    monkeypatch.delenv("MX_P2P_COLD_START", raising=False)
+    identity = build_source_identity(_vllm_config(_parallel_config()), _model_config())
+    assert not identity.extra_parameters

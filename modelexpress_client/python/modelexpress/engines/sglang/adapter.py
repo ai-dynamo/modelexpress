@@ -25,6 +25,7 @@ from ...tensor_utils import (
     collect_module_tensors,
 )
 from .draft_weights import draft_weight_adapter_for
+from .runtime_state import finalize_runtime_state, prepare_runtime_tensors
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
 
@@ -33,6 +34,8 @@ if TYPE_CHECKING:
     from sglang.srt.configs.load_config import LoadConfig
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.runtime_context import ParallelContext
+
+    from ...types import TensorDescriptor
 
 
 class SglangAdapter(EngineAdapter):
@@ -94,7 +97,20 @@ class SglangAdapter(EngineAdapter):
 
         return bool(is_cuda_alike())
 
+    @staticmethod
+    def _exclude_hidden_tensor_object(obj: object) -> bool:
+        """Keep distributed process groups and communicators local."""
+        module = (type(obj).__module__ or "") + "."
+        return module.startswith(
+            (
+                "sglang.srt.distributed.",
+                "sglang.srt.layers.communication.",
+                "torch.distributed.",
+            )
+        )
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
+        """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
             raise RuntimeError("SGLang tensor discovery requires result.model")
         # capture_tensor_attrs() only promotes bare Tensor attributes assigned
@@ -110,7 +126,11 @@ class SglangAdapter(EngineAdapter):
         # This adds _mx_* names to the manifest, so source and target must run
         # the same ModelExpress version; mixing old and new manifests fails
         # tensor matching.
-        adopt_hidden_tensors(result.model, self.accelerator_backend)
+        adopt_hidden_tensors(
+            result.model,
+            self.accelerator_backend,
+            exclude=self._exclude_hidden_tensor_object,
+        )
         tensors = collect_module_tensors(result.model, self.accelerator_backend)
         if is_sglang_draft_model(self.model_config):
             selector = draft_weight_adapter_for(
@@ -128,10 +148,27 @@ class SglangAdapter(EngineAdapter):
                     }
         return tensors
 
+    def requires_exact_tensor_catalog(self) -> bool:
+        """Require complete catalogs to keep quantization state consistent."""
+        return True
+
     def before_rdma_receive(self, result: LoadResult) -> LoadResult:
         with capture_tensor_attrs(self.accelerator_backend):
             result = self._post_load_weights(result)
             return self._process_weights_after_loading(result)
+
+    def prepare_rdma_target_from_manifest(
+        self, result: LoadResult, source_tensors: list[TensorDescriptor]
+    ) -> None:
+        if result.model is None:
+            raise RuntimeError("SGLang runtime preparation requires result.model")
+        prepare_runtime_tensors(result.model, source_tensors)
+
+    def after_rdma_receive(self, result: LoadResult) -> LoadResult:
+        if result.model is None:
+            raise RuntimeError("SGLang runtime finalization requires result.model")
+        finalize_runtime_state(result.model)
+        return result
 
     def apply_weight_iter(
         self,

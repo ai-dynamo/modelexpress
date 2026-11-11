@@ -60,6 +60,15 @@ def configure_trtllm_logging() -> None:
     _configure_engine_logging("TRT-LLM")
 
 
+def configure_sglang_logging() -> None:
+    """Keep ModelExpress logs visible in SGLang scheduler subprocesses."""
+    engine = logging.getLogger("sglang")
+    _configure_engine_logging("sglang" if engine.handlers else "")
+    namespace = logging.getLogger("modelexpress")
+    if namespace.handlers:
+        namespace.propagate = False
+
+
 def register_modelexpress():
     """
     Register ModelExpress integrations with vLLM.
