@@ -328,6 +328,26 @@ g++() { echo compiler-ready; }
         for modes in [{"RELEASE": ""}, {"RUN_TESTS": ""}, {"RUN_TESTS": "unknown"}]:
             self.assertNotEqual(check(results, **modes).returncode, 0)
 
+    def test_slack_failure_exception_applies_only_to_release_qualification(self):
+        jobs = workflow("nightly-ci.yml")["jobs"]
+        for phase, job_name in [("release", "trigger-gitlab-release"), ("final", "nightly-status")]:
+            results = {job: {"result": "success"} for job in jobs[job_name]["needs"]}
+            for conclusion in ["failure", "cancelled"]:
+                with self.subTest(phase=phase, conclusion=conclusion):
+                    changed = {**results, "notify-slack-start": {"result": conclusion}}
+                    environment = {
+                        "RELEASE": "true", "RUN_TESTS": "true",
+                        "RESULTS": json.dumps(changed),
+                    }
+                    script = f"bash .github/scripts/check-nightly-results.sh {phase}"
+                    result, _ = execute(script, environment)
+                    self.assertEqual(result.returncode, 0 if phase == "release" else 1, result.stderr)
+                    for required in ["core-tests", "manual-release-approval"]:
+                        with self.subTest(required=required):
+                            failed = {**changed, required: {"result": conclusion}}
+                            result, _ = execute(script, {**environment, "RESULTS": json.dumps(failed)})
+                            self.assertNotEqual(result.returncode, 0)
+
     def test_release_handoff_rejects_missing_artifact_metadata_before_posting(self):
         job = workflow("nightly-ci.yml")["jobs"]["trigger-gitlab-release"]
         trigger = next(step for step in job["steps"] if step.get("name") == "Trigger GitLab pipeline")

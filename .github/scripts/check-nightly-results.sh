@@ -12,7 +12,12 @@ esac
 
 printf '%s\n' "$RESULTS" | jq -e 'type == "object"' >/dev/null
 printf '%s\n' "$RESULTS" | jq .
-failed=$(printf '%s\n' "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key')
+# A best-effort Slack notification must not block release publication.
+failed=$(printf '%s\n' "$RESULTS" | jq -r --arg phase "$phase" '
+  to_entries[]
+  | select($phase != "release" or .key != "notify-slack-start")
+  | select(.value.result != "success" and .value.result != "skipped")
+  | .key')
 mandatory=(preflight)
 if [ "$RUN_TESTS" = true ]; then
   mandatory+=(core-tests inference-tests rl-tests)

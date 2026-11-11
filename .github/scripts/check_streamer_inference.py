@@ -10,7 +10,8 @@ import urllib.request
 TOKENS = 32
 
 
-def check_inference(url, model):
+def check_inference(url: str, model: str) -> dict:
+    """Require one nonblank completion that reaches the requested token limit."""
     payload = {
         "model": model,
         "prompt": "The capital of France is",

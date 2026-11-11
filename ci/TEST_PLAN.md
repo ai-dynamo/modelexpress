@@ -201,7 +201,8 @@ suite must pass before handoff, and release runs require core tests even with
 `run_tests=false`. Wheels, containers, crates, Helm, and compliance must all pass
 before publication is requested. Missing mode outputs fail qualification, so a
 partial rerun cannot silently disable checks. Existing current-attempt release
-approval requirements still apply. Handoff success means GitLab accepted the
+approval requirements still apply. A failed Slack start notification does not
+block handoff; its job still reports the notification failure. Handoff success means GitLab accepted the
 pipeline; downstream scanning/publication must be checked there. RL evidence
 uploads are disabled for nightly calls.
 
