@@ -205,6 +205,14 @@ Contributions intended to add significant new functionality must follow a more c
 
 Feature branches use `<username>/feature-name` format, forked from `main`.
 
+## Python CI prerequisites
+
+The Python protobuf matrix builds and imports `modelexpress.vmm._alloc_ext` before
+running tests. Self-hosted builder images should include `g++`; missing compilers
+use a five-minute, bounded apt setup step with recommended packages disabled.
+An unavailable compiler or failed extension build fails CI rather than silently
+reducing allocator coverage. The complete job retains its 20-minute deadline.
+
 ## Running GitHub Actions Locally
 
 You can use the `act` tool to run GitHub Actions locally. See [act usage](https://nektosact.com/introduction.html).
