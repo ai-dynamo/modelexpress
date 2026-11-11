@@ -177,6 +177,9 @@ of the existing Vime/Dynamo E2E smoke and does not enforce performance threshold
 both to succeed. Each child checks all of its test and cleanup results.
 Inference owns image builds, ModelStreamer, and the reusable GPU test workflow.
 RL owns Vime and generator-only refit, including their builds and cleanup.
+The cleanup image installs the lockfile-selected boto3 with a 60-second pip
+network timeout and up to three installation attempts, each capped at five
+minutes; exhausted retries still fail the build.
 One RL `GPU cleanup` fallback job handles both workloads after both tests finish;
 each cleanup path runs only when its test needs it, and Vime cleanup still runs
 if refit cleanup fails. Normal inline cleanup remains in each test job.

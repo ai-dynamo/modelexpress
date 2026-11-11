@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import io
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -269,6 +271,25 @@ class NightlyWorkflowTests(unittest.TestCase):
             results[suite]["result"] = "skipped"
         result, _ = execute(script, {**environment, "RUN_TESTS": "false", "RESULTS": json.dumps(results)})
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cleanup_image_install_retries_and_preserves_failure(self):
+        script = (ROOT / "ci/bench/Dockerfile.cleanup").read_text().split("RUN python3 - <<'PYTHON'\n", 1)[1].rsplit("\nPYTHON", 1)[0]
+        lock = b'[[package]]\nname = "boto3"\nversion = "1.43.0"\n'
+        error = subprocess.CalledProcessError(2, "pip")
+        timeout = subprocess.TimeoutExpired("pip", 300)
+        for failures in [[], [error], [timeout], [error, error, error], [timeout, timeout, timeout]]:
+            with self.subTest(failures=failures), patch("builtins.open", return_value=io.BytesIO(lock)), \
+                    patch("subprocess.check_call", side_effect=[*failures, 0]) as install, \
+                    patch("time.sleep") as sleep:
+                if len(failures) == 3:
+                    with self.assertRaises(type(failures[-1])):
+                        exec(compile(script, "Dockerfile.cleanup", "exec"), {})
+                else:
+                    exec(compile(script, "Dockerfile.cleanup", "exec"), {})
+                self.assertEqual(install.call_count, min(len(failures) + 1, 3))
+                self.assertEqual(sleep.call_count, min(len(failures), 2))
+                self.assertEqual(install.call_args.kwargs["timeout"], 300)
+                self.assertIn("boto3==1.43.0", install.call_args.args[0])
 
     def test_python_toolchain_setup_is_bounded_and_failure_is_not_hidden(self):
         job = workflow("modelexpress-core-ci.yml")["jobs"]["python-test"]
