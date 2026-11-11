@@ -12,8 +12,8 @@ worker_image=${WORKER_IMAGE:?WORKER_IMAGE is required}
 trainer_image=${TRAINER_IMAGE:?TRAINER_IMAGE is required}
 model_subpath=${MODEL_SUBPATH:?MODEL_SUBPATH is required}
 k=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$context" --namespace="$namespace")
-logs=$(mktemp -d)
-trap 'rm -rf "$logs"' EXIT
+logs=${RESULTS_DIR:?RESULTS_DIR is required}
+mkdir -p "$logs"
 
 # Check the namespace prerequisites.
 "${k[@]}" get secret mx-s3-creds nvcr-imagepullsecret >/dev/null

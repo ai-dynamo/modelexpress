@@ -1,0 +1,99 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+name: ModelExpress RL PrimeRL GPU CI
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        type: string
+        required: true
+      harness_sha:
+        type: string
+        required: true
+      worker_image:
+        type: string
+        required: true
+      gpu_limit:
+        type: string
+        required: true
+      gpu_slot:
+        type: string
+        required: true
+      upload_evidence:
+        type: boolean
+        default: true
+    secrets:
+      NGC_API_KEY:
+        required: true
+      HF_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  KUBECONFIG: /teleport/kubeconfig.yaml
+  KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
+  NAMESPACE: mx-ci-primerl-${{ github.run_id }}-${{ github.run_attempt }}
+  RESULTS_DIR: ${{ github.workspace }}/primerl-results
+
+jobs:
+  test:
+    name: PrimeRL reverse-text refit E2E (1 trainer + 1 inference GPU)
+    concurrency:
+      group: ${{ format('modelexpress-rl-gpu-{0}-slot-{1}', 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02', inputs.gpu_slot) }}
+      queue: max
+      cancel-in-progress: false
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 120
+    env:
+      MX_CI_GPU_CONCURRENCY: ${{ inputs.gpu_limit }}
+      MX_CI_GPU_LANE: ${{ format('slot-{0}', inputs.gpu_slot) }}
+      MX_TEST_SHA: ${{ inputs.sha }}
+      WORKER_IMAGE: ${{ inputs.worker_image }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.harness_sha }}
+          persist-credentials: false
+      - name: Prepare isolated two-GPU workload
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: bash ci/rl/primerl/cluster.sh setup
+      - name: Run upstream reverse-text assertions
+        run: bash ci/rl/primerl/cluster.sh run
+      - name: Collect evidence
+        if: always()
+        run: bash ci/rl/primerl/cluster.sh collect
+      - name: Upload evidence
+        if: ${{ always() && inputs.upload_evidence }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: primerl-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.RESULTS_DIR }}
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Record tested revision
+        if: always()
+        env:
+          TEST_SHA: ${{ inputs.sha }}
+        run: echo "RL PrimeRL refit CI of $TEST_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Cleanup owned workload
+        if: always()
+        run: bash ci/rl/primerl/cluster.sh cleanup
+
+  cleanup:
+    name: PrimeRL fallback cleanup
+    needs: test
+    if: ${{ always() && needs.test.result != 'success' && needs.test.result != 'skipped' }}
+    runs-on: prod-deploy-tester-v1
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.harness_sha }}
+          persist-credentials: false
+      - name: Cleanup owned workload
+        run: bash ci/rl/primerl/cluster.sh cleanup

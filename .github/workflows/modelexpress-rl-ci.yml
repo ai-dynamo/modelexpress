@@ -44,12 +44,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'issue_comment' }}
 
 env:
-  KUBECONFIG: /teleport/kubeconfig.yaml
-  KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
-  NAMESPACE: mx-ci-bench-${{ github.run_id }}-${{ github.run_attempt }}
   MX_IMAGE_REPO: nvcr.io/0980761089281446
   VIME_DYNAMO_REF: c3e05f0244ae6264d7953f68e2499c6dc2f54723
-  RESULTS_DIR: ${{ github.workspace }}/bench-results
 
 jobs:
   validate:
@@ -71,6 +67,8 @@ jobs:
       scenario: ${{ steps.inputs.outputs.scenario }}
       gpu_slot: ${{ steps.inputs.outputs.gpu_slot }}
       gpu_limit: ${{ steps.inputs.outputs.gpu_limit }}
+      vime_gpu_slot: ${{ steps.inputs.outputs.vime_gpu_slot }}
+      primerl_gpu_slot: ${{ steps.inputs.outputs.primerl_gpu_slot }}
       model: ${{ steps.inputs.outputs.model }}
       runtime: ${{ steps.inputs.outputs.runtime }}
     steps:
@@ -88,6 +86,7 @@ jobs:
       - name: Validate immutable source and registered experiment
         id: inputs
         env:
+          KUBE_CONTEXT: ${{ vars.MX_BENCH_KUBE_CONTEXT || 'nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02' }}
           TEST_SHA: ${{ inputs.sha || steps.gate.outputs.sha }}
           MX_CI_RL_GPU_CONCURRENCY: ${{ vars.MX_CI_RL_GPU_CONCURRENCY || '4' }}
           PR_NUMBER: ${{ inputs.pull_request || github.event.issue.number || 0 }}
@@ -106,18 +105,20 @@ jobs:
           number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_RUN_ID"] if os.environ["GITHUB_EVENT_NAME"] in {"schedule", "workflow_dispatch"} else os.environ["GITHUB_REF"].rsplit("/", 1)[1])
           print(f"gpu_limit={count}")
           print(f"gpu_slot={number % count}")
+          print(f"vime_gpu_slot={(number + 1) % count}")
+          print(f"primerl_gpu_slot={(number + 2) % count}")
           PYTHON
 
-  build:
+  build-generator-only:
     if: ${{ !cancelled() && needs.validate.result == 'success' }}
     name: RL generator-only refit build
     needs: validate
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 60
     outputs:
-      server: ${{ steps.images.outputs.server }}
-      worker: ${{ steps.images.outputs.worker }}
-      cleanup: ${{ steps.images.outputs.cleanup }}
+      server_image: ${{ steps.images.outputs.server_image }}
+      worker_image: ${{ steps.images.outputs.worker_image }}
+      cleanup_image: ${{ steps.images.outputs.cleanup_image }}
     steps:
       - name: Checkout trusted harness
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -144,29 +145,29 @@ jobs:
           server="$repo/mx-bench-server:$TEST_SHA"
           worker="$repo/mx-bench-worker:$TEST_SHA"
           cleanup="$repo/mx-bench-cleanup:$TEST_SHA"
-          docker buildx build --platform linux/amd64 -f ci/k8s/server/Dockerfile.server \
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 -f ci/k8s/server/Dockerfile.server \
             --cache-from "type=registry,ref=$repo/mx-bench-server:buildcache-shared" \
             --cache-to "type=registry,ref=$repo/mx-bench-server:buildcache-shared,mode=max,ignore-error=true" \
             -t "$server" --metadata-file server-build.json --push candidate
-          docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile \
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 -f ci/bench/Dockerfile \
             --cache-from "type=registry,ref=$repo/mx-bench-worker:buildcache-shared" \
             --cache-to "type=registry,ref=$repo/mx-bench-worker:buildcache-shared,mode=max,ignore-error=true" \
             --build-arg "RUNTIME_BASE=$RUNTIME_BASE" -t "$worker" \
             --metadata-file worker-build.json --push candidate
-          docker buildx build --platform linux/amd64 -f ci/bench/Dockerfile.cleanup \
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 -f ci/bench/Dockerfile.cleanup \
             --provenance=false \
             --cache-from "type=registry,ref=$repo/mx-bench-cleanup:buildcache-shared" \
             --cache-to "type=registry,ref=$repo/mx-bench-cleanup:buildcache-shared,mode=max,ignore-error=true" \
             -t "$cleanup" --metadata-file cleanup-build.json --push candidate
-          echo "cleanup=$repo/mx-bench-cleanup@$(jq -r '."containerimage.digest"' cleanup-build.json)" >> "$GITHUB_OUTPUT"
-          echo "server=$repo/mx-bench-server@$(jq -r '."containerimage.digest"' server-build.json)" >> "$GITHUB_OUTPUT"
-          echo "worker=$repo/mx-bench-worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
+          echo "cleanup_image=$repo/mx-bench-cleanup@$(jq -r '."containerimage.digest"' cleanup-build.json)" >> "$GITHUB_OUTPUT"
+          echo "server_image=$repo/mx-bench-server@$(jq -r '."containerimage.digest"' server-build.json)" >> "$GITHUB_OUTPUT"
+          echo "worker_image=$repo/mx-bench-worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
 
-  test:
-    if: ${{ !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' }}
+  test-generator-only:
+    if: ${{ !cancelled() && needs.validate.result == 'success' && needs.build-generator-only.result == 'success' }}
     name: GPU
-    needs: [validate, build]
-    uses: ./.github/workflows/modelexpress-rl-refit-gpu-ci.yml
+    needs: [validate, build-generator-only]
+    uses: ./.github/workflows/modelexpress-rl-generator-only-gpu-ci.yml
     secrets: inherit
     with:
       upload_evidence: ${{ github.event_name == 'issue_comment' || inputs.upload_evidence }}
@@ -176,172 +177,156 @@ jobs:
       scenario: ${{ needs.validate.outputs.scenario }}
       sha: ${{ needs.validate.outputs.sha }}
       harness_sha: ${{ needs.validate.outputs.harness_sha }}
-      server_image: ${{ needs.build.outputs.server }}
-      worker_image: ${{ needs.build.outputs.worker }}
-      cleanup_image: ${{ needs.build.outputs.cleanup }}
+      server_image: ${{ needs.build-generator-only.outputs.server_image }}
+      worker_image: ${{ needs.build-generator-only.outputs.worker_image }}
+      cleanup_image: ${{ needs.build-generator-only.outputs.cleanup_image }}
 
-  # Preserve cleanup when a workflow run is cancelled.
-  cleanup:
-    name: GPU cleanup
-    needs: [validate, build, test, test-vime-delta-refit]
-    if: >-
-      always() &&
-      ((needs.build.result == 'success' && needs.test.result != 'skipped' && needs.test.result != 'success') ||
-       (github.event_name != 'issue_comment' && needs.test-vime-delta-refit.result != 'skipped' && needs.test-vime-delta-refit.result != 'success'))
-    runs-on: prod-deploy-tester-v1
-    timeout-minutes: 25
-    env:
-      REFIT_CLEANUP: ${{ needs.build.result == 'success' && needs.test.result != 'skipped' && needs.test.result != 'success' }}
-      VIME_CLEANUP: ${{ github.event_name != 'issue_comment' && needs.test-vime-delta-refit.result != 'skipped' && needs.test-vime-delta-refit.result != 'success' }}
-      MODEL_PROFILE: ${{ needs.validate.outputs.model }}
-      SCENARIO: ${{ needs.validate.outputs.scenario }}
-      RUN_ID: ${{ needs.validate.outputs.model }}-${{ github.run_id }}-${{ github.run_attempt }}
-      SERVER_IMAGE: ${{ needs.build.outputs.server }}
-      WORKER_IMAGE: ${{ needs.build.outputs.worker }}
-      CLEANUP_IMAGE: ${{ needs.build.outputs.cleanup }}
+  build-vime:
+    name: RL Vime delta-refit build
+    needs: validate
+    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' }}
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 60
+    outputs:
+      trainer_image: ${{ steps.images.outputs.trainer_image }}
+      worker_image: ${{ steps.images.outputs.worker_image }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-        if: ${{ env.REFIT_CLEANUP == 'true' }}
+      - name: Checkout trusted harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           ref: ${{ needs.validate.outputs.harness_sha }}
           persist-credentials: false
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        if: ${{ env.REFIT_CLEANUP == 'true' }}
+      - name: Checkout approved source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
-          python-version: "3.12"
-      - name: Install manifest parser
-        if: ${{ env.REFIT_CLEANUP == 'true' }}
-        run: python3 -m pip install pyyaml
-      - name: Remove exact-run objects and owned namespace
-        if: ${{ env.REFIT_CLEANUP == 'true' }}
-        timeout-minutes: 15
-        run: python3 ci/bench/scripts/ci.py cleanup
-      - name: Delete direct H100 workload namespace
-        if: ${{ always() && env.VIME_CLEANUP == 'true' }}
-        timeout-minutes: 10
-        env:
-          KUBE_CONTEXT: nv-prd-dgxc.teleport.sh-dynamo-aws-dev-02
-          NAMESPACE: mx-ci-h100-vime-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          kc=(kubectl --kubeconfig=/teleport/kubeconfig.yaml --context="$KUBE_CONTEXT")
-          owner=$("${kc[@]}" get namespace "$NAMESPACE" --ignore-not-found \
-            -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
-          if [ -z "$owner" ]; then
-            exit 0
-          fi
-          if [ "$owner" != "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]; then
-            echo "Refusing to delete $NAMESPACE owned by $owner" >&2
-            exit 1
-          fi
-          "${kc[@]}" delete namespace "$NAMESPACE" --wait=true --timeout=180s
-      - name: Save cleanup evidence
-        if: ${{ always() && env.REFIT_CLEANUP == 'true' && (github.event_name == 'issue_comment' || inputs.upload_evidence) }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: bench-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.RESULTS_DIR }}
-          if-no-files-found: warn
-          retention-days: 14
-
-  build-vime-delta-refit:
-    if: ${{ github.event_name != 'issue_comment' }}
-    name: RL Vime delta-refit build
-    runs-on: prod-modelexpress-builder-amd-v1
-    permissions:
-      contents: read
-
-    outputs:
-      gpu_slot: ${{ steps.slots.outputs.gpu_slot }}
-      gpu_limit: ${{ steps.slots.outputs.gpu_limit }}
-    steps:
-      - name: Assign GPU slot
-        id: slots
-        env:
-          MX_CI_RL_GPU_CONCURRENCY: ${{ vars.MX_CI_RL_GPU_CONCURRENCY || '4' }}
-          PR_NUMBER: "0"
-        run: |
-          python3 - <<'PYTHON' >> "$GITHUB_OUTPUT"
-          import os
-          count = int(os.environ["MX_CI_RL_GPU_CONCURRENCY"])
-          if not 1 <= count <= 16:
-              raise SystemExit("MX_CI_RL_GPU_CONCURRENCY must be between 1 and 16")
-          number = int(os.environ["PR_NUMBER"]) or int(os.environ["GITHUB_RUN_ID"] if os.environ["GITHUB_EVENT_NAME"] in {"schedule", "workflow_dispatch"} else os.environ["GITHUB_REF"].rsplit("/", 1)[1])
-          print(f"gpu_limit={count}")
-          print(f"gpu_slot={(number + 1) % count}")
-          PYTHON
-
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          path: candidate
           persist-credentials: false
-
       - name: Checkout pinned Dynamo nightly
         run: |
           rm -rf "${RUNNER_TEMP}/dynamo"
           git init --quiet "${RUNNER_TEMP}/dynamo"
-          git -C "${RUNNER_TEMP}/dynamo" remote add origin \
-            https://github.com/ai-dynamo/dynamo.git
-          git -C "${RUNNER_TEMP}/dynamo" fetch --depth 1 --filter=blob:none \
-            origin "${VIME_DYNAMO_REF}"
+          git -C "${RUNNER_TEMP}/dynamo" remote add origin https://github.com/ai-dynamo/dynamo.git
+          git -C "${RUNNER_TEMP}/dynamo" fetch --depth 1 --filter=blob:none origin "${VIME_DYNAMO_REF}"
           git -C "${RUNNER_TEMP}/dynamo" checkout --detach FETCH_HEAD
-          git -C "${RUNNER_TEMP}/dynamo" rev-parse HEAD
-
-      - name: Log in to image registry
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - name: Build candidate trainer and rollout
+        id: images
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          TEST_SHA: ${{ needs.validate.outputs.sha }}
         run: |
-          echo "${{ secrets.NGC_API_KEY }}" | \
-            docker login nvcr.io -u '$oauthtoken' --password-stdin
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
-
-      - name: Build and push trainer and rollout
-        run: |
+          set -euo pipefail
+          echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          trainer="$MX_IMAGE_REPO/vime-dynamo-mx-trainer"
+          worker="$MX_IMAGE_REPO/vime-dynamo-mx-worker"
           bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
-            --cache-from "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:buildcache-shared" \
-            --cache-to "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:buildcache-shared,mode=max,ignore-error=true" \
-            --target trainer --push \
-            -t "${MX_IMAGE_REPO}/vime-dynamo-mx-trainer:${{ github.sha }}" . &
+            --cache-from "type=registry,ref=$trainer:buildcache-shared" \
+            --cache-to "type=registry,ref=$trainer:buildcache-shared,mode=max,ignore-error=true" \
+            --target trainer --metadata-file trainer-build.json --push -t "$trainer:$TEST_SHA" candidate &
           trainer_pid=$!
           worker_status=0
           bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f examples/rl/vime_dynamo_delta_refit/Dockerfile \
             --build-context dynamo="${RUNNER_TEMP}/dynamo" \
-            --cache-from "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:buildcache-shared" \
-            --cache-to "type=registry,ref=${MX_IMAGE_REPO}/vime-dynamo-mx-worker:buildcache-shared,mode=max,ignore-error=true" \
-            --target worker --push \
-            -t "${MX_IMAGE_REPO}/vime-dynamo-mx-worker:${{ github.sha }}" . || worker_status=$?
+            --cache-from "type=registry,ref=$worker:buildcache-shared" \
+            --cache-to "type=registry,ref=$worker:buildcache-shared,mode=max,ignore-error=true" \
+            --target worker --metadata-file worker-build.json --push -t "$worker:$TEST_SHA" candidate || worker_status=$?
           trainer_status=0
           wait "$trainer_pid" || trainer_status=$?
           if [ "$worker_status" -ne 0 ]; then exit "$worker_status"; fi
-          exit "$trainer_status"
+          if [ "$trainer_status" -ne 0 ]; then exit "$trainer_status"; fi
+          echo "trainer_image=$trainer@$(jq -r '."containerimage.digest"' trainer-build.json)" >> "$GITHUB_OUTPUT"
+          echo "worker_image=$worker@$(jq -r '."containerimage.digest"' worker-build.json)" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-
-  test-vime-delta-refit:
+  test-vime:
     name: GPU
-    needs: [build-vime-delta-refit]
+    needs: [validate, build-vime]
+    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' }}
     uses: ./.github/workflows/modelexpress-rl-vime-gpu-ci.yml
     secrets: inherit
     with:
-      gpu_limit: ${{ needs.build-vime-delta-refit.outputs.gpu_limit }}
-      gpu_slot: ${{ needs.build-vime-delta-refit.outputs.gpu_slot }}
+      sha: ${{ needs.validate.outputs.sha }}
+      harness_sha: ${{ needs.validate.outputs.harness_sha }}
+      worker_image: ${{ needs.build-vime.outputs.worker_image }}
+      trainer_image: ${{ needs.build-vime.outputs.trainer_image }}
+      gpu_limit: ${{ needs.validate.outputs.gpu_limit }}
+      gpu_slot: ${{ needs.validate.outputs.vime_gpu_slot }}
+      upload_evidence: ${{ inputs.upload_evidence }}
+
+  build-primerl:
+    needs: validate
+    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' }}
+    name: PrimeRL dev140 build
+    runs-on: prod-modelexpress-builder-amd-v1
+    timeout-minutes: 60
+    outputs:
+      worker_image: ${{ steps.image.outputs.worker_image }}
+    steps:
+      - name: Checkout trusted harness
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate.outputs.harness_sha }}
+          persist-credentials: false
+      - name: Checkout approved source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          path: candidate
+          persist-credentials: false
+      - name: Checkout pinned upstream tests
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          repository: PrimeIntellect-ai/prime-rl
+          ref: 0790ebb5d856860d916b270bda4884184ce9d786 # v0.10.1.dev140
+          path: prime-rl
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+      - name: Build candidate client and server on PrimeRL dev140
+        id: image
+        env:
+          NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+          TEST_SHA: ${{ needs.validate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          echo "$NGC_API_KEY" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          image=nvcr.io/0980761089281446/mx-primerl-ci
+          bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
+            -f ci/rl/primerl/Dockerfile \
+            --build-context prime-rl=prime-rl \
+            --cache-from "type=registry,ref=$image:buildcache-shared" \
+            --cache-to "type=registry,ref=$image:buildcache-shared,mode=max,ignore-error=true" \
+            --metadata-file primerl-build.json --push -t "$image:$TEST_SHA" candidate
+          echo "worker_image=$image@$(jq -r '."containerimage.digest"' primerl-build.json)" >> "$GITHUB_OUTPUT"
+
+  test-primerl:
+    name: GPU
+    needs: [validate, build-primerl]
+    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' }}
+    uses: ./.github/workflows/modelexpress-rl-primerl-gpu-ci.yml
+    secrets: inherit
+    with:
+      sha: ${{ needs.validate.outputs.sha }}
+      harness_sha: ${{ needs.validate.outputs.harness_sha }}
+      worker_image: ${{ needs.build-primerl.outputs.worker_image }}
+      gpu_limit: ${{ needs.validate.outputs.gpu_limit }}
+      gpu_slot: ${{ needs.validate.outputs.primerl_gpu_slot }}
+      upload_evidence: ${{ inputs.upload_evidence }}
 
   status-check:
     name: RL status check
     runs-on: ${{ inputs.runs_on || 'ubuntu-24.04' }}
-    needs: [validate, build, test, cleanup, build-vime-delta-refit, test-vime-delta-refit]
+    needs: [validate, build-generator-only, test-generator-only, build-vime, test-vime, build-primerl, test-primerl]
     if: ${{ always() && (github.event_name != 'issue_comment' || needs.validate.result != 'skipped') }}
     steps:
-      - name: All selected RL jobs succeeded
-        env:
-          COMMENT_RUN: ${{ github.event_name == 'issue_comment' }}
+      - name: Benchmark jobs succeeded
         run: |
           echo '${{ toJson(needs) }}' \
-            | jq -e --arg comment "$COMMENT_RUN" 'to_entries
-              | map(select($comment != "true" or (.key | contains("vime") | not)))
-              | all(
-                  .value.result == "success" or
-                  (.key == "cleanup" and .value.result == "skipped")
-                )'
+            | jq -e 'all(.validate, .["build-generator-only"], .["test-generator-only"]; .result == "success")'
+      - name: Training integration jobs succeeded
+        if: github.event_name != 'issue_comment'
+        run: |
+          echo '${{ toJson(needs) }}' \
+            | jq -e 'all(.["build-vime"], .["test-vime"],
+                .["build-primerl"], .["test-primerl"]; .result == "success")'
