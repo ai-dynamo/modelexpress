@@ -97,7 +97,7 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 \
 
 | Option | CLI Flag | Env Var | Default | Description |
 |--------|----------|---------|---------|-------------|
-| host | `--host` | `MODEL_EXPRESS_SERVER_HOST` | `0.0.0.0` | Bind address |
+| host | `--host` | `MODEL_EXPRESS_SERVER_HOST` | `0.0.0.0` | Bind address for the gRPC and metrics listeners. An IP literal; IPv6 works bare (`::`) or bracketed (`[::]`). |
 | port | `--port`, `-p` | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
 | metrics_port | `--metrics-port` | `MODEL_EXPRESS_SERVER_METRICS_PORT` | `9401` | Prometheus `/metrics` port. `0` disables the listener. Deliberately not the gRPC port: tonic serves HTTP/2 only, so a scrape aimed at `--port` can never complete. See [METRICS.md](METRICS.md). |
 

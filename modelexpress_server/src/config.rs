@@ -5,7 +5,7 @@ use clap::Parser;
 use config::ConfigError;
 use modelexpress_common::config::{LogFormat, LogLevel, load_layered_config};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use tracing::Level;
@@ -303,6 +303,20 @@ impl Default for CacheConfig {
     }
 }
 
+/// Builds a listen address from a host setting and a port.
+///
+/// A bare IP literal (`0.0.0.0`, `::`, `::1`) is parsed on its own so IPv6 hosts
+/// do not need brackets. Anything else, such as a bracketed `[::]` or `[fe80::1%2]`,
+/// goes through the `host:port` form as before. On failure the attempted address
+/// and the parse error are returned for the caller's message.
+fn listen_addr(host: &str, port: u16) -> Result<SocketAddr, (String, std::net::AddrParseError)> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let addr = format!("{host}:{port}");
+    addr.parse().map_err(|e| (addr, e))
+}
+
 impl ServerConfig {
     /// Load configuration from multiple sources in order of precedence:
     /// 1. Command line arguments (highest priority)
@@ -414,9 +428,9 @@ impl ServerConfig {
 
     /// Get the server socket address
     pub fn socket_addr(&self) -> Result<SocketAddr, ConfigError> {
-        let addr = format!("{}:{}", self.server.host, self.server.port);
-        addr.parse()
-            .map_err(|e| ConfigError::Message(format!("Invalid server address {addr}: {e}")))
+        listen_addr(&self.server.host, self.server.port.get()).map_err(|(addr, e)| {
+            ConfigError::Message(format!("Invalid server address {addr}: {e}"))
+        })
     }
 
     /// Socket address for the Prometheus `/metrics` listener, or `None` when
@@ -431,10 +445,11 @@ impl ServerConfig {
         let Some(metrics_port) = NonZeroU16::new(self.server.metrics_port) else {
             return Ok(None);
         };
-        let addr = format!("{}:{}", self.server.host, metrics_port);
-        addr.parse()
+        listen_addr(&self.server.host, metrics_port.get())
             .map(Some)
-            .map_err(|e| ConfigError::Message(format!("Invalid metrics address {addr}: {e}")))
+            .map_err(|(addr, e)| {
+                ConfigError::Message(format!("Invalid metrics address {addr}: {e}"))
+            })
     }
 
     /// Get the logging level as a tracing Level
@@ -1040,5 +1055,69 @@ mod tests {
             Some(0),
             "0 is the documented disable value"
         );
+    }
+
+    #[allow(clippy::expect_used)]
+    fn config_with_host(host: &str) -> ServerConfig {
+        let mut config = ServerConfig::default();
+        config.server.host = host.to_string();
+        config.server.port = NonZeroU16::new(8001).expect("non-zero port");
+        config.server.metrics_port = 9091;
+        config
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_listen_addresses_accept_bare_and_bracketed_hosts() {
+        for (host, ip) in [
+            ("0.0.0.0", "0.0.0.0"),
+            ("127.0.0.1", "127.0.0.1"),
+            ("::", "::"),
+            ("::1", "::1"),
+            ("[::]", "::"),
+            ("[::1]", "::1"),
+        ] {
+            let ip: IpAddr = ip.parse().expect("valid ip");
+            let config = config_with_host(host);
+            assert_eq!(
+                config.socket_addr().expect("server address should parse"),
+                SocketAddr::new(ip, 8001),
+                "server address for host {host}"
+            );
+            assert_eq!(
+                config
+                    .metrics_socket_addr()
+                    .expect("metrics address should parse"),
+                Some(SocketAddr::new(ip, 9091)),
+                "metrics address for host {host}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_listen_addresses_keep_bracketed_ipv6_scope_id() {
+        let config = config_with_host("[fe80::1%2]");
+        let addr = config.socket_addr().expect("server address should parse");
+        let SocketAddr::V6(addr) = addr else {
+            panic!("expected an IPv6 address, got {addr}");
+        };
+        assert_eq!(addr.scope_id(), 2);
+        assert_eq!(addr.port(), 8001);
+    }
+
+    #[test]
+    fn test_listen_addresses_reject_invalid_hosts() {
+        for host in ["not-an-ip", "", "[::", "::1]", "0.0.0.0:80"] {
+            let config = config_with_host(host);
+            assert!(
+                config.socket_addr().is_err(),
+                "server address for host {host:?} should be rejected"
+            );
+            assert!(
+                config.metrics_socket_addr().is_err(),
+                "metrics address for host {host:?} should be rejected"
+            );
+        }
     }
 }
