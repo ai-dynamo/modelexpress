@@ -26,11 +26,11 @@ logger = logging.getLogger("modelexpress.strategy_model_streamer")
 
 def _resolve_model_uri(ctx: LoadContext) -> str:
     """Resolve the model URI used by ModelStreamer across engine configs."""
-    if not ctx.use_model_config_uri and (model_uri := envs.MX_MODEL_URI):
+    if model_uri := envs.MX_MODEL_URI:
         return model_uri
     for attr in ("model_weights", "model", "model_path"):
         value = getattr(ctx.model_config, attr, None)
-        if isinstance(value, str) and value:
+        if value:
             return value
     return ""
 
@@ -39,8 +39,8 @@ class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
     """Load weights by streaming safetensors via runai-model-streamer.
 
     Activated by setting MX_MODEL_URI, which is also the preferred streaming
-    URI. A separate draft pass uses its engine-configured URI after the strategy
-    has been enabled. Engine adapters provide the concrete ModelStreamer iterator.
+    URI. Engine model configuration is used only when the environment value is
+    unavailable. Engine adapters provide the concrete ModelStreamer iterator.
     """
 
     name = "model_streamer"
@@ -60,12 +60,13 @@ class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
         return True
 
     def is_available(self, ctx: LoadContext) -> bool:
-        if not envs.MX_MODEL_URI:
+        if not self.supports_explicit_uri(ctx):
+            return False
+        model_uri = envs.MX_MODEL_URI or ""
+        if not model_uri:
             logger.info(
                 f"[Worker {ctx.global_rank}] MX_MODEL_URI not set, skipping model streamer"
             )
-            return False
-        if not self.supports_explicit_uri(ctx):
             return False
         return True
 

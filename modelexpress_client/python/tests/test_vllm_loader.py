@@ -843,13 +843,32 @@ class TestMtpDrafterSecondLoad:
             loader.load_model(vllm_config, model_config)
         return schedule
 
+    def test_legacy_mtp_cache_path_is_same_checkpoint(self):
+        from types import SimpleNamespace
+        from modelexpress.engines.vllm.loader import _same_checkpoint
+
+        target = SimpleNamespace(
+            model="/cache/model",
+            model_weights="s3://bucket/model",
+        )
+        draft = SimpleNamespace(model="/cache/model", model_weights="")
+
+        assert _same_checkpoint(target, draft)
+
     @pytest.mark.parametrize("different_checkpoint", [False, True])
     def test_cold_start_elects_main_not_draft(self, monkeypatch, different_checkpoint):
+        from types import SimpleNamespace
         from modelexpress.engines.vllm import loader as loader_mod
 
         monkeypatch.setenv("MX_P2P_COLD_START", "1")
         target = _make_load_context(device_id=0)
         draft = _make_load_context(device_id=0)
+        target.model_config = SimpleNamespace(
+            model="s3://bucket/model", model_weights=""
+        )
+        draft.model_config = SimpleNamespace(
+            model="s3://bucket/model", model_weights=""
+        )
         if different_checkpoint:
             draft.identity.model_name = "other-checkpoint"
         config = self._spec_vllm_config()
@@ -898,6 +917,7 @@ class TestMtpDrafterSecondLoad:
         """The drafter's second load joins the target's publication: the
         device registry becomes the union, while the loader, NIXL manager and
         loader context keep pointing at the main load."""
+        from types import SimpleNamespace
         from modelexpress.engines.vllm import loader as loader_mod
 
         if disable_draft_p2p is None:
@@ -907,6 +927,9 @@ class TestMtpDrafterSecondLoad:
         enabled = disable_draft_p2p != "1"
         loader = _make_loader()
         target_ctx = _make_load_context(device_id=0)
+        target_ctx.model_config = SimpleNamespace(
+            model="s3://bucket/model", model_weights=""
+        )
         target_weight = MagicMock()
         target_ctx.tensors = {"target.weight": target_weight}
         target_manager = MagicMock()
@@ -917,6 +940,9 @@ class TestMtpDrafterSecondLoad:
         draft_loader = _make_loader()
         draft_config = MagicMock(dtype=torch.float32, runner_type="draft")
         draft_ctx = _make_load_context(device_id=0)
+        draft_ctx.model_config = SimpleNamespace(
+            model="s3://bucket/model", model_weights=""
+        )
         draft_weight = MagicMock()
         draft_ctx.tensors = {"mx_draft::mtp.0.weight": draft_weight}
         draft_ctx.nixl_manager = target_manager
@@ -980,7 +1006,6 @@ class TestMtpDrafterSecondLoad:
             assert draft.p2p_enabled is expected
             assert draft.shared_nixl_manager is (main.nixl_manager if expected else None)
             assert draft.p2p_source_identity == (main.identity if expected else None)
-            assert draft.use_model_config_uri
             if expected:
                 assert draft.draft_tensor_namespace.startswith("mx_draft::")
                 assert draft.draft_tensor_namespace != "mx_draft::"

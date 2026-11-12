@@ -82,6 +82,13 @@ def _checkpoint_config(model_config) -> tuple[str, str]:
     return value("model"), value("model_weights")
 
 
+def _same_checkpoint(target_config, draft_config) -> bool:
+    target_model, target_weights = _checkpoint_config(target_config)
+    draft_model, draft_weights = _checkpoint_config(draft_config)
+    target_paths = {target_model, target_weights} - {""}
+    return (draft_weights or draft_model) in target_paths
+
+
 def _draft_namespace(ctx: LoadContext, vllm_config) -> str | None:
     """Scope a separate draft to its checkpoint and runtime configuration."""
     model, weights = _checkpoint_config(ctx.model_config)
@@ -222,10 +229,8 @@ class MxModelLoader(BaseModelLoader):
             main_ctx = main_loader._ctx if main_loader is not None else None
             separate_draft = main_ctx is None or (
                 main_ctx.identity != ctx.identity
-                or _checkpoint_config(main_ctx.model_config)
-                != _checkpoint_config(ctx.model_config)
+                or not _same_checkpoint(main_ctx.model_config, ctx.model_config)
             )
-            ctx.use_model_config_uri = separate_draft
             namespace = _draft_namespace(ctx, vllm_config) if separate_draft else None
             if (
                 envs.MX_DISABLE_DRAFT_P2P
