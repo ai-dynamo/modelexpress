@@ -55,8 +55,6 @@ logger = logging.getLogger("modelexpress.metadata.k8s_service_client")
 
 _DEFAULT_SERVICE_PATTERN = "mx-sources"
 _DEFAULT_WORKER_GRPC_PORT = 6555
-_DEFAULT_MAX_RETRIES = 5
-_DEFAULT_BACKOFF_SECONDS = 0.5
 
 
 class MxK8sServiceClient(MxClientBase):
@@ -78,17 +76,15 @@ class MxK8sServiceClient(MxClientBase):
     ):
         self._worker_rank = worker_rank
         self._service_pattern = service_pattern or envs.MX_K8S_SERVICE_PATTERN
-        env_retries = envs.MX_K8S_SOURCE_RETRIES
+        # envs owns the parsing: a malformed or negative value warns and
+        # falls back to the default instead of failing the worker.
         self._max_retries = (
             max_retries if max_retries is not None
-            else int(env_retries) if env_retries
-            else _DEFAULT_MAX_RETRIES
+            else envs.MX_K8S_SOURCE_RETRIES
         )
-        env_backoff = envs.MX_K8S_SOURCE_BACKOFF_SECONDS
         self._backoff_seconds = (
             backoff_seconds if backoff_seconds is not None
-            else float(env_backoff) if env_backoff
-            else _DEFAULT_BACKOFF_SECONDS
+            else envs.MX_K8S_SOURCE_BACKOFF_SECONDS
         )
 
     # -- connection management ------------------------------------------------
