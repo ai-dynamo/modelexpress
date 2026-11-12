@@ -843,13 +843,32 @@ class TestMtpDrafterSecondLoad:
             loader.load_model(vllm_config, model_config)
         return schedule
 
+    def test_legacy_mtp_cache_path_is_same_checkpoint(self):
+        from types import SimpleNamespace
+        from modelexpress.engines.vllm.loader import _same_checkpoint
+
+        target = SimpleNamespace(
+            model="/cache/model",
+            model_weights="s3://bucket/model",
+        )
+        draft = SimpleNamespace(model="/cache/model", model_weights="")
+
+        assert _same_checkpoint(target, draft)
+
     @pytest.mark.parametrize("different_checkpoint", [False, True])
     def test_cold_start_elects_main_not_draft(self, monkeypatch, different_checkpoint):
+        from types import SimpleNamespace
         from modelexpress.engines.vllm import loader as loader_mod
 
         monkeypatch.setenv("MX_P2P_COLD_START", "1")
         target = _make_load_context(device_id=0)
         draft = _make_load_context(device_id=0)
+        target.model_config = SimpleNamespace(
+            model="s3://bucket/model", model_weights=""
+        )
+        draft.model_config = SimpleNamespace(
+            model="s3://bucket/model", model_weights=""
+        )
         if different_checkpoint:
             draft.identity.model_name = "other-checkpoint"
         config = self._spec_vllm_config()
@@ -898,6 +917,7 @@ class TestMtpDrafterSecondLoad:
         """The drafter's second load joins the target's publication: the
         device registry becomes the union, while the loader, NIXL manager and
         loader context keep pointing at the main load."""
+        from types import SimpleNamespace
         from modelexpress.engines.vllm import loader as loader_mod
 
         if disable_draft_p2p is None:
@@ -907,6 +927,9 @@ class TestMtpDrafterSecondLoad:
         enabled = disable_draft_p2p != "1"
         loader = _make_loader()
         target_ctx = _make_load_context(device_id=0)
+        target_ctx.model_config = SimpleNamespace(
+            model="s3://bucket/model", model_weights=""
+        )
         target_weight = MagicMock()
         target_ctx.tensors = {"target.weight": target_weight}
         target_manager = MagicMock()
@@ -917,6 +940,9 @@ class TestMtpDrafterSecondLoad:
         draft_loader = _make_loader()
         draft_config = MagicMock(dtype=torch.float32, runner_type="draft")
         draft_ctx = _make_load_context(device_id=0)
+        draft_ctx.model_config = SimpleNamespace(
+            model="s3://bucket/model", model_weights=""
+        )
         draft_weight = MagicMock()
         draft_ctx.tensors = {"mx_draft::mtp.0.weight": draft_weight}
         draft_ctx.nixl_manager = target_manager
@@ -940,6 +966,88 @@ class TestMtpDrafterSecondLoad:
             loader_mod._tensor_registry.pop(0, None)
             loader_mod._nixl_managers.pop(0, None)
             loader_mod._loader_registry.pop(0, None)
+
+    @pytest.mark.parametrize(
+        ("enable", "disable", "expected"),
+        [(None, None, False), ("0", None, False), ("1", None, True), ("1", "1", False)],
+    )
+    def test_separate_draft_joins_main_publication(
+        self, monkeypatch, enable, disable, expected
+    ):
+        from types import SimpleNamespace
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        for name, value in (
+            ("MX_ENABLE_SEPARATE_DRAFT_P2P", enable),
+            ("MX_DISABLE_DRAFT_P2P", disable),
+        ):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        main = _make_load_context(device_id=0)
+        main.model_config = SimpleNamespace(model="s3://bucket/main", model_weights=None)
+        main.nixl_manager = MagicMock()
+        main.tensors = {"main.weight": MagicMock()}
+        draft = _make_load_context(device_id=0, identity=_make_identity("draft"))
+        draft.model_config = SimpleNamespace(
+            model="s3://bucket/draft", model_weights=None, revision="rev-1"
+        )
+        draft.nixl_manager = main.nixl_manager
+        draft.tensors = {"mx_draft::weight": MagicMock()}
+        config = self._spec_vllm_config()
+        config.speculative_config.method = "eagle"
+        try:
+            self._load(_make_loader(), config,
+                       MagicMock(dtype=torch.float32, runner_type="generate"), main)
+            with patch.object(loader_mod, "_vllm_version", return_value="test-version"):
+                self._load(_make_loader(), config,
+                           MagicMock(dtype=torch.float32, runner_type="draft"), draft)
+            assert draft.p2p_enabled is expected
+            assert draft.shared_nixl_manager is (main.nixl_manager if expected else None)
+            assert draft.p2p_source_identity == (main.identity if expected else None)
+            if expected:
+                assert draft.draft_tensor_namespace.startswith("mx_draft::")
+                assert draft.draft_tensor_namespace != "mx_draft::"
+            assert loader_mod._tensor_registry[0] == (
+                {**main.tensors, **draft.tensors} if expected else main.tensors
+            )
+        finally:
+            loader_mod._draft_publication_gates.pop(0, None)
+            loader_mod._tensor_registry.pop(0, None)
+            loader_mod._nixl_managers.pop(0, None)
+            loader_mod._loader_registry.pop(0, None)
+
+    @pytest.mark.parametrize("missing", ["model", "revision", "version", "method"])
+    def test_separate_draft_requires_compatibility_fields(self, missing):
+        from types import SimpleNamespace
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        config = SimpleNamespace(speculative_config=SimpleNamespace(method="eagle"))
+        ctx = _make_load_context()
+        ctx.model_config = SimpleNamespace(model="s3://draft", model_weights=None, revision="rev")
+        version = "1.0"
+        if missing == "version":
+            version = ""
+        elif missing == "method":
+            config.speculative_config.method = None
+        else:
+            setattr(ctx.model_config, missing, None)
+        with patch.object(loader_mod, "_vllm_version", return_value=version):
+            assert loader_mod._draft_namespace(ctx, config) is None
+
+    def test_draft_namespace_changes_with_checkpoint_revision(self):
+        from types import SimpleNamespace
+        from modelexpress.engines.vllm import loader as loader_mod
+
+        config = SimpleNamespace(speculative_config=SimpleNamespace(method="eagle"))
+        ctx = _make_load_context()
+        ctx.model_config = SimpleNamespace(model="s3://draft", model_weights=None, revision="rev-1")
+        with patch.object(loader_mod, "_vllm_version", return_value="1.0"):
+            first = loader_mod._draft_namespace(ctx, config)
+            ctx.model_config.revision = "rev-2"
+            second = loader_mod._draft_namespace(ctx, config)
+        assert first != second
 
     def test_drafter_with_another_identity_stays_out_of_p2p(self):
         """A draft from a different checkpoint (e.g. EAGLE) has its own
@@ -1270,6 +1378,13 @@ class TestMtpDrafterSecondLoad:
         manifest = [
             TensorDescriptor("model.layers.0.w", 1, 4, 0, "torch.float32"),
             TensorDescriptor("mx_draft::model.layers.0.w", 2, 4, 0, "torch.float32"),
+            TensorDescriptor(
+                "mx_draft::eagle-hash::model.layers.0.w",
+                3,
+                4,
+                0,
+                "torch.float32",
+            ),
         ]
         main_ctx = _make_load_context()
         assert [t.name for t in RdmaStrategy._scope_source_tensors(main_ctx, manifest)] == [
@@ -1282,9 +1397,36 @@ class TestMtpDrafterSecondLoad:
             "mx_draft::model.layers.0.w"
         ]
 
+        eagle_ctx = self._draft_ctx(self._populated_manager())
+        eagle_ctx.draft_tensor_namespace = "mx_draft::eagle-hash::"
+        eagle_ctx.tensors = {
+            "mx_draft::eagle-hash::model.layers.0.w": MagicMock()
+        }
+        assert [
+            t.name for t in RdmaStrategy._scope_source_tensors(eagle_ctx, manifest)
+        ] == ["mx_draft::eagle-hash::model.layers.0.w"]
+
         draft_ctx.tensors["mx_draft::model.layers.1.w"] = MagicMock()
         with pytest.raises(RuntimeError, match="lacks 1 of 2 draft tensors"):
             RdmaStrategy._scope_source_tensors(draft_ctx, manifest)
+
+    def test_mtp_draft_rejects_separate_draft_manifest(self):
+        from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+        ctx = self._draft_ctx(self._populated_manager())
+        source = p2p_pb2.WorkerMetadata(
+            tensors=[
+                p2p_pb2.TensorDescriptor(
+                    name="mx_draft::eagle-hash::model.layers.0.w",
+                    addr=0x1000,
+                    size=1024,
+                    device_id=0,
+                    dtype="bfloat16",
+                )
+            ]
+        )
+
+        assert RdmaStrategy._may_serve_draft(ctx, source) is False
 
     def test_draft_rdma_miss_falls_back_to_model_streamer(self):
         """A draft whose RDMA attempt finds no source carrying draft tensors
@@ -2231,6 +2373,16 @@ class TestFindSourceInstances:
         strategy._find_source_instances(ctx)
         ctx.mx_client.list_sources.assert_called_once_with(
             identity=ctx.identity,
+            status_filter=p2p_pb2.SOURCE_STATUS_READY,
+        )
+
+    def test_separate_draft_lists_main_identity(self):
+        strategy = self._make_strategy()
+        ctx = _make_load_context(p2p_source_identity=_make_identity("main"))
+        ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[])
+        strategy._find_source_instances(ctx)
+        ctx.mx_client.list_sources.assert_called_once_with(
+            identity=ctx.p2p_source_identity,
             status_filter=p2p_pb2.SOURCE_STATUS_READY,
         )
 

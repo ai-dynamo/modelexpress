@@ -94,6 +94,8 @@ class LoadContext:
     # on the same worker. The draft shares the main load's NIXL agent,
     # metadata port and SourceIdentity rather than publishing its own.
     p2p_role: str = "main"
+    # A separate draft is advertised within its main model's publication.
+    p2p_source_identity: p2p_pb2.SourceIdentity | None = None
     # Draft manifests can refine this to a compatibility-digested namespace.
     draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
     # False keeps a load out of P2P entirely (no registration, no RDMA).
