@@ -68,10 +68,28 @@ Engine contexts:
   build it from Megatron-Bridge conversion tasks with
   `modelexpress_rl.train.engines.megatron.build_megatron_tensor_specs`.
 
+What the FSDP publisher puts on the wire:
+
+- Only floating-point `state_dict` tensors are published.
+- An unsharded or replicated tensor is published in full by every rank; the
+  duplicate boxes are deduped before planning.
+- A sharded `DTensor` publishes this rank's local box: FSDP along dim 0, tensor
+  parallelism along dim 1, or a block of both on a 2-D mesh (FSDP x TP).
+- The shard layout is fixed at first publish. A changed tensor set, dtype, or
+  shard geometry on a later step raises.
+- Names stay in the trainer's native form. HF-name conversion is the
+  receiver's job (see "Native Trainer Layouts" below), never the publisher's.
+
 Set `ModelExpressTrainerConfig.staging_mode` explicitly
 (`TrainerStagingMode`): prefer `IN_PLACE` when the source bytes stay stable and
 match the wire dtype until retirement; otherwise `COPY_TO_HOST`.
 `COPY_TO_DEVICE` costs substantial VRAM and should be a measured exception.
+
+`IN_PLACE` registers the live local storage and serves it without a copy. On
+FSDP it requires every local shard to be contiguous and already in the wire
+dtype (a dtype override that differs from the source is rejected), and it fails
+on a later step if the storage address moved. Both cases point to
+`COPY_TO_HOST`, which keeps persistent pinned arenas and casts on copy.
 
 Retire in this order: `control.delete_weight_version(...)`,
 `trainer.release_version(version=...)`, `control.delete_trainer_mesh(...)`,
@@ -129,6 +147,71 @@ Pause generation on every replica before `apply_weight` and resume only after
 every replica succeeds. Any failure after installation starts: keep the
 deployment paused and restart the engines; a partially installed model is not
 the old version.
+
+## Generator Side: How A Slice Is Chosen
+
+The generator never receives a per-model conversion spec. It asks the engine's
+own weight loader which slice of each full tensor its rank needs. This runs on
+each generator worker while a version is staged (`stage_weight` on the direct
+client; the plugin's `update_weights` calls it internally), before any weight
+is installed. The result is reused across versions, so most refits skip
+straight to the read.
+
+1. Capture (`geometry`): zero-storage placeholder tensors are fed
+   through the engine's `load_weights`. For each destination parameter this
+   records the view/slice op-chain applied to the source tensor and where the
+   `copy_` lands (offset, shape, stride). No data moves. On vLLM the capture
+   runs on the live model: parameters are reverted to their load-time
+   skeletons through a layerwise reload, captured, and then the original kernel
+   tensors are put back as they were. Capture skips vLLM's finalize step,
+   which would post-process the never-filled skeletons and overwrite the live
+   weights.
+2. Slice plan (`slice_plan`): the recorded op-chain is replayed on a `meta`
+   tensor of the source's full shape (a PyTorch tensor with shape and strides
+   but no storage), and the resulting view's offset, shape, and strides give
+   the axis-aligned box of the full source this rank needs. That box is
+   intersected with each shard box the trainers published. Any chain of pure
+   views (slicing, indexing, transposes) resolves.
+3. Transfer plan (`transfer_plan`): each overlap becomes maximal byte runs that
+   are contiguous in both the shard buffer and the destination; the generator
+   pulls each run with an RDMA read over NIXL, with no action from the trainer.
+
+Capture depends only on the generator and the full source tensors; steps 2
+and 3 also depend on how the trainer is sharded. So the plan from steps 2 and 3
+is built once per trainer mesh generation and reused for later versions, and a
+new mesh or mesh update rebuilds it. When that happens, capture is redone only
+if the generator's load layout, `convert_native_to_hf`, or the source tensor
+schema (names, dtypes, full shapes) changed.
+
+A load that is not a pure view of the source (a copy, a dtype mismatch,
+arithmetic, or a view the slice plan cannot yet resolve) marks that source
+unsupported, and staging fails closed with
+`IncompleteRefit` (`unsupported=` above zero, with `causes=` naming the
+operation) rather than installing wrong bytes.
+
+When one copy would need more than `MX_RESHARD_MAX_SEGMENTS_PER_COPY`
+descriptors, a compatible dim-0-sharded source is pulled once into contiguous
+staging and sliced locally.
+
+## Native Trainer Layouts
+
+When the trainer publishes native, non-HF weights (for example an MoE with
+stacked experts), the generator sets `convert_native_to_hf` on its
+`VllmGeneratorContext`. It is a `dict[str, Tensor] -> dict[str, Tensor]`
+mapping, run on placeholder tensors before the vLLM `load_weights` capture, so
+it traces structure only (renames and view ops such as expert unstack) and
+moves no data.
+
+- Every output must be a traced view of a published source. A synthesized
+  tensor (new storage, arithmetic) raises `UnsupportedReshard`.
+- Leave it as `None` (the default) when the trainer already publishes the HF
+  names vLLM's loader expects, which is the usual case for dense models. No
+  conversion runs.
+- Only the direct client can set it today. The vLLM plugin builds its own
+  context without a converter, so a trainer refitting through the plugin must
+  publish HF names.
+- Set the converter once when building the generator context. A different
+  converter only takes effect at the next trainer mesh change.
 
 ## Cold Start At An Exact Version
 
