@@ -95,6 +95,18 @@
       ]
     },
     {
+      "id": "nixl-native-moe-layout",
+      "question": "Our FSDP trainer keeps MoE experts stacked in one tensor per layer, but vLLM's loader expects HF per-expert names. How do I refit over the NIXL path without converting on the trainer?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Publish the native layout unchanged and set convert_native_to_hf on the VllmGeneratorContext passed to ModelExpressGeneratorClient (the direct client; the vLLM plugin path cannot set a converter): a dict[str, Tensor] -> dict[str, Tensor] mapping that renames and unstacks with view ops only. It runs on placeholder tensors before the load_weights capture, so no data moves, and every output must be a traced view of a published source; a synthesized tensor (arithmetic, cat/stack, a new constant) raises UnsupportedReshard ('conversion produced a non-traced tensor'). HF-name conversion belongs on the receiver, not in the FSDP publisher.",
+      "expected_behavior": [
+        "Put the conversion on the generator via convert_native_to_hf, not in the trainer",
+        "Require view-only mappings and name UnsupportedReshard for synthesized tensors",
+        "Keep the trainer publishing its native names",
+        "Note that the vLLM plugin path cannot set a converter"
+      ]
+    },
+    {
       "id": "neg-initial-p2p-load",
       "question": "Speed up vLLM cold start by loading the model over P2P from another ModelExpress-served replica.",
       "expected_skill": "none",

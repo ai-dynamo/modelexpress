@@ -138,3 +138,41 @@ Next action: publish from every logical shard; drain generator leases
 (`finish_weight_update` or `release()`) before updating the mesh or retiring a
 version; unset `MX_P2P_METADATA`. After `IncompleteRefit` or any failure once
 installation started, keep generation paused and restart the engine.
+
+## Slice Planning And Shard Layout (NIXL)
+
+Signals:
+
+- `IncompleteRefit: full-tensor refit must cover every engine parameter` with
+  `unsupported=` or `missing=` above zero, raised while staging a version
+- `UnsupportedReshard: <name>: conversion produced a non-traced tensor`
+- trainer: `IN_PLACE serves the source dtype but wire is ...`
+- trainer: `IN_PLACE requires a contiguous local shard`
+- trainer: `source storage moved since registration`
+- trainer: `shard geometry changed since initialize`, `FSDP tensor set changed since initialize`,
+  or `FSDP tensor coverage changed after binding`
+- server: `mesh update must preserve logical shard coverage`
+
+Checks:
+
+- Does the vLLM loader or `convert_native_to_hf` do something other than take
+  a pure view of a published source (a copy, a dtype mismatch, arithmetic,
+  `cat`/`stack`, or a view the slice plan cannot yet resolve)? The `causes=`
+  field names the operation.
+- Does the trainer re-materialize its `state_dict` (CPU offload, gathered state
+  dict) or keep weights in a dtype other than the wire dtype?
+- Did the parallelism layout or the published tensor set change since the mesh
+  was created?
+
+Next action: these fail while the version is being staged, before any weight is
+installed, so live weights are untouched and the engine does not need a
+restart. If the error is `conversion produced a non-traced tensor`, or the
+operation named in `causes=` comes from your `convert_native_to_hf`, make that
+mapping view-only and leave fusing (for example gate/up) to the vLLM loader. If
+the error reports `missing=` greater than zero, some vLLM parameters were never
+written because the published names do not cover them; fix the trainer names
+or the converter. If the unsupported operation is inside vLLM's own loader, the
+reshard path does not support that model today; report it with the `causes=`
+output. Switch `IN_PLACE` to `COPY_TO_HOST` for dtype, contiguity, or
+moved-storage errors. A changed shard layout needs a new trainer mesh; an
+existing mesh only accepts updates that keep the same logical shard coverage.
