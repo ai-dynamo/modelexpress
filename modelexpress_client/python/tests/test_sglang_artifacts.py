@@ -410,3 +410,33 @@ def test_sglang_kernel_cache_identity_without_digest_keeps_existing_source_id(mo
 
     assert identity.compile_config_digest == ""
     assert compute_mx_source_id(identity) == compute_mx_source_id(without_field)
+
+
+@pytest.mark.parametrize("configured", [None, "", " ", "http://custom/ready"])
+@pytest.mark.parametrize("disabled", [False, True])
+def test_http_readiness_precedes_cache_settling(
+    monkeypatch, tmp_path, configured, disabled
+):
+    from modelexpress.metadata import artifact_lifecycle
+    from modelexpress.metadata.artifact_transfer import ArtifactCacheRoot
+
+    if configured is None:
+        monkeypatch.delenv("MX_ARTIFACT_READY_URL", raising=False)
+    else:
+        monkeypatch.setenv("MX_ARTIFACT_READY_URL", configured)
+    monkeypatch.setenv("MX_DISABLE_PATCHES", str(int(disabled)))
+    (tmp_path / "kernel.so").write_bytes(b"compiled")
+    clock = [100.0]
+    healthy = [False]
+    monkeypatch.setattr(artifact_lifecycle.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(artifacts, "_sglang_health_ready", lambda ctx: healthy[0])
+    ready = artifacts._sglang_artifact_ready_fn(
+        (ArtifactCacheRoot("primary", tmp_path, tmp_path),)
+    )
+    assert not ready()
+    healthy[0] = True
+    assert not ready()
+    clock[0] += artifact_lifecycle.CACHE_SETTLE_SECS
+    assert ready()
+    (tmp_path / "kernel.so").write_bytes(b"later compilation")
+    assert not ready()

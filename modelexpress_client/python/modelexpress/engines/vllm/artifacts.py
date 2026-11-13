@@ -537,16 +537,10 @@ def _set_extra_if_present(
 
 def _vllm_artifact_ready_fn(
     source_roots: tuple[ArtifactCacheRoot, ...],
-    health_ready_fn=None,
-    ctx: LoadContext | None = None,
+    ctx: LoadContext,
 ):
-    if health_ready_fn is None:
-        # Resolve the engine hook at call time so existing tests and diagnostics
-        # can replace _vllm_health_ready after constructing the readiness check.
-        health_ready_fn = lambda: _vllm_health_ready(ctx)
     return _artifact_lifecycle.artifact_ready_fn(
-        source_roots,
-        health_ready_fn,
+        source_roots, ctx.artifact_ready_fn or (lambda: False)
     )
 
 
@@ -557,7 +551,11 @@ def _vllm_health_ready(ctx: LoadContext | None = None) -> bool:
 def _vllm_health_url(ctx: LoadContext | None = None) -> str:
     return _artifact_lifecycle.resolve_health_url(
         envs.MX_ARTIFACT_READY_URL,
-        _DEFAULT_READY_URL,
+        (
+            getattr(getattr(ctx, "load_config", None), "model_loader_extra_config", None)
+            or {}
+        ).get("modelexpress_artifact_ready_url")
+        or _DEFAULT_READY_URL,
         getattr(ctx, "head_addr", None),
     )
 

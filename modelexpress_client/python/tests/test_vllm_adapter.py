@@ -1588,3 +1588,44 @@ def test_discovery_keeps_exact_k3_collective_state_local(
     assert op.collective.peer_ptrs is pointers
     assert op.collective.flags is flags
     assert op.collective.workspace is workspace
+
+
+def test_vllm_context_supplies_artifact_readiness_callback(monkeypatch):
+    from modelexpress.engines.vllm import artifacts
+
+    _stub_metadata_client(monkeypatch)
+    sys.modules["vllm.distributed"].get_world_group.return_value.local_rank = 0
+    config = _context_config(load_device="cuda:0")
+    config.load_config.model_loader_extra_config = {"modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health"}
+    config.parallel_config.master_addr = "head.internal"
+    monkeypatch.delenv("MX_ARTIFACT_READY_URL", raising=False)
+    monkeypatch.delenv("LWS_LEADER_ADDRESS", raising=False)
+    urls = []
+    monkeypatch.setattr(
+        artifacts._artifact_lifecycle,
+        "artifact_health_ready",
+        lambda url: urls.append(url) or True,
+    )
+
+    ctx = build_vllm_load_context(config, _model_config())
+    assert ctx.artifact_ready_fn()
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://custom.internal:9443/ready")
+    assert ctx.artifact_ready_fn()
+    assert urls == [
+        "http://head.internal:9007/health",
+        "https://custom.internal:9443/ready",
+    ]
+
+
+def test_adapter_native_loaders_do_not_receive_mx_readiness_options():
+    config = _context_config(load_device="cpu")
+    config.load_config.model_loader_extra_config = {
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+        "num_threads": 4,
+    }
+    adapter = VllmAdapter(config, _model_config())
+    assert adapter.load_config.model_loader_extra_config == {"num_threads": 4}
+    assert config.load_config.model_loader_extra_config == {
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+        "num_threads": 4,
+    }

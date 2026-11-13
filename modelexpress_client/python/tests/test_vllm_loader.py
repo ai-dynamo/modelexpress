@@ -3295,3 +3295,30 @@ def test_retry_releases_tensors_while_caller_retains_model(
         assert rebuilt.value is rebuilt.model
         assert rebuilt.publishable is False
     assert adapter.accelerator_backend.empty_cache_calls == 1
+
+
+def test_standalone_native_loader_does_not_receive_mx_readiness_options(monkeypatch):
+    from types import SimpleNamespace
+    from modelexpress.engines.vllm import loader as module
+
+    config = SimpleNamespace(load_format="mx", model_loader_extra_config={
+        "modelexpress_artifact_ready_url": "http://127.0.0.1:9007/health",
+        "num_threads": 4,
+    })
+    loader = module.MxModelLoader(config)
+    received = []
+
+    class NativeLoader:
+        def __init__(self, load_config):
+            assert load_config.model_loader_extra_config == {"num_threads": 4}
+        def download_model(self, model_config):
+            received.append(model_config)
+        def load_weights(self, model, model_config):
+            received.append(model)
+
+    monkeypatch.setattr(module, "DefaultModelLoader", NativeLoader)
+    monkeypatch.setattr(module.model_prefetch, "is_enabled", lambda: False)
+    loader.download_model("model-config")
+    loader.load_weights("model", "model-config")
+    assert received == ["model-config", "model"]
+    assert config.model_loader_extra_config["modelexpress_artifact_ready_url"] == "http://127.0.0.1:9007/health"

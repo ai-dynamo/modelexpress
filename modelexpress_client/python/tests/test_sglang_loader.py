@@ -2135,3 +2135,27 @@ def test_transfer_engine_rejects_source_only_runtime_tensor():
         loader._receive_via_transfer_engine({}, transfer_engine, source,
                                             SimpleNamespace(global_rank=0))
     transfer_engine.submit_scatter_read.assert_not_called()
+
+
+@pytest.mark.parametrize("local_dummy", [False, True])
+def test_sglang_context_captures_http_readiness(monkeypatch, local_dummy):
+    from modelexpress.engines.sglang import adapter, artifacts, readiness
+
+    captured = readiness.SglangServerReadiness(
+        "http://127.0.0.1:9007/health", local_dummy=local_dummy
+    )
+    monkeypatch.delenv("MX_ARTIFACT_READY_URL", raising=False)
+    monkeypatch.setattr(adapter, "sglang_server_readiness", lambda: captured)
+    ctx = build_sglang_load_context(_load_config(), _model_config(), _device_config())
+    ctx.head_addr = "head.internal"
+    def unavailable():
+        raise AssertionError("Readiness must use the configuration captured at load")
+    monkeypatch.setattr(artifacts, "sglang_server_readiness", unavailable)
+    probe = MagicMock(return_value=True)
+    monkeypatch.setattr(artifacts._common_artifacts, "artifact_health_ready", probe)
+    assert ctx.artifact_ready_fn()
+    host = "127.0.0.1" if local_dummy else "head.internal"
+    probe.assert_called_once_with(f"http://{host}:9007/health", timeout_secs=5.0)
+    monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://custom-health/ready")
+    assert ctx.artifact_ready_fn()
+    assert probe.call_args.args == ("https://custom-health/ready",)

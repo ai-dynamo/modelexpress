@@ -877,7 +877,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
 | `MX_P2P_COLD_START` | `0` | Opt in to lease-coordinated concurrent cold starts with vLLM and a centralized Redis-backed MX server. Supports fixed non-elastic TP, PP, DP, EP and speculative decoding. TP, DP and PP have been validated on GPUs; EP has not. Prefill or decode context parallelism greater than one is rejected by the opt-in path; reload, sleep/wake and elastic EP are unsupported. |
 | `MX_P2P_COLD_START_WAIT_TIMEOUT_SECS` | `600` | Maximum time in seconds for cold-start donor discovery and election before skipping RDMA and continuing with the remaining load strategies. Also caps total donor lease renewal time from acquisition. Must be positive and less than 1500 seconds; invalid values use the default. This leaves a margin below the default 1800-second Gloo timeout, but deployments with a shorter CPU process-group timeout must configure a shorter MX wait. |
-| `MX_ARTIFACT_READY_URL` | Framework default for bundles; unset for vLLM weight publication | Readiness endpoint used before preparing and publishing cache artifact bundles. For vLLM weight metadata, readiness is gated only when explicitly configured. Bundle readiness defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. See [Multi-node readiness](#multi-node-readiness). |
+| `MX_ARTIFACT_READY_URL` | engine-specific | Explicit HTTP readiness override for weights and artifacts. When unset, empty, or whitespace-only, both engines derive their health URLs from resolved serving settings. |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile and kernel JIT cache (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI) artifact source pools. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
@@ -1316,7 +1316,44 @@ and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
 `status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its
 deterministic object key and needs no MX metadata record.
 
+#### Artifact startup readiness
+
+`MX_ARTIFACT_READY_URL` remains an optional HTTP(S) override. When unset, empty,
+or whitespace-only:
+
+- vLLM probes its resolved HTTP host and port, including CLI/config-file
+  overrides. For example, `vllm serve MODEL --port 8001 --load-format modelexpress`
+  probes `http://127.0.0.1:8001/health` without another setting.
+- SGLang probes its resolved HTTP listener without plugin hooks. Python follower
+  nodes use their local plain-HTTP health listener, including when the head uses
+  TLS. Rust listener placement follows SGLang's native helper.
+
+Both paths wait for cache files to settle. Weight-metadata policy is unchanged.
+Startup completion does not cover specializations compiled by later requests.
+
+vLLM carries the parsed endpoint to workers through its general-plugin
+compatibility adapter, without changing source identities or compilation-cache
+hashes. Wildcard bind hosts become loopback addresses. TLS selects HTTPS with
+normal certificate verification. Without serving configuration, the fallback
+is `http://127.0.0.1:8000/health`; this also applies when compatibility patches
+are disabled. UDS, gRPC-only serving, dynamic ports, and custom frontends require
+an explicit reachable HTTP(S) URL. Headless workers retain head-address routing.
+SGLang needs no runtime compatibility patch for listener discovery. Its fallback
+is `http://127.0.0.1:30000/health`; TLS uses normal certificate verification.
+No vLLM worker extension or endpoint plugin is required. Worker-local readiness
+is supplied through `LoadContext.artifact_ready_fn`; the artifact layer adds cache
+settling and keeps publication closed if the callback is missing. The serialized
+URL travels in `model_loader_extra_config` through a single CLI-conversion
+wrapper; MX removes its key from copies passed to native loaders.
+Automatic discovery only attaches metadata for MX loaders while artifact
+transfer is enabled and no explicit URL is set. Unsupported hook shapes, missing
+parsed arguments, or read-only configuration are logged; use
+`MX_ARTIFACT_READY_URL` when discovery cannot run.
+
 #### Multi-node readiness
+
+SGLang's inferred local follower health listeners are probed locally. The
+following head-address routing applies to other loopback health URLs.
 
 Only the head node of a multi-node engine serves HTTP; the others run headless
 (for vLLM, `--headless`, which starts the executor and no API server), so a

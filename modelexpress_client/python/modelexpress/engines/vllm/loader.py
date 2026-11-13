@@ -48,7 +48,12 @@ from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
-from .adapter import _is_speculative_draft, build_vllm_load_context, cold_start_expected_workers
+from .adapter import (
+    _is_speculative_draft,
+    _native_load_config,
+    build_vllm_load_context,
+    cold_start_expected_workers,
+)
 from .artifacts import (
     _vllm_health_ready,
     _vllm_version,
@@ -144,7 +149,7 @@ class MxModelLoader(BaseModelLoader):
     """
 
     def __init__(self, load_config: LoadConfig):
-        super().__init__(load_config)
+        super().__init__(_native_load_config(load_config))
         configure_vllm_logging()
         # Unconditionally, and off the load path: a run that skips P2P and falls
         # back to a local or HuggingFace path must still bring the exporter up,
