@@ -107,6 +107,55 @@
       ]
     },
     {
+      "id": "choose-path-separate-clusters-s3",
+      "question": "Our Megatron trainer runs on one cluster and the vLLM rollout fleet on another cloud with no RDMA between them. Both can reach an S3 bucket. Which ModelExpress refit path should we use?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Use the S3 delta path: with no network path between trainer and generators, NIXL and M2N are not options, and S3 delta only needs both sides to reach S3 and the MX server. Register a catalog-only READY v0 for the shared seed, initialize ModelExpressTrainerClient with WRITE_TO_STORAGE, XOR_DELTA and an ObjectStorageConfig, call prepare_delta_base, then per update create the version as STAGING, stage_shard and publish on every publishing rank, and mark it READY. Start vLLM with the modelexpress weight-transfer backend, call init_weight_transfer_engine once, and apply each version with start_weight_update, update_weights and finish_weight_update while generation is paused.",
+      "expected_behavior": [
+        "Select the S3 delta path and name the deciding rule",
+        "Explain that S3 delta needs no trainer-to-generator network path",
+        "List the trainer-side calls in order, including the catalog-only v0 and prepare_delta_base",
+        "List the vLLM init and apply sequence"
+      ]
+    },
+    {
+      "id": "wire-miles-sglang-s3",
+      "question": "How do I turn on ModelExpress S3 delta refit in Miles with Miles-managed SGLang for Qwen3-30B-A3B, with a full checkpoint every 10 steps?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Pass --update-weight-transfer-mode modelexpress and --modelexpress-config with model_name, server_url, initial_base_version_id, seed_checkpoint_path, refit_checkpoint_dir, object_storage_uri_prefix, object_storage_region_name (or object_storage_endpoint_url) and full_hf_checkpoint_interval 10. Use a fresh model name, base id and S3 prefix per run. Miles requires Megatron, no colocation, no LoRA, and abort or retract pausing, and SGLang must include the ModelExpress refit endpoint. Miles registers the catalog-only v0, publishes from sender ranks, marks each version READY, pauses and flushes the engines, calls update_weights_from_modelexpress, and resumes. Set MX_GENERATOR_SOURCE_ORDER=OBJECT_STORAGE on rollout workers for S3-only refit and size the refit cache for the active lineage plus two copies of a full checkpoint.",
+      "expected_behavior": [
+        "Give the transfer-mode flag and a complete --modelexpress-config",
+        "Set full_hf_checkpoint_interval to 10",
+        "Require a fresh model name, base id, and S3 prefix per run",
+        "State the Miles constraints: Megatron, no colocation or LoRA, abort or retract pausing",
+        "Mention sizing refit_checkpoint_dir"
+      ]
+    },
+    {
+      "id": "s3-retained-base-mismatch",
+      "question": "After our trainer process restarted, publishing the next delta fails with: target base 'v41' does not match retained base 'v0'. What happened and how do we recover?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Delta lineage: the restarted ModelExpressTrainerClient retains only the seed base v0, while the new version names v41 as its base, so the trainer cannot compute an exact XOR delta. This fails before any generator install, so generators keep serving and need no restart. Publish the next version as a FULL_HF_CHECKPOINT with no base_version_id to start a new chain from the current weights, then continue with deltas against that version.",
+      "expected_behavior": [
+        "Classify as delta lineage on the trainer side",
+        "Explain the retained base resets when the trainer client is recreated",
+        "Recover by publishing a FULL_HF_CHECKPOINT",
+        "State that generators need no restart"
+      ]
+    },
+    {
+      "id": "s3-replay-chain-limit",
+      "question": "A vLLM generator that was down for a while fails refit with: replay exceeds maximum chain length 64 before revision 'v37'. We only publish deltas.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Delta lineage and checkpoint cache: with only deltas, the generator would replay more than max_replay_chain_length (default 64) revisions to reach the target. The chain is resolved before any download or installation, so the cache and live weights are unchanged. Publish full HF checkpoints periodically (full_hf_checkpoint_interval in Miles) so chains reset, then request the target again; raising max_replay_chain_length in the receiver config is only a stopgap.",
+      "expected_behavior": [
+        "Classify as delta lineage or replay chain limit",
+        "Name the default limit of 64 and max_replay_chain_length",
+        "Recommend periodic full checkpoints",
+        "State the failure happens before installation, so no engine restart is needed"
+      ]
+    },
+    {
       "id": "neg-initial-p2p-load",
       "question": "Speed up vLLM cold start by loading the model over P2P from another ModelExpress-served replica.",
       "expected_skill": "none",
