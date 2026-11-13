@@ -229,3 +229,47 @@ prefix per run. If installation started and failed, keep generation paused and
 request the same version, or a newer one built on it, again: the prepared
 checkpoint is reloaded in full. Restart the engine only if that also fails. In
 Miles a failed install stops the run.
+
+## FSDP Snapshot Staging (NIXL)
+
+Signals: `IN_PLACE` rejects a dtype conversion or moved source address;
+`COPY_TO_HOST staging requires CUDA for pinned memory`; host-source metadata is
+rejected; or later versions install old values after state-dict rematerialization.
+
+Next action:
+
+- Read [fsdp-cpu-staging.md](fsdp-cpu-staging.md). Use `COPY_TO_HOST` for casts
+  or moving storage; retain exact FP32 exceptions rather than lowering training
+  precision to make `IN_PLACE` fit.
+- Refresh the mapping retained by `bind_tensors` with the current tensors;
+  the public client does not fetch a new state dict on each publish. Preserve
+  coverage/dtypes, or retire and recreate the client/mesh for a layout change.
+- Check CUDA-enabled pinned allocation, host-memory/registration limits, and
+  compatible host-aware readers for DRAM v2 manifests. Keep destination memory
+  kind explicit in custom transport wiring; do not label host pointers as VRAM.
+- Wait for snapshot completion before publication, and retire the previous
+  version before overwriting shared arenas. A lease does not prevent a local
+  buffer overwrite. If a live engine installed stale or partial weights, keep
+  it paused and restart before resuming; a rejected configuration before any
+  installation does not itself corrupt the engine.
+
+## RDMA Provisioning Or Rail Selection
+
+Signals: several readers all use one NIC; topology lists devices missing from
+`/dev/infiniband`; auto-probe warns about isolated GPUs; or warm throughput
+changes sharply across launches despite identical tensor geometry.
+
+Next action:
+
+- Read [rdma-rails.md](rdma-rails.md). Collect the usable device map on both
+  endpoints, not just host sysfs or a scheduler GPU count.
+- Select the actual transport's controls. For NIXL, verify
+  `MX_RDMA_NIC_PIN=auto` or an externally managed per-worker `UCX_NET_DEVICES`;
+  an enabled MX selector can overwrite the latter. An identical explicit list
+  with `device_id=0` on every isolated worker converges on one NIC.
+- If devices were not allocated, fix provisioning through the workload owner;
+  do not claim a flag grants access. If auto cannot see peer GPUs, use a verified
+  per-worker mapping. Apply it before recreating NIXL agents/communicators.
+- Confirm selected HCA/port and memory path from logs and traffic counters,
+  then repeat independent launches with correctness checks. Successful READs,
+  two allowed HCAs, or a high link rate do not prove multi-rail bandwidth.

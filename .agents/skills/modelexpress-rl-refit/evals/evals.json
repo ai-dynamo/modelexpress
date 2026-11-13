@@ -156,18 +156,118 @@
       ]
     },
     {
+      "id": "fsdp-host-precision-and-memory",
+      "question": "Our FSDP parameters are FP32, but we send BF16 weights with FP32 router biases. We cannot afford another GPU snapshot. Should I use IN_PLACE, turn on optimizer CPU offload, or set the generator staging device to CPU?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Use the NIXL FSDP COPY_TO_HOST mode with FULL_TENSOR and exact state-dict names in FSDPTrainerContext.wire_dtype_overrides for the FP32 exceptions. IN_PLACE cannot cast. Optimizer offload and generator staging are independent. Pinned host buffers replace the persistent wire-format GPU snapshot, but conversion temporaries and generator buffers still need memory; quantify local shards including replicated tensors and measure peaks.",
+      "expected_behavior": [
+        "Select COPY_TO_HOST through ModelExpressTrainerConfig or its environment default",
+        "Preserve FP32 exception names and training precision",
+        "Distinguish trainer staging, optimizer offload and receiver staging",
+        "Do not claim zero extra VRAM or a universal performance benefit"
+      ]
+    },
+    {
+      "id": "fsdp-host-snapshot-lifetime",
+      "question": "A generator still holds a lease on v7. With COPY_TO_HOST, can the trainer publish v8 now because the bytes are on CPU? We only have one trainer client per rank.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. The FSDP adapter reuses the same persistent host arenas for later versions. A server lease does not stop local overwrites. Wait for consumers to finish/release leases, retire v7 and release its trainer publications before staging v8. Source optimizer writes may resume after snapshot completion, but the CPU snapshot must stay immutable. COPY_TO_HOST is not per-version buffering.",
+      "expected_behavior": [
+        "Reject overlapping publication into reused arenas",
+        "Distinguish original source tensors from the published snapshot",
+        "Require completion and retirement before reuse",
+        "Do not suggest force-deleting an active lease"
+      ]
+    },
+    {
+      "id": "fsdp-bound-state-rematerialized",
+      "question": "We bound model.state_dict() once and call publish_version each step. FSDP now replaces its tensor objects during offload, and refits appear to use old weights. Does COPY_TO_HOST automatically fetch the new state dict?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. The public client retains the mapping passed to bind_tensors. The adapter re-captures from that mapping, not directly from the model. After retiring the old version, refresh the contents of the same bound mapping from the current model.state_dict(), preserving coverage and source dtypes; do not bind twice. A changed layout requires a new client/mesh. Validate multiple changing versions including storage replacement.",
+      "expected_behavior": [
+        "Identify the retained mapping as the source",
+        "Refresh the existing mapping before publication",
+        "Preserve retirement and layout checks",
+        "Verify actual installed parameters across changed versions"
+      ]
+    },
+    {
+      "id": "fsdp-host-reader-compatibility",
+      "question": "After switching the trainer to COPY_TO_HOST, our older receiver rejects mx.reshard.shard_table.v2. Should we mark the source VRAM or move generator staging to CPU?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Neither is the compatibility fix. Host-source manifests are v2 and describe registered DRAM. Upgrade both ends to host-aware clients; never relabel host pointers as VRAM. Source and destination memory kinds are independent. A custom NixlReshardTransport needs session_to_memory and an explicit local_mem_type for the actual receive buffer.",
+      "expected_behavior": [
+        "Keep source memory type DRAM",
+        "Require a host-aware receiver",
+        "Do not require CPU destination staging",
+        "Describe custom transport memory-kind wiring"
+      ]
+    },
+    {
+      "id": "rdma-masked-workers-explicit-list",
+      "question": "Four NIXL workers each see one CUDA GPU and call the manager with device_id=0. We set MX_RDMA_NIC_PIN=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1 in all workers, yet every reader uses mlx5_0. Why?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "The explicit list indexes process-local device_id, not global rank, so every worker chooses entry zero. Use auto if host PCI GPU discovery and allocated NIC visibility are consistent across workers, or supply distinct externally assigned UCX_NET_DEVICES per worker with MX_RDMA_NIC_PIN unset/off. If PCI enumeration is also isolated, auto cannot reliably spread them. Verify effective logs and traffic, not just the configured list.",
+      "expected_behavior": [
+        "Explain device_id indexing",
+        "Offer auto only with adequate shared topology visibility",
+        "Offer per-worker UCX_NET_DEVICES with MX selector disabled",
+        "Verify actual mapping before benchmarking"
+      ]
+    },
+    {
+      "id": "rdma-pin-precedence-and-transport",
+      "question": "We set UCX_NET_DEVICES to a manually assigned rail but left MX_RDMA_NIC_PIN=auto enabled. It changed at startup. Should we set NCCL_IB_HCA to force NIXL back onto the intended NIC?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. The enabled MX selector can overwrite UCX_NET_DEVICES before NIXL agent construction. Disable/unset MX_RDMA_NIC_PIN when managing UCX_NET_DEVICES externally and restart the worker/agent with the intended value. NCCL_IB_HCA controls NCCL, not NIXL/UCX. Confirm the manual rail is allocated and reachable; preserve correctness checks.",
+      "expected_behavior": [
+        "Explain MX pin precedence",
+        "Disable MX selector for external UCX mapping",
+        "Keep NCCL and NIXL selectors separate",
+        "Apply the mapping before agent creation"
+      ]
+    },
+    {
+      "id": "rdma-allowed-versus-used-rails",
+      "question": "Our synthetic M2N timing allowed two HCAs and ran fast. The channel logs show only one HCA carrying GDRDMA traffic. Can we report two-rail scaling and use that rate as the GLM refit result?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. Allowed HCAs are not active rails. This evidence supports a synthetic single-rail transport measurement, not multi-rail scaling or live GLM refit. Verify port traffic with counter units and contention accounted for, repeat independent launches, separate cold and warm spans, and qualify the current cross-node M2N integration separately.",
+      "expected_behavior": [
+        "Reject both multi-rail and GLM refit claims",
+        "Use logs and port counters to identify active rails",
+        "Repeat independent launches",
+        "Do not infer current M2N cross-node support from a historical native probe"
+      ]
+    },
+    {
+      "id": "rdma-visible-but-unallocated",
+      "question": "The refit pod has four idle GPUs and sysfs lists eight NICs, but only one uverbs device is exposed and other pods hold the NIC allocations. Can auto pinning spread traffic onto the other seven?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. Sysfs visibility does not grant verbs access; the current auto probe filters NICs without exposed verbs devices. Check actual device access, allocation and peer connectivity. Coordinate GPU/NIC provisioning or use the available rail with its measured limits. Do not access other tenants devices or claim four idle GPUs provide four usable rails.",
+      "expected_behavior": [
+        "Distinguish sysfs from usable verbs devices",
+        "Check NIC capacity alongside GPU capacity",
+        "Do not claim pinning grants missing devices",
+        "Report the provisioning limit before making bandwidth claims"
+      ]
+    },
+    {
       "id": "neg-initial-p2p-load",
       "question": "Speed up vLLM cold start by loading the model over P2P from another ModelExpress-served replica.",
       "expected_skill": "none",
       "ground_truth": "Initial checkpoint loading belongs to the base ModelExpress loader, not RL weight refit.",
-      "expected_behavior": ["modelexpress-rl-refit stays silent"]
+      "expected_behavior": [
+        "modelexpress-rl-refit stays silent"
+      ]
     },
     {
       "id": "neg-dynamo-deploy",
       "question": "Deploy the Qwen vLLM disaggregated recipe with Dynamo on my cluster.",
       "expected_skill": "dynamo-recipe-runner",
       "ground_truth": "Dynamo recipe bring-up belongs to dynamo-recipe-runner.",
-      "expected_behavior": ["modelexpress-rl-refit stays silent; dynamo-recipe-runner handles it"]
+      "expected_behavior": [
+        "modelexpress-rl-refit stays silent; dynamo-recipe-runner handles it"
+      ]
     }
   ]
 }
