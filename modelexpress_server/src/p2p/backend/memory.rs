@@ -65,7 +65,7 @@ impl MetadataBackend for InMemoryMetadataBackend {
         _pod_uid: &str,
         _pod_namespace: &str,
     ) -> MetadataResult<()> {
-        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity);
+        let source_id = crate::p2p::source_identity::compute_mx_source_id(identity)?;
         let record = WorkerRecord::from(worker);
         let rank = record.worker_rank;
 
@@ -252,7 +252,7 @@ mod tests {
     async fn publish_get_remove_roundtrip() {
         let backend = InMemoryMetadataBackend::new();
         let id = identity("m");
-        let source_id = compute_mx_source_id(&id);
+        let source_id = compute_mx_source_id(&id).expect("source id");
 
         backend
             .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
@@ -285,7 +285,7 @@ mod tests {
     async fn get_metadata_returns_ranks_sorted() {
         let backend = InMemoryMetadataBackend::new();
         let id = identity("m");
-        let source_id = compute_mx_source_id(&id);
+        let source_id = compute_mx_source_id(&id).expect("source id");
 
         for rank in [2, 0, 1] {
             backend
@@ -353,7 +353,7 @@ mod tests {
         let mut id = identity("m");
         id.extra_parameters
             .insert("training_step".to_string(), "42".to_string());
-        let source_id = compute_mx_source_id(&id);
+        let source_id = compute_mx_source_id(&id).expect("source id");
 
         backend
             .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
@@ -383,7 +383,7 @@ mod tests {
     async fn update_status_patches_then_errors_on_missing() {
         let backend = InMemoryMetadataBackend::new();
         let id = identity("m");
-        let source_id = compute_mx_source_id(&id);
+        let source_id = compute_mx_source_id(&id).expect("source id");
 
         backend
             .publish_metadata(&id, "w1", worker(0, SourceStatus::Initializing), "", "", "")
@@ -423,7 +423,7 @@ mod tests {
     async fn remove_worker_drops_source_only_when_empty() {
         let backend = InMemoryMetadataBackend::new();
         let id = identity("m");
-        let source_id = compute_mx_source_id(&id);
+        let source_id = compute_mx_source_id(&id).expect("source id");
 
         backend
             .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
@@ -468,7 +468,7 @@ mod tests {
     async fn source_load_round_trips_as_option() {
         let backend = InMemoryMetadataBackend::new();
         let id = identity("m");
-        let source_id = compute_mx_source_id(&id);
+        let source_id = compute_mx_source_id(&id).expect("source id");
         backend
             .publish_metadata(&id, "w1", worker(0, SourceStatus::Ready), "", "", "")
             .await

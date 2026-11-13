@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import io
 import json
 import os
 import re
@@ -8,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import yaml
 
@@ -178,7 +180,7 @@ class NightlyWorkflowTests(unittest.TestCase):
         match = re.search(r"fromJSON\('((?:''|[^'])*)'\)", include)
         partitions = json.loads(match[1].replace("''", "'"))
         self.assertEqual({key: len(rows) for key, rows in partitions.items()}, {
-            "vllm": 10, "sglang": 6, "sglang-mooncake": 1, "dynamo-vllm": 1, "dynamo-sglang": 1, "large": 7,
+            "vllm": 7, "sglang": 3, "sglang-mooncake": 1, "dynamo-vllm": 1, "dynamo-sglang": 1, "large": 7,
         })
         namespaces = set()
         for framework, cases in partitions.items():
@@ -199,8 +201,6 @@ class NightlyWorkflowTests(unittest.TestCase):
                     self.assertLessEqual(len(grove_label), 63, grove_label)
         large = [case for cases in partitions.values() for case in cases if case.get("large")]
         self.assertEqual(sorted(case["fleet_size"] for case in large if case["kind"] == "fleet"), ["15", "5", "5"])
-        sglang_mla = next(case for case in partitions["sglang"] if case.get("measure_vram"))
-        self.assertEqual(sglang_mla["pytest_args"], "--expected-max-total-tokens 131072")
         self.assertEqual(
             {case["name"] for case in large if case["kind"] != "fleet"},
             {
@@ -258,7 +258,7 @@ class NightlyWorkflowTests(unittest.TestCase):
         results = {job: {"result": "success"} for job in status["needs"]}
         results["manual-release-approval"]["result"] = "skipped"
         environment = {"RELEASE": "false", "RUN_TESTS": "true", "SKIP_GITLAB": "false"}
-        script = status["steps"][0]["run"]
+        script = next(step["run"] for step in status["steps"] if step.get("name") == "Verify results")
         result, _ = execute(script, {**environment, "RESULTS": json.dumps(results)})
         self.assertEqual(result.returncode, 0, result.stderr)
         for suite in ["core-tests", "inference-tests", "rl-tests"]:
@@ -271,6 +271,134 @@ class NightlyWorkflowTests(unittest.TestCase):
             results[suite]["result"] = "skipped"
         result, _ = execute(script, {**environment, "RUN_TESTS": "false", "RESULTS": json.dumps(results)})
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cleanup_image_install_retries_and_preserves_failure(self):
+        script = (ROOT / "ci/bench/Dockerfile.cleanup").read_text().split("RUN python3 - <<'PYTHON'\n", 1)[1].rsplit("\nPYTHON", 1)[0]
+        lock = b'[[package]]\nname = "boto3"\nversion = "1.43.0"\n'
+        error = subprocess.CalledProcessError(2, "pip")
+        timeout = subprocess.TimeoutExpired("pip", 300)
+        for failures in [[], [error], [timeout], [error, error, error], [timeout, timeout, timeout]]:
+            with self.subTest(failures=failures), patch("builtins.open", return_value=io.BytesIO(lock)), \
+                    patch("subprocess.check_call", side_effect=[*failures, 0]) as install, \
+                    patch("time.sleep") as sleep:
+                if len(failures) == 3:
+                    with self.assertRaises(type(failures[-1])):
+                        exec(compile(script, "Dockerfile.cleanup", "exec"), {})
+                else:
+                    exec(compile(script, "Dockerfile.cleanup", "exec"), {})
+                self.assertEqual(install.call_count, min(len(failures) + 1, 3))
+                self.assertEqual(sleep.call_count, min(len(failures), 2))
+                self.assertEqual(install.call_args.kwargs["timeout"], 300)
+                self.assertIn("boto3==1.43.0", install.call_args.args[0])
+
+    def test_python_toolchain_setup_is_bounded_and_failure_is_not_hidden(self):
+        job = workflow("modelexpress-core-ci.yml")["jobs"]["python-test"]
+        setup = next(step for step in job["steps"] if step.get("name") == "Install C toolchain")
+        self.assertEqual(setup["timeout-minutes"], "5")
+        self.assertLess(int(setup["timeout-minutes"]), int(job["timeout-minutes"]))
+        stubs = """
+command() { return "$COMPILER_MISSING"; }
+sudo() { printf '%s\n' "$*"; return "$APT_STATUS"; }
+g++() { echo compiler-ready; }
+"""
+        for missing, apt_status in [("0", "0"), ("1", "0"), ("1", "23")]:
+            with self.subTest(missing=missing, apt_status=apt_status):
+                result, _ = execute(stubs + setup["run"], {
+                    "COMPILER_MISSING": missing, "APT_STATUS": apt_status,
+                })
+                self.assertEqual(result.returncode, int(apt_status))
+                if missing == "0":
+                    self.assertNotIn("apt-get", result.stdout)
+                elif apt_status == "0":
+                    self.assertIn("--no-install-recommends g++", result.stdout)
+                    self.assertIn("Acquire::http::Timeout=30", result.stdout)
+                else:
+                    self.assertNotIn("compiler-ready", result.stdout)
+
+    def test_release_qualification_blocks_failed_missing_and_skipped_prerequisites(self):
+        jobs = workflow("nightly-ci.yml")["jobs"]
+        gate = jobs["trigger-gitlab-release"]
+        self.assertTrue({"core-tests", "inference-tests", "rl-tests"} <= set(gate["needs"]))
+        steps = gate["steps"]
+        qualify = next(step for step in steps if step.get("name") == "Verify release qualification")
+        trigger = next(step for step in steps if step.get("name") == "Trigger GitLab pipeline")
+        self.assertLess(steps.index(qualify), steps.index(trigger))
+        environment = {"RELEASE": "true", "RUN_TESTS": "true"}
+        results = {job: {"result": "success"} for job in gate["needs"]}
+        results["manual-release-approval"]["result"] = "skipped"
+
+        def check(values, **modes):
+            return execute(qualify["run"], {**environment, **modes, "RESULTS": json.dumps(values)})[0]
+
+        self.assertEqual(check(results).returncode, 0)
+        for job in gate["needs"]:
+            if job in {"manual-release-approval", "notify-slack-start"}:
+                continue
+            for conclusion in ["failure", "cancelled", "skipped", None]:
+                changed = dict(results)
+                if conclusion is None:
+                    del changed[job]
+                else:
+                    changed[job] = {"result": conclusion}
+                with self.subTest(job=job, conclusion=conclusion):
+                    self.assertNotEqual(check(changed).returncode, 0)
+        disabled = {**results, "inference-tests": {"result": "skipped"}, "rl-tests": {"result": "skipped"}}
+        self.assertEqual(check(disabled, RUN_TESTS="false").returncode, 0)
+        disabled["core-tests"] = {"result": "skipped"}
+        self.assertNotEqual(check(disabled, RUN_TESTS="false").returncode, 0)
+        for modes in [{"RELEASE": ""}, {"RUN_TESTS": ""}, {"RUN_TESTS": "unknown"}]:
+            self.assertNotEqual(check(results, **modes).returncode, 0)
+
+    def test_slack_failure_exception_applies_only_to_release_qualification(self):
+        jobs = workflow("nightly-ci.yml")["jobs"]
+        for phase, job_name in [("release", "trigger-gitlab-release"), ("final", "nightly-status")]:
+            results = {job: {"result": "success"} for job in jobs[job_name]["needs"]}
+            for conclusion in ["failure", "cancelled"]:
+                with self.subTest(phase=phase, conclusion=conclusion):
+                    changed = {**results, "notify-slack-start": {"result": conclusion}}
+                    environment = {
+                        "RELEASE": "true", "RUN_TESTS": "true",
+                        "RESULTS": json.dumps(changed),
+                    }
+                    script = f"bash .github/scripts/check-nightly-results.sh {phase}"
+                    result, _ = execute(script, environment)
+                    self.assertEqual(result.returncode, 0 if phase == "release" else 1, result.stderr)
+                    for required in ["core-tests", "manual-release-approval"]:
+                        with self.subTest(required=required):
+                            failed = {**changed, required: {"result": conclusion}}
+                            result, _ = execute(script, {**environment, "RESULTS": json.dumps(failed)})
+                            self.assertNotEqual(result.returncode, 0)
+
+    def test_release_handoff_rejects_missing_artifact_metadata_before_posting(self):
+        job = workflow("nightly-ci.yml")["jobs"]["trigger-gitlab-release"]
+        trigger = next(step for step in job["steps"] if step.get("name") == "Trigger GitLab pipeline")
+        script = "curl() { echo posted >&2; echo '{\"id\":123,\"status\":\"pending\"}'; }\n" + trigger["run"]
+        environment = {name: "test-value" for name in trigger["env"]}
+        environment.update({
+            "GITLAB_TRIGGER_URL": "https://gitlab.invalid/trigger",
+            "GITHUB_SHA": "a" * 40, "GITHUB_RUN_ID": "123",
+        })
+        required = [
+            "ARTIFACTORY_WHEEL_REPO", "ARTIFACTORY_PATH", "NGC_STAGING_ORG",
+            "NIGHTLY_TAG", "WHEEL_VERSION", "CRATE_VERSION", "HELM_CHART_VERSION",
+            "STAGED_CONTAINERS", "STAGED_CRATES", "STAGED_HELM",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            environment["GITHUB_STEP_SUMMARY"] = str(Path(directory) / "summary")
+            result, values = execute(script, environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(values["artifacts"], "wheel,container,crate,helm")
+            self.assertIn("posted", result.stderr)
+            for name in required:
+                with self.subTest(name=name):
+                    result, _ = execute(script, {**environment, name: ""})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn("posted", result.stderr)
+
+    def test_release_authorization_still_requires_the_current_attempt(self):
+        gate = workflow("nightly-ci.yml")["jobs"]["trigger-gitlab-release"]
+        self.assertIn("needs.manual-release-approval.outputs.approved_attempt == github.run_attempt", gate["if"])
+        self.assertIn("github.event_name == 'schedule' && github.run_attempt == '1'", gate["if"])
 
 
 class StageReleaseRcWorkflowTests(unittest.TestCase):

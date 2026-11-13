@@ -294,19 +294,7 @@ runs:
       env:
         MODEL: ${{ inputs.model }}
         PORT: ${{ inputs.port }}
-      run: |
-        set -euo pipefail
-        RESPONSE=$(curl -sS --max-time 60 "http://localhost:${PORT}/v1/completions" \
-          -H "Content-Type: application/json" \
-          -d "{\"model\": \"${MODEL}\", \"prompt\": \"The capital of France is\", \"max_tokens\": 8}")
-        echo "Response: ${RESPONSE}"
-        echo "${RESPONSE}" | python3 -c "
-        import json, sys
-        body = json.load(sys.stdin)
-        choices = body.get('choices', [])
-        assert choices and choices[0].get('text'), f'No completion text in response: {body}'
-        print('Inference OK:', repr(choices[0]['text'][:60]))
-        "
+      run: python3 .github/scripts/check_streamer_inference.py
 
     - name: Cleanup container
       if: always()

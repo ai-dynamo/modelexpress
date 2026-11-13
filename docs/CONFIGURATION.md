@@ -184,7 +184,7 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 | MX_ARTIFACT_TRANSFER | false | Enable compatible file-backed JIT artifact installation and publication |
 | MX_ARTIFACT_BACKEND | nixl | Artifact transport: `nixl` or `mooncake`; exactly one is selected and there is no fallback |
 | MX_ARTIFACT_BUNDLE_ROOT | $TMPDIR/modelexpress-artifacts | Local staging root for artifact bundles |
-| MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile artifact sources by compile configuration |
+| MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile and kernel JIT cache artifact sources by compile configuration |
 | MX_ARTIFACT_MOONCAKE_NAMESPACE | modelexpress/artifacts | Key prefix used by the Mooncake artifact backend |
 | MX_ARTIFACT_MOONCAKE_POOL_BYTES | 536870912 bytes | Local buffer-pool size for the process-local Mooncake artifact client; a config-file `local_buffer_size` takes precedence |
 | MX_ARTIFACT_MOONCAKE_DELETE_RETRIES | 10 | Additional attempts when stale-object or repair-marker removal reports an active lease |

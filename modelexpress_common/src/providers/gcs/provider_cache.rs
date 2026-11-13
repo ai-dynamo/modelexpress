@@ -5,9 +5,9 @@ use super::{
     model_dir::ModelDir,
     model_name::{BucketName, CACHE_ROOT_DIR_NAME, ModelName},
 };
-use crate::cache::{ModelInfo, ProviderCache};
+use crate::cache::{ModelInfo, ProviderCache, read_dir_for_listing};
 use crate::models::ModelProvider;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -26,13 +26,20 @@ impl GcsProviderCache {
         if current_model_dir.has_manifest_file() {
             match current_model_dir.model_name() {
                 Ok(model) => {
-                    if current_model_dir.cache_satisfies_request(false)? {
-                        models.push(ModelInfo {
-                            provider: ModelProvider::Gcs,
-                            name: model.to_string(),
-                            size: current_model_dir.size()?,
-                            path: current_dir.to_path_buf(),
-                        });
+                    match current_model_dir.cache_satisfies_request(false) {
+                        Ok(true) => models.push(ModelInfo::measured(
+                            ModelProvider::Gcs,
+                            model.to_string(),
+                            current_dir.to_path_buf(),
+                            current_model_dir.size(),
+                        )),
+                        Ok(false) => {}
+                        Err(err) => models.push(ModelInfo::measured(
+                            ModelProvider::Gcs,
+                            model.to_string(),
+                            current_dir.to_path_buf(),
+                            Err(err),
+                        )),
                     }
                     return Ok(());
                 }
@@ -46,9 +53,10 @@ impl GcsProviderCache {
             }
         }
 
-        for entry in fs::read_dir(current_dir)
-            .with_context(|| format!("Failed to read directory '{}'", current_dir.display()))?
-        {
+        let Some(entries) = read_dir_for_listing(current_dir) else {
+            return Ok(());
+        };
+        for entry in entries {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {

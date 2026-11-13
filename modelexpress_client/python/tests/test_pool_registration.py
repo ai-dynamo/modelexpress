@@ -18,6 +18,7 @@ from modelexpress.nixl_transfer import (
     _arena_single_mr_forced,
     NixlTransferManager,
     _pool_reg_enabled,
+    _spanning_descriptors,
 )
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
@@ -196,6 +197,21 @@ class TestFindCudaAllocations:
             NixlTransferManager._find_cuda_allocations([_desc("w_named", 0x1000, 64)])
 
 
+class TestSpanningDescriptors:
+    def test_tensors_inside_allocations_are_not_reported(self):
+        allocations = [(0x1000, 0x1000), (0x2000, 0x1000)]
+        descriptors = [_desc("w0", 0x1000, 0x1000), _desc("w1", 0x2800, 0x800)]
+        assert _spanning_descriptors(descriptors, allocations) == []
+
+    def test_tensor_past_allocation_end_is_reported_with_its_allocation(self):
+        allocations = [(0x1000, 0x1000), (0x2000, 0x1000)]
+        inside = _desc("inside", 0x1000, 0x100)
+        spanning = _desc("spanning", 0x1f00, 0x200)
+        assert _spanning_descriptors([inside, spanning], allocations) == [
+            (spanning, 0x1000, 0x1000)
+        ]
+
+
 class TestRawDescriptorMemType:
     def _make_manager(self) -> NixlTransferManager:
         mgr = NixlTransferManager(agent_name="test", device_id=0)
@@ -217,6 +233,45 @@ class TestRawDescriptorMemType:
             mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=["UCX"],
         )
+
+    def test_pool_registration_keeps_allocations_when_tensors_fit(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        backing = torch.zeros(8, dtype=torch.float32)
+        first = MagicMock(wraps=backing[:4])
+        first.is_cuda = True
+        second = MagicMock(wraps=backing[4:])
+        second.is_cuda = True
+        base = backing.data_ptr()
+        mgr = self._make_manager()
+        # Each tensor ends exactly at the end of its own allocation.
+        mgr._find_cuda_allocations = MagicMock(
+            return_value=[(base, 16), (base + 16, 16)]
+        )
+        mgr.register_tensors({"a": first, "b": second})
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(base, 16, 0, ""), (base + 16, 16, 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
+    def test_pool_registration_rejects_tensor_spanning_allocations(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        backing = torch.zeros(4, dtype=torch.float32)
+        tensor = MagicMock(wraps=backing)
+        tensor.is_cuda = True
+        base = backing.data_ptr()
+        mgr = self._make_manager()
+        # One VA range backed by two separately mapped segments.
+        mgr._find_cuda_allocations = MagicMock(return_value=[(base, 8), (base + 8, 8)])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            mgr.register_tensors({"workspace": tensor})
+
+        message = str(exc_info.value)
+        assert "First: workspace" in message
+        assert f"[0x{base:x}, 0x{base + 8:x})" in message
+        mgr._agent.register_memory.assert_not_called()
 
     def test_draft_view_inside_registered_pool_reuses_main_registration(
         self, monkeypatch

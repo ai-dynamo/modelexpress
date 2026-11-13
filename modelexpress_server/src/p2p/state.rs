@@ -134,11 +134,12 @@ impl P2pStateManager {
         &self,
         identity: &SourceIdentity,
         worker_id: &str,
-        worker: WorkerMetadata,
+        mut worker: WorkerMetadata,
         pod_name: &str,
         pod_uid: &str,
         pod_namespace: &str,
     ) -> MetadataResult<()> {
+        worker.updated_at = chrono::Utc::now().timestamp_millis();
         self.get_backend()
             .await?
             .publish_metadata(
@@ -149,6 +150,44 @@ impl P2pStateManager {
                 pod_uid,
                 pod_namespace,
             )
+            .await
+    }
+
+    /// Try to acquire a cold-start donor lease on the configured backend.
+    pub async fn try_acquire_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        self.get_backend()
+            .await?
+            .try_acquire_donor_lease(compatibility_key, owner_token, duration)
+            .await
+    }
+
+    /// Renew a cold-start donor lease while it is still owned.
+    pub async fn renew_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+        duration: std::time::Duration,
+    ) -> MetadataResult<bool> {
+        self.get_backend()
+            .await?
+            .renew_donor_lease(compatibility_key, owner_token, duration)
+            .await
+    }
+
+    /// Release a cold-start donor lease if the token still owns it.
+    pub async fn release_donor_lease(
+        &self,
+        compatibility_key: &str,
+        owner_token: &str,
+    ) -> MetadataResult<bool> {
+        self.get_backend()
+            .await?
+            .release_donor_lease(compatibility_key, owner_token)
             .await
     }
 

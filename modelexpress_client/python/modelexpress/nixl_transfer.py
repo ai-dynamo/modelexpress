@@ -15,8 +15,11 @@ also uses the same agent for host DRAM chunk staging.
 from __future__ import annotations
 
 import atexit
+import bisect
+import ipaddress
 import logging
 import os
+import socket
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -55,6 +58,34 @@ NIXL_DRAM_MEM_TYPE = "DRAM"
 NIXL_VRAM_MEM_TYPE = "VRAM"
 #: The memory kinds a published shard may live in, as NIXL names them.
 NIXL_MEM_TYPES = (NIXL_VRAM_MEM_TYPE, NIXL_DRAM_MEM_TYPE)
+
+
+def _resolve_metadata_host(host: str, port: int) -> str:
+    """Resolve a worker host to the numeric address required by NIXL's socket API."""
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+
+    try:
+        addresses = socket.getaddrinfo(
+            host, port, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror as exc:
+        raise RuntimeError(f"Could not resolve NIXL metadata host {host!r}: {exc}") from exc
+
+    for family, _, _, _, sockaddr in addresses:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        address = sockaddr[0]
+        if family == socket.AF_INET6 and sockaddr[3] and "%" not in address:
+            address = f"{address}%{sockaddr[3]}"
+        return address
+
+    raise RuntimeError(f"No IPv4 or IPv6 address found for NIXL metadata host {host!r}")
 
 
 def is_nixl_available() -> bool:
@@ -114,6 +145,24 @@ class PostedRead:
 def _has_memory_range(size: int, addr: int) -> bool:
     """True when a tensor owns allocated bytes that can be registered and read."""
     return size > 0 and addr != 0
+
+
+def _spanning_descriptors(
+    descriptors: list[TensorDescriptor],
+    allocations: list[tuple[int, int]],
+) -> list[tuple[TensorDescriptor, int, int]]:
+    """Descriptors that run past the allocation containing their start address.
+
+    ``allocations`` is the sorted output of ``_find_cuda_allocations`` for the
+    same descriptors. Returns ``(descriptor, alloc_base, alloc_size)`` tuples.
+    """
+    bases = [base for base, _ in allocations]
+    spanning = []
+    for d in descriptors:
+        base, size = allocations[bisect.bisect_right(bases, d.addr) - 1]
+        if d.addr + d.size > base + size:
+            spanning.append((d, base, size))
+    return spanning
 
 
 class NixlTransferManager:
@@ -423,6 +472,20 @@ class NixlTransferManager:
         ):
             if self._accelerator_backend.supports_pool_reg():
                 allocations = self._find_cuda_allocations(registrable_descriptors)
+                # A tensor that runs past its allocation (e.g. a VA reservation
+                # backed by several mappings) cannot be covered by one
+                # registration: the allocation is too short, and registering
+                # the tensor itself trips cuda_ipc's range assertion.
+                spanning = _spanning_descriptors(registrable_descriptors, allocations)
+                if spanning:
+                    first, alloc_base, alloc_size = spanning[0]
+                    raise RuntimeError(
+                        f"{len(spanning)} of {len(registrable_descriptors)} tensors "
+                        "extend past the CUDA allocation containing their start "
+                        f"address and cannot be registered. First: {first.name} "
+                        f"at 0x{first.addr:x} ({first.size} bytes) in allocation "
+                        f"[0x{alloc_base:x}, 0x{alloc_base + alloc_size:x})"
+                    )
             else:
                 allocations = None
                 logger.warning(
@@ -972,8 +1035,12 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
 
-        logger.info(f"Fetching remote metadata from {remote_agent_name} at {ip}:{port}")
-        self._agent.fetch_remote_metadata(remote_agent_name, ip, port)
+        metadata_ip = _resolve_metadata_host(ip, port)
+        logger.info(
+            "Fetching remote metadata from %s at %s:%s (host=%s)",
+            remote_agent_name, metadata_ip, port, ip,
+        )
+        self._agent.fetch_remote_metadata(remote_agent_name, metadata_ip, port)
 
         start = time.perf_counter()
         while True:
@@ -987,7 +1054,7 @@ class NixlTransferManager:
                     f"Remote metadata loaded for {remote_agent_name} "
                     f"({time.perf_counter() - start:.2f}s)"
                 )
-                self._remote_agents[remote_agent_name] = (ip, port)
+                self._remote_agents[remote_agent_name] = (metadata_ip, port)
                 return
             time.sleep(0.01)
 

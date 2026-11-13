@@ -19,6 +19,7 @@ def test_defaults_when_unset(monkeypatch):
         "MX_MS_DISTRIBUTED",
         "MX_LOAD_STRATEGY_CHAIN",
         "MX_DISABLE_DRAFT_P2P",
+        "MX_ENABLE_SEPARATE_DRAFT_P2P",
         "MX_PLUGIN_DIR",
         "MX_LOAD_PLUGIN",
         "MX_LOAD_PLUGIN_BEFORE",
@@ -45,6 +46,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_MS_DISTRIBUTED is True
     assert envs.MX_LOAD_STRATEGY_CHAIN == "INFERENCE"
     assert envs.MX_DISABLE_DRAFT_P2P is False
+    assert envs.MX_ENABLE_SEPARATE_DRAFT_P2P is False
     assert envs.MX_PLUGIN_DIR == "/opt/modelexpress/plugins"
     assert envs.MX_LOAD_PLUGIN is None
     assert envs.MX_LOAD_PLUGIN_BEFORE == "server-cache"
@@ -89,6 +91,10 @@ def test_bool_parsing(monkeypatch, caplog):
     assert envs.MX_DISABLE_DRAFT_P2P is True
     monkeypatch.setenv("MX_DISABLE_DRAFT_P2P", "0")
     assert envs.MX_DISABLE_DRAFT_P2P is False
+    monkeypatch.setenv("MX_ENABLE_SEPARATE_DRAFT_P2P", "1")
+    assert envs.MX_ENABLE_SEPARATE_DRAFT_P2P is True
+    monkeypatch.setenv("MX_ENABLE_SEPARATE_DRAFT_P2P", "0")
+    assert envs.MX_ENABLE_SEPARATE_DRAFT_P2P is False
     monkeypatch.setenv("MX_POOL_REG", "1")
     assert envs.MX_POOL_REG is True
     monkeypatch.setenv("MX_POOL_REG", "0")
@@ -169,3 +175,18 @@ def test_dir_lists_registered_names():
     assert "MX_NIXL_BACKEND" in names
     assert "VLLM_ATTENTION_BACKEND" in names
     assert names == sorted(names)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "invalid", "1500", "1501"])
+def test_cold_start_wait_invalid_uses_default(monkeypatch, value):
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", value)
+    assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 600
+
+
+def test_cold_start_wait_default_and_override(monkeypatch):
+    monkeypatch.delenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", raising=False)
+    assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 600
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "12.5")
+    assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 12.5
+    monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "1499.9")
+    assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 1499.9
