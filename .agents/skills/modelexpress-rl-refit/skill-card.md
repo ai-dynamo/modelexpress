@@ -1,5 +1,5 @@
 ## Description: <br>
-Wire an RL trainer (Megatron or FSDP) and a vLLM generator through ModelExpress for live weight refit. Use to choose between the NCCL M2N collective path and the NIXL reshard path, integrate either one, run the reference end-to-end refit, or diagnose refit failures such as group admission, epoch changes, version leases, and deadline expiry; not for initial model loading. <br>
+Wire an RL trainer (Megatron, FSDP, or Miles) and a vLLM or SGLang generator through ModelExpress for live weight refit. Use to choose between the NCCL M2N collective path, the NIXL reshard path, and the S3 delta path, integrate any of them, run the reference end-to-end refit, or diagnose refit failures such as group admission, epoch changes, version leases, deadline expiry, and delta lineage or checkpoint-cache errors; not for initial model loading. <br>
 
 This skill is ready for commercial/non-commercial use. <br>
 
@@ -9,7 +9,7 @@ NVIDIA <br>
 ### License/Terms of Use: <br>
 Apache 2.0 <br>
 ## Use Case: <br>
-RL framework integrators and ML infrastructure engineers use this skill to select a ModelExpress weight-refit transport, connect trainer ranks and vLLM generator engines to the ModelExpress control plane, validate the integration with the reference end-to-end example, and triage refit failures into actionable categories. <br>
+RL framework integrators and ML infrastructure engineers use this skill to select a ModelExpress weight-refit transport, connect trainer ranks and vLLM or SGLang generator engines to the ModelExpress control plane, validate the integration with the reference end-to-end example, and triage refit failures into actionable categories. <br>
 
 ### Deployment Geography for Use: <br>
 Global <br>
@@ -23,6 +23,7 @@ Mitigation: Review and scan skill before deployment. <br>
 ## Reference(s): <br>
 - [NCCL M2N Collective Refit](references/m2n-collective-refit.md) <br>
 - [NIXL Reshard Refit](references/nixl-reshard-refit.md) <br>
+- [S3 Delta Refit](references/s3-delta-refit.md) <br>
 - [Failure Decision Tree](references/failure-decision-tree.md) <br>
 - [ModelExpress Releases](https://github.com/ai-dynamo/modelexpress/releases/latest) <br>
 
