@@ -128,3 +128,6 @@ class LoadContext:
     # when unknown. RDMA reloads skip the target-side post-processing, so they
     # are only correct when restoring these same weights.
     loaded_identity: p2p_pb2.SourceIdentity | None = None
+    # Reload only: refuse a peer catalog that does not name every target
+    # tensor before any write, instead of warning and refilling a subset.
+    require_exact_tensor_catalog: bool = False

@@ -47,6 +47,7 @@ from ...load_strategy import (
 from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
+from ...tensor_utils import adopt_bare_tensors
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import _is_speculative_draft, build_vllm_load_context, cold_start_expected_workers
 from .artifacts import (
@@ -55,6 +56,7 @@ from .artifacts import (
     install_vllm_cache_artifacts,
     schedule_vllm_cache_artifact_publish,
 )
+from .source_identity import is_pinned_revision
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -176,6 +178,7 @@ class MxModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
         prefix: str = "",
+        restore: bool = False,
     ) -> nn.Module:
         """Reload weights into an already-initialized model.
 
@@ -190,12 +193,22 @@ class MxModelLoader(BaseModelLoader):
         Peers must not read weights while they are being overwritten, so P2P
         source-serving stops first unless a prior sleep() already stopped it.
         The strategy chain registers and republishes the reloaded tensors.
+
+        `restore=True` says `model` holds `model_config`'s weights from another
+        loader, for example before a process checkpoint, so RDMA may refill them.
+        It enables P2P without requiring it: RDMA needs a revision that pins the
+        captured checkpoint (MX_MODEL_REVISION or a full commit hash), a peer
+        catalog naming every target tensor and a reachable peer; otherwise the
+        reload comes from storage. After a level-2 sleep, map the weight storage
+        back before calling.
         """
         if envs.MX_P2P_COLD_START:
             raise RuntimeError("MX cold start does not support model reload")
         if self._last_sleep_level is None:
             self._stop_serving()
-        return self._load_or_reload_model(vllm_config, model_config, prefix, model)
+        return self._load_or_reload_model(
+            vllm_config, model_config, prefix, model, restore
+        )
 
     def _load_or_reload_model(
         self,
@@ -203,6 +216,7 @@ class MxModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         prefix: str = "",
         model: nn.Module | None = None,
+        restore: bool = False,
     ) -> nn.Module:
         """Load model, auto-detecting the best loading strategy.
 
@@ -222,6 +236,16 @@ class MxModelLoader(BaseModelLoader):
             # Snapshot: a refit rewrites the live identity's revision in place.
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
             ctx.loaded_identity.CopyFrom(self._ctx.identity)
+        elif ctx.is_reload and restore and not is_pinned_revision(model_config):
+            logger.info(
+                f"[Worker {ctx.global_rank}] Restore needs a revision that pins "
+                f"the checkpoint, not {ctx.identity.revision!r}; skipping RDMA"
+            )
+        elif ctx.is_reload and restore:
+            ctx.loaded_identity = p2p_pb2.SourceIdentity()
+            ctx.loaded_identity.CopyFrom(ctx.identity)
+            ctx.require_exact_tensor_catalog = True
+            adopt_bare_tensors(model, ctx.accelerator_backend)
         draft_gate: DraftPublicationGate | None = None
         main_ctx = None
         if is_speculative_draft:
