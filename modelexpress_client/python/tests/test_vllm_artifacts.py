@@ -14,6 +14,7 @@ from modelexpress import p2p_pb2
 from modelexpress.engines.vllm import artifacts
 from modelexpress.metadata import artifact_lifecycle
 from modelexpress.metadata.artifact_transfer import ArtifactCacheRoot
+from modelexpress.metadata.source_id import compute_mx_source_id
 
 
 def test_install_vllm_cache_artifacts_is_default_off(monkeypatch):
@@ -1074,3 +1075,63 @@ def test_publish_survives_a_failing_check(compile_cache_root):
         assert artifacts._publish_vllm_cache_artifact(ctx, transfer, identity) is published
 
     check.assert_called_once()
+
+
+KERNEL_CACHE_SOURCE_TYPES = [
+    p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
+    p2p_pb2.MX_SOURCE_TYPE_DEEP_GEMM_CACHE,
+    p2p_pb2.MX_SOURCE_TYPE_TILELANG_CACHE,
+    p2p_pb2.MX_SOURCE_TYPE_CUTE_DSL_CACHE,
+    p2p_pb2.MX_SOURCE_TYPE_FLASHINFER_CACHE,
+]
+
+
+def _kernel_cache_identity(monkeypatch, source_type, digest):
+    for name, value in (
+        ("_triton_version", "3.4.0"),
+        ("_triton_key", "triton-key"),
+        ("_deep_gemm_jit_key", "deep-gemm-key"),
+        ("_tilelang_version", "0.1.6"),
+        ("_cutlass_dsl_version", "4.2.0"),
+        ("_flashinfer_version", "0.4.0"),
+    ):
+        monkeypatch.setattr(artifacts, name, lambda value=value: value)
+    monkeypatch.setattr(artifacts, "_gpu_arch", lambda device_id: "sm90")
+    monkeypatch.setattr(artifacts.torch.version, "cuda", "12.8")
+    if digest is None:
+        monkeypatch.delenv("MX_ARTIFACT_COMPILE_CONFIG_DIGEST", raising=False)
+    else:
+        monkeypatch.setenv("MX_ARTIFACT_COMPILE_CONFIG_DIGEST", digest)
+    ctx = SimpleNamespace(
+        device_id=0,
+        identity=p2p_pb2.SourceIdentity(
+            model_name="test/model",
+            backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
+        ),
+    )
+    return artifacts._artifact_identity(ctx, source_type)
+
+
+@pytest.mark.parametrize("source_type", KERNEL_CACHE_SOURCE_TYPES)
+def test_kernel_cache_identity_partitions_by_compile_config_digest(monkeypatch, source_type):
+    # A prefill worker must not be handed a decode worker's kernel bundle: the
+    # bundle is valid but holds only the smaller shape set decode compiled.
+    prefill = _kernel_cache_identity(monkeypatch, source_type, "prefill-mnbt16384")
+    decode = _kernel_cache_identity(monkeypatch, source_type, "decode-mnbt512")
+
+    assert prefill.compile_config_digest == "prefill-mnbt16384"
+    assert compute_mx_source_id(prefill) != compute_mx_source_id(decode)
+    assert compute_mx_source_id(prefill) == compute_mx_source_id(
+        _kernel_cache_identity(monkeypatch, source_type, "prefill-mnbt16384")
+    )
+
+
+@pytest.mark.parametrize("source_type", KERNEL_CACHE_SOURCE_TYPES)
+def test_kernel_cache_identity_without_digest_keeps_existing_source_id(monkeypatch, source_type):
+    identity = _kernel_cache_identity(monkeypatch, source_type, None)
+    without_field = p2p_pb2.SourceIdentity()
+    without_field.CopyFrom(identity)
+    without_field.ClearField("compile_config_digest")
+
+    assert identity.compile_config_digest == ""
+    assert compute_mx_source_id(identity) == compute_mx_source_id(without_field)

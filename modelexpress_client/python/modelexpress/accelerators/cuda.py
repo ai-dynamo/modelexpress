@@ -60,3 +60,6 @@ class CudaAcceleratorBackend:
 
     def supports_gds(self) -> bool:
         return True
+
+    def requires_classic_alloc_pool(self) -> bool:
+        return True

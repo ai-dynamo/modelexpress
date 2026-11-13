@@ -264,8 +264,26 @@ def test_before_rdma_receive_runs_layout_finalizers(monkeypatch):
     assert result.model is model
     assert events == [
         ("finalize", "model", "finalize_mega_moe_weights"),
+        ("finalize", "model", "finalize_mega_attn_weights"),
         ("process", torch.device("cpu")),
     ]
+
+
+def test_before_rdma_receive_permutes_mega_attn_before_quant_processing(monkeypatch):
+    """Mirrors vLLM: the model-level hook re-runs mega attn after quant processing."""
+
+    def process_weights_after_loading(model, model_config, target_device):
+        model.model.attn.quant_processed = True
+        model.process_weights_after_loading()
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    model = _MegaAttnTopLevelModel()
+
+    adapter.before_rdma_receive(LoadResult(value=model, model=model))
+
+    assert model.model.attn.permutes == 1
+    assert model.model.attn._fused_layouts_ready
 
 
 def test_after_rdma_receive_runs_derived_weight_finalizers(monkeypatch):
@@ -885,10 +903,47 @@ class _MegaMoeModel(torch.nn.Module):
     def finalize_mega_moe_weights(self) -> None:
         self.events.append(("finalize", "model", "finalize_mega_moe_weights"))
 
+    def finalize_mega_attn_weights(self) -> None:
+        self.events.append(("finalize", "model", "finalize_mega_attn_weights"))
+
     def finalize_mhc_broadcast_weights(self) -> None:
         self.events.append(
             ("finalize", "model", "finalize_mhc_broadcast_weights")
         )
+
+
+class _MegaAttnTopLevelModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = _MegaAttnModel()
+
+    def process_weights_after_loading(self) -> None:
+        self.model.finalize_mega_attn_weights()
+
+
+class _MegaAttnModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.attn = _MegaAttnAttention()
+
+    def finalize_mega_attn_weights(self) -> None:
+        self.attn.finalize_loaded_weights()
+
+
+class _MegaAttnAttention(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._fused_layouts_ready = False
+        self.quant_processed = False
+        self.permutes = 0
+
+    def finalize_loaded_weights(self) -> None:
+        if self._fused_layouts_ready:
+            return
+        if self.quant_processed:
+            raise RuntimeError("permutation ran after quant post-processing")
+        self.permutes += 1
+        self._fused_layouts_ready = True
 
 
 class _MegaMoeLayer(torch.nn.Module):
@@ -1487,7 +1542,7 @@ class TestTargetSharedDraftPrefixes:
         )
         monkeypatch.setattr(
             "modelexpress.engines.vllm.adapter.collect_module_tensors",
-            lambda *_args: {
+            lambda *_args, **_kwargs: {
                 "layers.0.shared_head.head.weight": model.layers[0].shared_head.head.weight
             },
         )
