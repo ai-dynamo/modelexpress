@@ -176,3 +176,56 @@ reshard path does not support that model today; report it with the `causes=`
 output. Switch `IN_PLACE` to `COPY_TO_HOST` for dtype, contiguity, or
 moved-storage errors. A changed shard layout needs a new trainer mesh; an
 existing mesh only accepts updates that keep the same logical shard coverage.
+
+## Delta Lineage And Checkpoint Cache (S3)
+
+Signals:
+
+- trainer: `target base ... does not match retained base ...`
+- trainer: `publish the staged canonical checkpoint before staging another`
+- generator: `target ...: revision ... is not READY`
+- generator: `target ...: revision ... model_name does not match the generator`
+- generator: `local checkpoint version ... does not match exact base ... for revision ...`
+- generator: `target ...: replay failed at revision ...: canonical target checksum differs for ...`
+  (only tensors the delta changed are checked), or
+  `full HF checkpoint ... tensor set differs from its index`
+- trainer: `S3 target URI does not match the configured prefix`
+- generator: `target ...: replay exceeds maximum chain length ...`
+- generator: `CheckpointCacheCapacityError` (`checkpoint cache quota of ... bytes cannot accommodate ...`
+  or `checkpoint cache filesystem has ... bytes free ...`)
+- receiver initialization: `seed checkpoint does not exist: ...` or the initial
+  serving version `is not READY`
+- Miles: `ModelExpress requires Megatron, no LoRA/colocation, and abort/retract pausing`
+- Miles: `SGLang must include ModelExpress refit support for this transfer mode`
+- the first delta after each full checkpoint takes much longer to apply than
+  the deltas after it
+
+Checks:
+
+- Do trainer and generator use the same MX model name (`MX_MODEL_NAME_OVERRIDE`
+  for vLLM), the same `initial_base_version_id`, and the same seed snapshot?
+- Did the orchestrator mark the version READY only after every publishing
+  rank's `publish()` returned?
+- Was the trainer client recreated or a version skipped, so the next delta's
+  `base_version_id` is not the client's retained base?
+- Does the run reuse a model name, base id, or S3 prefix from an earlier run?
+- How many deltas lie between the last full checkpoint and the target?
+- Does `refit_checkpoint_max_size_gb` and the cache disk hold the active
+  lineage plus two copies of a downloaded full checkpoint? A delta that copies
+  the full checkpoint inline logs that no working copy was available.
+
+Next action: none of these touch live weights before installation starts.
+Catalog, chain-length, manifest, and capacity failures leave the cache as it
+was: fix the cause and request the same version again. A failed delta
+download, apply, or checksum resets the cache to the initial base, so in
+S3-only mode the next delta fails with an exact-base mismatch; publish a
+`FULL_HF_CHECKPOINT` (or reinitialize the generator). For a seed or base
+mismatch, align the seeds and publish a full checkpoint to start a new chain.
+For long chains, publish full checkpoints periodically
+(`full_hf_checkpoint_interval` in Miles); with vLLM peers enabled every refit
+replays from the last full checkpoint. For capacity, enlarge the quota or move
+the cache to a larger node-local disk. Use a fresh model name, base id, and S3
+prefix per run. If installation started and failed, keep generation paused and
+request the same version, or a newer one built on it, again: the prepared
+checkpoint is reloaded in full. Restart the engine only if that also fails. In
+Miles a failed install stops the run.
