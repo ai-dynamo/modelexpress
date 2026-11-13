@@ -86,11 +86,7 @@ impl DownloadTask {
             }
         };
 
-        if !metadata.is_file() {
-            return Ok(false);
-        }
-
-        Ok(true)
+        Ok(metadata.is_file())
     }
 
     pub async fn remove_temp_file_if_present(&self, temp_path: &Path) -> Result<()> {
