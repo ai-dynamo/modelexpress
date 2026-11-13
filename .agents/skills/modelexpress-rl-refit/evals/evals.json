@@ -1,0 +1,273 @@
+{
+  "skill": "modelexpress-rl-refit",
+  "cases": [
+    {
+      "id": "choose-path-megatron-multinode",
+      "question": "We train with Megatron across two nodes and serve with vLLM. Should we refit through ModelExpress's NCCL M2N collective path or the NIXL path?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Choose the NIXL reshard path: the M2N path ships no Megatron Publisher and is validated on a single node only (a cross-node reshard has failed inside NCCL's transport). Wire MegatronTrainerContext with build_megatron_tensor_specs, bind_tensors, create_trainer_mesh, create_weight_version, publish_version, and the vLLM modelexpress weight-transfer backend.",
+      "expected_behavior": [
+        "Select the NIXL reshard path and name the deciding rule",
+        "State that no Megatron Publisher exists for the M2N path",
+        "State that M2N is validated single-node only",
+        "List the trainer-side API calls in order"
+      ]
+    },
+    {
+      "id": "preflight-m2n-generator",
+      "question": "Before I launch the collective refit, check that this generator container has a usable NCCL and that my MX_NCCL_REFIT settings are valid. The MX server is at mx-server:8001.",
+      "expected_skill": "modelexpress-rl-refit",
+      "expected_script": "scripts/refit_preflight.py",
+      "ground_truth": "Run scripts/refit_preflight.py --path m2n --endpoint mx-server:8001 inside the container, report the mapped libnccl version against the 2.30.7 floor, nccl and nccl.m2n importability, NCCL_COMM_BLOCKING, and any invalid MX_NCCL_REFIT_* value, and fix every failed check first.",
+      "expected_behavior": [
+        "Run the preflight script with --path m2n and the endpoint",
+        "Read the mapped libnccl version, not torch.cuda.nccl.version()",
+        "Report failed checks with a concrete fix"
+      ]
+    },
+    {
+      "id": "run-m2n-e2e",
+      "question": "Run the ModelExpress M2N end-to-end refit example on Qwen3-4B with 4 trainers and 4 generators, and tell me how to know it really passed.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "From examples/rl/m2n_collective_refit, export MODEL and MX_ENDPOINT and run DIFF=1 ./run_e2e.sh (T and G default to 4), ideally with PROC_TIMEOUT_S set. Pass is E2E PASS in generator.log with DIFF=1 enabled and every .rc file reading 0; DIFF=1 is the acceptance test because token equality is not sound on larger models.",
+      "expected_behavior": [
+        "Set MODEL and MX_ENDPOINT and run run_e2e.sh with DIFF=1",
+        "Require 8 GPUs on one node",
+        "Recommend PROC_TIMEOUT_S for unattended runs",
+        "Define pass as E2E PASS plus zero .rc files"
+      ]
+    },
+    {
+      "id": "group-not-ready-missing-slots",
+      "question": "compute_plan on my trainers raises GroupNotReadyError after ten minutes and .missing lists g2 and g3. What do I do?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "This is group admission/formation: generator slots g2 and g3 never joined or their registration expired before READY. Check those processes are running against the same MX endpoint with identical slot lists and model_name, start or fix them, and retry compute_plan; raise MX_NCCL_REFIT_GROUP_TIMEOUT_S if vLLM startup is slow.",
+      "expected_behavior": [
+        "Classify as group admission/formation",
+        "Point at the slots named in .missing",
+        "Check slot lists, model_name and endpoint consistency",
+        "Retry compute_plan after fixing the missing ranks"
+      ]
+    },
+    {
+      "id": "epoch-changed-disagreeing",
+      "question": "start_weight_update raised EpochChangedError and the error's disagreeing list names t1. Only t1 runs with MX_NCCL_REFIT_GROUPED_SUBMISSION=1.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Epoch fencing caused by a plan digest mismatch: MX_NCCL_REFIT_GROUPED_SUBMISSION is part of the plan digest, so the group stays FORMING. Make the setting identical on every participant (grouped submission also needs GIN), then re-run compute_plan and create a new operation at the new epoch.",
+      "expected_behavior": [
+        "Classify as epoch fencing with plan digest disagreement",
+        "Name GROUPED_SUBMISSION as part of the plan digest",
+        "Align the setting before re-running compute_plan",
+        "Create a new operation at the new epoch"
+      ]
+    },
+    {
+      "id": "wedged-communicator",
+      "question": "My generator process logged CommunicatorWedgedError during update_weights. Can I just call compute_plan again?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. CommunicatorWedgedError is fatal to the process: catch it at top level and terminate with a non-zero os._exit. The round is already reported FAILED so peers re-form at a new epoch; restart the generator with a new worker_id. Bound each worker process externally because MX_NCCL_REFIT_TRANSFER_TIMEOUT_S cannot interrupt a blocked native reshard.",
+      "expected_behavior": [
+        "Refuse in-process recovery",
+        "Require a non-zero os._exit and a restart with a new worker_id",
+        "Explain the external process bound"
+      ]
+    },
+    {
+      "id": "nixl-mesh-update-lease",
+      "question": "UpdateTrainerMesh fails with 'cannot change trainer mesh generation while a linked version has an active lease'. I'm adding a trainer replica.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Version lease on the NIXL path: any mesh update that changes its generation is rejected while a linked weight version has an active consumer lease, including additive replicas. Let generators finish their refit (finish_weight_update or release the staged handle) so the leases drain, then update the mesh; new versions capture the new generation.",
+      "expected_behavior": [
+        "Classify as version lease/publication on the NIXL path",
+        "Explain that additive replicas still change the generation",
+        "Drain generator leases before updating the mesh"
+      ]
+    },
+    {
+      "id": "wire-fsdp-vllm-nixl",
+      "question": "Show me the calls to publish an FSDP model's weights through ModelExpress and have a vLLM worker install them with the modelexpress weight-transfer backend.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Trainer: ModelExpressTrainerClient.initialize with FSDPTrainerContext, bind_tensors(model.state_dict()), ModelExpressControlClient.create_trainer_mesh, create_weight_version with FULL_TENSOR and the mesh id, publish_version, check READY. vLLM started with --weight-transfer-config '{\"backend\":\"modelexpress\"}': pause generation, init_weight_transfer_engine, start_weight_update, update_weights with update_info.version_id, finish_weight_update, verify installed version, resume.",
+      "expected_behavior": [
+        "Give the trainer, control, and generator calls in order",
+        "Pause generation before installing and verify before resuming",
+        "Retire with delete_weight_version, release_version, delete_trainer_mesh"
+      ]
+    },
+    {
+      "id": "nixl-native-moe-layout",
+      "question": "Our FSDP trainer keeps MoE experts stacked in one tensor per layer, but vLLM's loader expects HF per-expert names. How do I refit over the NIXL path without converting on the trainer?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Publish the native layout unchanged and set convert_native_to_hf on the VllmGeneratorContext passed to ModelExpressGeneratorClient (the direct client; the vLLM plugin path cannot set a converter): a dict[str, Tensor] -> dict[str, Tensor] mapping that renames and unstacks with view ops only. It runs on placeholder tensors before the load_weights capture, so no data moves, and every output must be a traced view of a published source; a synthesized tensor (arithmetic, cat/stack, a new constant) raises UnsupportedReshard ('conversion produced a non-traced tensor'). HF-name conversion belongs on the receiver, not in the FSDP publisher.",
+      "expected_behavior": [
+        "Put the conversion on the generator via convert_native_to_hf, not in the trainer",
+        "Require view-only mappings and name UnsupportedReshard for synthesized tensors",
+        "Keep the trainer publishing its native names",
+        "Note that the vLLM plugin path cannot set a converter"
+      ]
+    },
+    {
+      "id": "choose-path-separate-clusters-s3",
+      "question": "Our Megatron trainer runs on one cluster and the vLLM rollout fleet on another cloud with no RDMA between them. Both can reach an S3 bucket. Which ModelExpress refit path should we use?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Use the S3 delta path: with no network path between trainer and generators, NIXL and M2N are not options, and S3 delta only needs both sides to reach S3 and the MX server. Register a catalog-only READY v0 for the shared seed, initialize ModelExpressTrainerClient with WRITE_TO_STORAGE, XOR_DELTA and an ObjectStorageConfig, call prepare_delta_base, then per update create the version as STAGING, stage_shard and publish on every publishing rank, and mark it READY. Start vLLM with the modelexpress weight-transfer backend, call init_weight_transfer_engine once, and apply each version with start_weight_update, update_weights and finish_weight_update while generation is paused.",
+      "expected_behavior": [
+        "Select the S3 delta path and name the deciding rule",
+        "Explain that S3 delta needs no trainer-to-generator network path",
+        "List the trainer-side calls in order, including the catalog-only v0 and prepare_delta_base",
+        "List the vLLM init and apply sequence"
+      ]
+    },
+    {
+      "id": "wire-miles-sglang-s3",
+      "question": "How do I turn on ModelExpress S3 delta refit in Miles with Miles-managed SGLang for Qwen3-30B-A3B, with a full checkpoint every 10 steps?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Pass --update-weight-transfer-mode modelexpress and --modelexpress-config with model_name, server_url, initial_base_version_id, seed_checkpoint_path, refit_checkpoint_dir, object_storage_uri_prefix, object_storage_region_name (or object_storage_endpoint_url) and full_hf_checkpoint_interval 10. Use a fresh model name, base id and S3 prefix per run. Miles requires Megatron, no colocation, no LoRA, and abort or retract pausing, and SGLang must include the ModelExpress refit endpoint. Miles registers the catalog-only v0, publishes from sender ranks, marks each version READY, pauses and flushes the engines, calls update_weights_from_modelexpress, and resumes. Set MX_GENERATOR_SOURCE_ORDER=OBJECT_STORAGE on rollout workers for S3-only refit and size the refit cache for the active lineage plus two copies of a full checkpoint.",
+      "expected_behavior": [
+        "Give the transfer-mode flag and a complete --modelexpress-config",
+        "Set full_hf_checkpoint_interval to 10",
+        "Require a fresh model name, base id, and S3 prefix per run",
+        "State the Miles constraints: Megatron, no colocation or LoRA, abort or retract pausing",
+        "Mention sizing refit_checkpoint_dir"
+      ]
+    },
+    {
+      "id": "s3-retained-base-mismatch",
+      "question": "After our trainer process restarted, publishing the next delta fails with: target base 'v41' does not match retained base 'v0'. What happened and how do we recover?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Delta lineage: the restarted ModelExpressTrainerClient retains only the seed base v0, while the new version names v41 as its base, so the trainer cannot compute an exact XOR delta. This fails before any generator install, so generators keep serving and need no restart. Publish the next version as a FULL_HF_CHECKPOINT with no base_version_id to start a new chain from the current weights, then continue with deltas against that version.",
+      "expected_behavior": [
+        "Classify as delta lineage on the trainer side",
+        "Explain the retained base resets when the trainer client is recreated",
+        "Recover by publishing a FULL_HF_CHECKPOINT",
+        "State that generators need no restart"
+      ]
+    },
+    {
+      "id": "s3-replay-chain-limit",
+      "question": "A vLLM generator that was down for a while fails refit with: replay exceeds maximum chain length 64 before revision 'v37'. We only publish deltas.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Delta lineage and checkpoint cache: with only deltas, the generator would replay more than max_replay_chain_length (default 64) revisions to reach the target. The chain is resolved before any download or installation, so the cache and live weights are unchanged. Publish full HF checkpoints periodically (full_hf_checkpoint_interval in Miles) so chains reset, then request the target again; raising max_replay_chain_length in the receiver config is only a stopgap.",
+      "expected_behavior": [
+        "Classify as delta lineage or replay chain limit",
+        "Name the default limit of 64 and max_replay_chain_length",
+        "Recommend periodic full checkpoints",
+        "State the failure happens before installation, so no engine restart is needed"
+      ]
+    },
+    {
+      "id": "fsdp-host-precision-and-memory",
+      "question": "Our FSDP parameters are FP32, but we send BF16 weights with FP32 router biases. We cannot afford another GPU snapshot. Should I use IN_PLACE, turn on optimizer CPU offload, or set the generator staging device to CPU?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Use the NIXL FSDP COPY_TO_HOST mode with FULL_TENSOR and exact state-dict names in FSDPTrainerContext.wire_dtype_overrides for the FP32 exceptions. IN_PLACE cannot cast. Optimizer offload and generator staging are independent. Pinned host buffers replace the persistent wire-format GPU snapshot, but conversion temporaries and generator buffers still need memory; quantify local shards including replicated tensors and measure peaks.",
+      "expected_behavior": [
+        "Select COPY_TO_HOST through ModelExpressTrainerConfig or its environment default",
+        "Preserve FP32 exception names and training precision",
+        "Distinguish trainer staging, optimizer offload and receiver staging",
+        "Do not claim zero extra VRAM or a universal performance benefit"
+      ]
+    },
+    {
+      "id": "fsdp-host-snapshot-lifetime",
+      "question": "A generator still holds a lease on v7. With COPY_TO_HOST, can the trainer publish v8 now because the bytes are on CPU? We only have one trainer client per rank.",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. The FSDP adapter reuses the same persistent host arenas for later versions. A server lease does not stop local overwrites. Wait for consumers to finish/release leases, retire v7 and release its trainer publications before staging v8. Source optimizer writes may resume after snapshot completion, but the CPU snapshot must stay immutable. COPY_TO_HOST is not per-version buffering.",
+      "expected_behavior": [
+        "Reject overlapping publication into reused arenas",
+        "Distinguish original source tensors from the published snapshot",
+        "Require completion and retirement before reuse",
+        "Do not suggest force-deleting an active lease"
+      ]
+    },
+    {
+      "id": "fsdp-bound-state-rematerialized",
+      "question": "We bound model.state_dict() once and call publish_version each step. FSDP now replaces its tensor objects during offload, and refits appear to use old weights. Does COPY_TO_HOST automatically fetch the new state dict?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. The public client retains the mapping passed to bind_tensors. The adapter re-captures from that mapping, not directly from the model. After retiring the old version, refresh the contents of the same bound mapping from the current model.state_dict(), preserving coverage and source dtypes; do not bind twice. A changed layout requires a new client/mesh. Validate multiple changing versions including storage replacement.",
+      "expected_behavior": [
+        "Identify the retained mapping as the source",
+        "Refresh the existing mapping before publication",
+        "Preserve retirement and layout checks",
+        "Verify actual installed parameters across changed versions"
+      ]
+    },
+    {
+      "id": "fsdp-host-reader-compatibility",
+      "question": "After switching the trainer to COPY_TO_HOST, our older receiver rejects mx.reshard.shard_table.v2. Should we mark the source VRAM or move generator staging to CPU?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Neither is the compatibility fix. Host-source manifests are v2 and describe registered DRAM. Upgrade both ends to host-aware clients; never relabel host pointers as VRAM. Source and destination memory kinds are independent. A custom NixlReshardTransport needs session_to_memory and an explicit local_mem_type for the actual receive buffer.",
+      "expected_behavior": [
+        "Keep source memory type DRAM",
+        "Require a host-aware receiver",
+        "Do not require CPU destination staging",
+        "Describe custom transport memory-kind wiring"
+      ]
+    },
+    {
+      "id": "rdma-masked-workers-explicit-list",
+      "question": "Four NIXL workers each see one CUDA GPU and call the manager with device_id=0. We set MX_RDMA_NIC_PIN=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1 in all workers, yet every reader uses mlx5_0. Why?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "The explicit list indexes process-local device_id, not global rank, so every worker chooses entry zero. Use auto if host PCI GPU discovery and allocated NIC visibility are consistent across workers, or supply distinct externally assigned UCX_NET_DEVICES per worker with MX_RDMA_NIC_PIN unset/off. If PCI enumeration is also isolated, auto cannot reliably spread them. Verify effective logs and traffic, not just the configured list.",
+      "expected_behavior": [
+        "Explain device_id indexing",
+        "Offer auto only with adequate shared topology visibility",
+        "Offer per-worker UCX_NET_DEVICES with MX selector disabled",
+        "Verify actual mapping before benchmarking"
+      ]
+    },
+    {
+      "id": "rdma-pin-precedence-and-transport",
+      "question": "We set UCX_NET_DEVICES to a manually assigned rail but left MX_RDMA_NIC_PIN=auto enabled. It changed at startup. Should we set NCCL_IB_HCA to force NIXL back onto the intended NIC?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. The enabled MX selector can overwrite UCX_NET_DEVICES before NIXL agent construction. Disable/unset MX_RDMA_NIC_PIN when managing UCX_NET_DEVICES externally and restart the worker/agent with the intended value. NCCL_IB_HCA controls NCCL, not NIXL/UCX. Confirm the manual rail is allocated and reachable; preserve correctness checks.",
+      "expected_behavior": [
+        "Explain MX pin precedence",
+        "Disable MX selector for external UCX mapping",
+        "Keep NCCL and NIXL selectors separate",
+        "Apply the mapping before agent creation"
+      ]
+    },
+    {
+      "id": "rdma-allowed-versus-used-rails",
+      "question": "Our synthetic M2N timing allowed two HCAs and ran fast. The channel logs show only one HCA carrying GDRDMA traffic. Can we report two-rail scaling and use that rate as the GLM refit result?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. Allowed HCAs are not active rails. This evidence supports a synthetic single-rail transport measurement, not multi-rail scaling or live GLM refit. Verify port traffic with counter units and contention accounted for, repeat independent launches, separate cold and warm spans, and qualify the current cross-node M2N integration separately.",
+      "expected_behavior": [
+        "Reject both multi-rail and GLM refit claims",
+        "Use logs and port counters to identify active rails",
+        "Repeat independent launches",
+        "Do not infer current M2N cross-node support from a historical native probe"
+      ]
+    },
+    {
+      "id": "rdma-visible-but-unallocated",
+      "question": "The refit pod has four idle GPUs and sysfs lists eight NICs, but only one uverbs device is exposed and other pods hold the NIC allocations. Can auto pinning spread traffic onto the other seven?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. Sysfs visibility does not grant verbs access; the current auto probe filters NICs without exposed verbs devices. Check actual device access, allocation and peer connectivity. Coordinate GPU/NIC provisioning or use the available rail with its measured limits. Do not access other tenants devices or claim four idle GPUs provide four usable rails.",
+      "expected_behavior": [
+        "Distinguish sysfs from usable verbs devices",
+        "Check NIC capacity alongside GPU capacity",
+        "Do not claim pinning grants missing devices",
+        "Report the provisioning limit before making bandwidth claims"
+      ]
+    },
+    {
+      "id": "neg-initial-p2p-load",
+      "question": "Speed up vLLM cold start by loading the model over P2P from another ModelExpress-served replica.",
+      "expected_skill": "none",
+      "ground_truth": "Initial checkpoint loading belongs to the base ModelExpress loader, not RL weight refit.",
+      "expected_behavior": [
+        "modelexpress-rl-refit stays silent"
+      ]
+    },
+    {
+      "id": "neg-dynamo-deploy",
+      "question": "Deploy the Qwen vLLM disaggregated recipe with Dynamo on my cluster.",
+      "expected_skill": "dynamo-recipe-runner",
+      "ground_truth": "Dynamo recipe bring-up belongs to dynamo-recipe-runner.",
+      "expected_behavior": [
+        "modelexpress-rl-refit stays silent; dynamo-recipe-runner handles it"
+      ]
+    }
+  ]
+}
