@@ -1,6 +1,6 @@
 ---
 name: modelexpress-rl-refit
-description: Wire an RL trainer (Megatron, FSDP, or Miles) and a vLLM or SGLang generator through ModelExpress for live weight refit. Use to choose between the NCCL M2N collective path, the NIXL reshard path, and the S3 delta path, integrate any of them, run the reference end-to-end refit, or diagnose refit failures such as group admission, epoch changes, version leases, deadline expiry, and delta lineage or checkpoint-cache errors; not for initial model loading.
+description: Wire an RL trainer (Megatron, FSDP, or Miles) and a vLLM or SGLang generator through ModelExpress for live weight refit. Use to choose between the NCCL M2N collective path, the NIXL reshard path, and the S3 delta path, integrate any of them, run the reference end-to-end refit, configure FSDP CPU staging or RDMA rail selection, or diagnose refit failures such as group admission, epoch changes, version leases, deadline expiry, and delta lineage or checkpoint-cache errors; not for initial model loading.
 license: Apache-2.0
 metadata:
   author: NVIDIA
@@ -10,6 +10,8 @@ metadata:
     - weight-refit
     - nccl
     - nixl
+    - fsdp
+    - rdma
     - s3
     - vllm
     - sglang
@@ -148,6 +150,19 @@ Miles does steps 1, 2, 4, and 5 itself with `--update-weight-transfer-mode model
 and `--modelexpress-config`; set `full_hf_checkpoint_interval` and use a fresh
 model name, base id, and S3 prefix per run.
 
+### Configure FSDP Staging Or RDMA Rails When Needed
+
+- For FSDP snapshot memory, moving storage, or precision exceptions, read
+  [fsdp-cpu-staging.md](references/fsdp-cpu-staging.md). Prefer `IN_PLACE` only
+  for immutable, stable, matching-dtype sources; otherwise use `COPY_TO_HOST`.
+  This configures NIXL source staging, not optimizer offload, receiver staging,
+  or the M2N publisher. Retire a version before reusing its snapshot buffers.
+- For slow network refits, NIC pinning, or multi-GPU rail contention, read
+  [rdma-rails.md](references/rdma-rails.md). Inventory usable devices on both
+  endpoints, then use the transport's own selector: `MX_RDMA_NIC_PIN` /
+  `UCX_NET_DEVICES` for NIXL, `NCCL_IB_HCA` for NCCL. Verify actual traffic;
+  an allowed NIC list does not establish multi-rail use or cross-node M2N support.
+
 ### 4. Run The Reference End-To-End Refit
 
 M2N, one node with `T + G` GPUs, from `examples/rl/m2n_collective_refit/`:
@@ -188,6 +203,8 @@ Classify into one bucket with `references/failure-decision-tree.md`:
 - deadline expiry and wedged communicators (`CommunicatorWedgedError`, hangs)
 - plan coverage and correctness (`PlanCoverageError`, `DIFF=1` mismatches)
 - version leases and publication (NIXL: version not `READY`, active-lease rejections)
+- FSDP snapshot staging (source movement, dtype mismatch, pinned-memory or DRAM metadata errors)
+- RDMA provisioning and rail selection (inaccessible NICs, converged ranks, inconsistent throughput)
 - delta lineage and checkpoint cache (S3: base mismatch, checksum mismatch,
   replay chain limit, cache capacity, failed install)
 
@@ -228,6 +245,8 @@ Return:
 - chosen path and the rule that decided it
 - trainer and generator wiring, as the exact API calls in order
 - the run or verification command and its pass signal
+- for staging or rail changes: memory/lifetime contract or per-worker device map,
+  validation evidence, and any unmeasured memory or bandwidth claims
 - for failures: bucket, strongest signal (exception class or server message),
   likely cause, exact next action, and whether the engine must be restarted
 
@@ -257,6 +276,8 @@ Return:
 | `EpochChangedError` with `.disagreeing` set; group stays `FORMING` | Plan digest differs: different plan, `m2n_abi_version`, or `MX_NCCL_REFIT_BLOCKING_DATA_PLANE`/`GROUPED_SUBMISSION` | Make the plan and those settings identical everywhere |
 | `CommunicatorWedgedError` | Lane abort overran `MX_NCCL_REFIT_ABORT_TIMEOUT_S` | Exit the process with non-zero `os._exit`; restart with a new `worker_id` |
 | vLLM refit fails before mutation with `MX_P2P_METADATA=0` | Readers of central-coordinator addresses cannot be accounted for | Unset `MX_P2P_METADATA` (default `1`) |
+| FSDP `IN_PLACE` rejects moved storage or a wire-dtype cast | Live storage cannot satisfy the snapshot contract | Use `COPY_TO_HOST`; preserve FP32 exceptions and refresh the bound mapping when tensors are replaced |
+| Network refit is correct but slow with multiple readers | NIC convergence or unsuitable/inaccessible rails | Inventory both endpoints and follow `references/rdma-rails.md`; verify the effective mapping and traffic |
 | Trainer: `target base ... does not match retained base ...` | The new version's `base_version_id` is not the version this trainer client last published (client recreated, or a publish was skipped) | Publish the next version as a `FULL_HF_CHECKPOINT` (no base) to start a new chain |
 | Generator: `canonical target checksum differs for ...` | Trainer and generator seeds differ, or the published tensors are not canonical HF tensors | Point both sides at the same seed snapshot; publish a full checkpoint to recover |
 | Generator: `replay exceeds maximum chain length 64 ...` | Too many deltas since the last full checkpoint: the generator is far behind, cold-starting, or replays from the full root on every refit (vLLM with peers) | Set `full_hf_checkpoint_interval` (Miles) or publish full checkpoints; raise `max_replay_chain_length` only as a stopgap |
@@ -266,5 +287,7 @@ Return:
 - `references/m2n-collective-refit.md`: M2N client API, SPI, call sequence, errors, configuration.
 - `references/nixl-reshard-refit.md`: NIXL trainer, control, and generator lifecycle and settings.
 - `references/s3-delta-refit.md`: S3 delta trainer, vLLM, SGLang, and Miles lifecycle, cache sizing, and settings.
+- `references/fsdp-cpu-staging.md`: staging selection, current-source publication, snapshot lifetime, DRAM compatibility, and measurement.
+- `references/rdma-rails.md`: usable NIC inventory, NIXL/NCCL selection, convergence diagnosis, and physical traffic verification.
 - `references/failure-decision-tree.md`: bucket-by-bucket signals, checks, and actions.
 - Source docs: `docs/NCCL_M2N_REFIT.md`, `docs/rl/README.md`, `docs/rl/ARCHITECTURE.md`, `docs/rl/CONFIGURATION.md`, `docs/rl/S3_DELTA_WEIGHT_REFIT.md`.

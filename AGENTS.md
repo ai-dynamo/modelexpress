@@ -67,7 +67,7 @@ Load the matching skill before starting any of these. Each is a `SKILL.md` under
 | Add a gRPC service | `add-grpc-service` |
 | Bump the release version or public-image tags | `bump-version` |
 | Commit sign-off and DCO repair | `dco` |
-| Wire an RL trainer and a vLLM or SGLang generator through ModelExpress for live weight refit | `modelexpress-rl-refit` |
+| Wire an RL trainer and a vLLM or SGLang generator through ModelExpress for live weight refit; configure FSDP staging or diagnose RDMA rail selection | `modelexpress-rl-refit` |
 
 ## Git Workflow
 

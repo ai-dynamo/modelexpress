@@ -90,6 +90,9 @@ FSDP it requires every local shard to be contiguous and already in the wire
 dtype (a dtype override that differs from the source is rejected), and it fails
 on a later step if the storage address moved. Both cases point to
 `COPY_TO_HOST`, which keeps persistent pinned arenas and casts on copy.
+For current-state binding, snapshot lifetime, DRAM compatibility and memory
+validation, read [fsdp-cpu-staging.md](fsdp-cpu-staging.md). For NIC selection
+and slow network transfers, read [rdma-rails.md](rdma-rails.md).
 
 Retire in this order: `control.delete_weight_version(...)`,
 `trainer.release_version(version=...)`, `control.delete_trainer_mesh(...)`,
