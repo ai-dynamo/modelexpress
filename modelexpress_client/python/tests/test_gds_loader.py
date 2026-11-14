@@ -352,6 +352,117 @@ class TestGdsStrategyIntegration:
         assert exc.value.mutated is True
         mock_gds.shutdown.assert_called_once()
 
+    class _ConsumingAdapter(_FakeAdapter):
+        """Adapter that drains the iterator, as engine load_weights does."""
+
+        def __init__(self):
+            self.calls = 0
+            self.loaded = []
+
+        def apply_weight_iter(self, result: LoadResult, weights_iter):
+            self.calls += 1
+            for name, _ in weights_iter:
+                self.loaded.append(name)
+            return result
+
+    def _make_real_loader_context(self, model_dir, adapter):
+        """Context for the real MxGdsLoader with a CPU stand-in backend."""
+        from modelexpress.load_strategy import LoadContext
+
+        backend = MagicMock()
+        backend.current_device.return_value = 0
+        backend.torch_device.return_value = torch.device("cpu")
+        return LoadContext(
+            model_config=SimpleNamespace(model=str(model_dir), revision=None),
+            load_config=SimpleNamespace(use_tqdm_on_load=False),
+            target_device=torch.device("cpu"),
+            global_rank=0,
+            worker_rank=0,
+            local_rank=0,
+            device_id=0,
+            identity=MagicMock(),
+            mx_client=MagicMock(),
+            worker_id="test-worker",
+            adapter=adapter,
+            accelerator_backend=backend,
+        )
+
+    @staticmethod
+    def _write_safetensors(path, dtype):
+        header = {"w": {"dtype": dtype, "shape": [2], "data_offsets": [0, 8]}}
+        header_bytes = json.dumps(header).encode()
+        with open(path, "wb") as f:
+            f.write(struct.pack("<Q", len(header_bytes)))
+            f.write(header_bytes)
+            f.write(b"\x00" * 8)
+
+    @patch("modelexpress.gds_loader.GdsTransferManager")
+    @patch("modelexpress.gds_loader.is_gds_available", return_value=True)
+    def test_gds_missing_safetensors_is_not_mutated(self, _mock_avail, _mock_mgr, tmp_path):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        adapter = self._ConsumingAdapter()
+        ctx = self._make_real_loader_context(tmp_path, adapter)
+        model = MagicMock()
+
+        with pytest.raises(StrategyFailed, match=r"No \.safetensors") as exc:
+            GdsStrategy().load(LoadResult(value=model, model=model), ctx)
+
+        assert exc.value.mutated is False
+        assert adapter.calls == 0
+
+    @patch("modelexpress.gds_loader.GdsTransferManager")
+    @patch("modelexpress.gds_loader.is_gds_available", return_value=True)
+    def test_gds_unsupported_dtype_is_not_mutated(self, _mock_avail, _mock_mgr, tmp_path):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        self._write_safetensors(tmp_path / "model.safetensors", "C64")
+        adapter = self._ConsumingAdapter()
+        ctx = self._make_real_loader_context(tmp_path, adapter)
+        model = MagicMock()
+
+        with pytest.raises(StrategyFailed, match="Unsupported safetensors dtype") as exc:
+            GdsStrategy().load(LoadResult(value=model, model=model), ctx)
+
+        assert exc.value.mutated is False
+        assert adapter.calls == 0
+
+    @patch("modelexpress.gds_loader.GdsTransferManager")
+    @patch("modelexpress.gds_loader.is_gds_available", return_value=True)
+    def test_gds_transfer_error_is_mutated(self, _mock_avail, mock_mgr_cls, tmp_path):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        self._write_safetensors(tmp_path / "model.safetensors", "F32")
+        mock_mgr_cls.return_value.batch_load_file.side_effect = RuntimeError("GDS read failed")
+        adapter = self._ConsumingAdapter()
+        ctx = self._make_real_loader_context(tmp_path, adapter)
+        model = MagicMock()
+
+        with pytest.raises(StrategyFailed, match="GDS read failed") as exc:
+            GdsStrategy().load(LoadResult(value=model, model=model), ctx)
+
+        assert exc.value.mutated is True
+        assert adapter.calls == 1
+        mock_mgr_cls.return_value.shutdown.assert_called_once()
+
+    @patch("modelexpress.gds_loader.GdsTransferManager")
+    @patch("modelexpress.gds_loader.is_gds_available", return_value=True)
+    def test_gds_real_loader_yields_tensors(self, _mock_avail, mock_mgr_cls, tmp_path):
+        from modelexpress.load_strategy.gds_strategy import GdsStrategy
+
+        self._write_safetensors(tmp_path / "model.safetensors", "F32")
+        mock_mgr_cls.return_value.batch_load_file.return_value = [
+            torch.zeros(8, dtype=torch.uint8)
+        ]
+        adapter = self._ConsumingAdapter()
+        ctx = self._make_real_loader_context(tmp_path, adapter)
+        model = MagicMock()
+
+        GdsStrategy().load(LoadResult(value=model, model=model), ctx)
+
+        assert adapter.loaded == ["w"]
+        mock_mgr_cls.return_value.shutdown.assert_called_once()
+
     @patch("modelexpress.gds_transfer.is_gds_available", return_value=False)
     def test_gds_not_available(self, _mock_avail):
         from modelexpress.load_strategy.gds_strategy import GdsStrategy

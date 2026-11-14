@@ -650,6 +650,18 @@ def test_sglang_model_streamer_requires_initialized_model(monkeypatch):
         raise AssertionError("Expected missing model to fail")
 
 
+def test_sglang_model_streamer_setup_error_raises_before_iteration(monkeypatch):
+    loader_cls = MagicMock()
+    load_format = SimpleNamespace(RUNAI_STREAMER="runai_streamer")
+    _install_sglang_runai_loader_modules(monkeypatch, loader_cls, load_format)
+
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    with pytest.raises(RuntimeError, match="requires result.model"):
+        adapter.build_model_streamer_weight_iter("s3://bucket/model")
+    loader_cls.assert_not_called()
+
+
 def test_sglang_retry_initializes_model_with_configured_dtype(monkeypatch):
     original_dtype = torch.get_default_dtype()
     sglang_mod = ModuleType("sglang")
