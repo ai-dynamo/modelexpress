@@ -597,6 +597,40 @@ class TestHeartbeatDaemon:
         assert heartbeat._thread.is_alive()
 
 
+class TestHeartbeatInterval:
+    @pytest.mark.parametrize("value", ["0", "-5"])
+    def test_non_positive_env_interval_waits_default(self, mx_client, nixl_manager, value):
+        with patch.dict("os.environ", {"MX_HEARTBEAT_INTERVAL_SECS": value}):
+            publisher = PublisherThread(
+                mx_client=mx_client,
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                nixl_manager=nixl_manager,
+            )
+        waits = []
+
+        def stop_after_wait(timeout):
+            waits.append(timeout)
+            publisher._stop_event.set()
+
+        with patch.object(publisher._stop_event, "wait", side_effect=stop_after_wait):
+            publisher._run()
+
+        assert waits == [30]
+
+    @pytest.mark.parametrize("interval", [0, -1])
+    def test_non_positive_interval_argument_rejected(self, mx_client, interval):
+        with pytest.raises(ValueError, match="interval_secs must be positive"):
+            PublisherThread(
+                mx_client=mx_client,
+                mx_source_id="abc123",
+                worker_id="w1",
+                worker_rank=0,
+                interval_secs=interval,
+            )
+
+
 class TestSourceLoadPresence:
     """The publisher forwards exactly what the provider knows: a reading, or None."""
 
