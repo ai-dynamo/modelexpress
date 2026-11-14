@@ -72,6 +72,44 @@ def test_k8s_worker_rpc_retry_policy_uses_configured_values():
     assert client.worker_rpc_retry_policy() == (3, 0.25)
 
 
+def test_k8s_retry_policy_defaults_when_env_unset(monkeypatch):
+    monkeypatch.delenv("MX_K8S_SOURCE_RETRIES", raising=False)
+    monkeypatch.delenv("MX_K8S_SOURCE_BACKOFF_SECONDS", raising=False)
+    client = MxK8sServiceClient()
+
+    assert client.worker_rpc_retry_policy() == (5, 0.5)
+
+
+def test_k8s_retry_policy_reads_env(monkeypatch):
+    monkeypatch.setenv("MX_K8S_SOURCE_RETRIES", "2")
+    monkeypatch.setenv("MX_K8S_SOURCE_BACKOFF_SECONDS", "0")
+    client = MxK8sServiceClient()
+
+    assert client.worker_rpc_retry_policy() == (2, 0.0)
+
+
+@pytest.mark.parametrize("value", ["3.0", "abc", "-1"])
+def test_k8s_invalid_retries_env_falls_back_to_default(monkeypatch, caplog, value):
+    monkeypatch.setenv("MX_K8S_SOURCE_RETRIES", value)
+    monkeypatch.delenv("MX_K8S_SOURCE_BACKOFF_SECONDS", raising=False)
+    with caplog.at_level("WARNING", logger="modelexpress.envs"):
+        client = MxK8sServiceClient()
+
+    assert client.worker_rpc_retry_policy() == (5, 0.5)
+    assert "MX_K8S_SOURCE_RETRIES" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["-0.5", "nan", "inf", "soon"])
+def test_k8s_invalid_backoff_env_falls_back_to_default(monkeypatch, caplog, value):
+    monkeypatch.delenv("MX_K8S_SOURCE_RETRIES", raising=False)
+    monkeypatch.setenv("MX_K8S_SOURCE_BACKOFF_SECONDS", value)
+    with caplog.at_level("WARNING", logger="modelexpress.envs"):
+        client = MxK8sServiceClient()
+
+    assert client.worker_rpc_retry_policy() == (5, 0.5)
+    assert "MX_K8S_SOURCE_BACKOFF_SECONDS" in caplog.text
+
+
 # ---------------------------------------------------------------------------
 # publish_metadata / list_sources / update_status behavior
 # ---------------------------------------------------------------------------
