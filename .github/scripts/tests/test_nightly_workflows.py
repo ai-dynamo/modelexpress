@@ -402,6 +402,13 @@ g++() { echo compiler-ready; }
 
 
 class StageReleaseRcWorkflowTests(unittest.TestCase):
+    def test_rc_crates_are_published_to_the_registry_not_uploaded_as_files(self):
+        steps = workflow("stage-release-rc.yml")["jobs"]["stage-crates"]["steps"]
+        publish = next(step for step in steps if step.get("id") == "package")
+        self.assertIn("stage_crates.py --registry artifactory", publish["run"])
+        self.assertNotIn("--output-dir", publish["run"])
+        self.assertFalse([step for step in steps if "jf rt upload" in step.get("run", "")])
+
     def test_preflight_accepts_only_a_matching_release_dispatch(self):
         script = workflow("stage-release-rc.yml")["jobs"]["preflight"]["steps"][0]["run"]
         dispatch = {
