@@ -13,6 +13,9 @@ import torch
 
 from .. import envs as rl_envs
 from .. import timing
+from ..azure import AzureBlobClient
+from ..object_storage import ObjectStorageType
+from ..object_storage_writer import ObjectStorageWriter
 from ..s3 import S3Client
 from ..utils import make_tensor_reader
 from ..version import TrainerTensorsMetadata, WeightVersionRef
@@ -106,10 +109,16 @@ class TrainerRuntime:
             read_seed_tensor, _ = make_tensor_reader(
                 object_storage.seed_checkpoint_path
             )
-            s3 = S3Client(
-                endpoint_url=object_storage.endpoint_url,
-                region_name=object_storage.region_name,
-            )
+            writer: ObjectStorageWriter
+            if object_storage.storage_type is ObjectStorageType.S3:
+                writer = S3Client(
+                    endpoint_url=object_storage.endpoint_url,
+                    region_name=object_storage.region_name,
+                )
+            elif object_storage.storage_type is ObjectStorageType.AZURE:
+                writer = AzureBlobClient()
+            else:
+                raise ValueError("only S3 and Azure object storage are currently supported")
             try:
                 method = CanonicalDeltaPublicationMethod(
                     config=object_storage,
@@ -118,10 +127,10 @@ class TrainerRuntime:
                     rpc_timeout_seconds=rpc_timeout_seconds,
                     process_group=process_group,
                     read_seed_tensor=read_seed_tensor,
-                    s3=s3,
+                    writer=writer,
                 )
             except Exception:
-                s3.close()
+                writer.close()
                 raise
             return cls(method=method, resources=None)
 
