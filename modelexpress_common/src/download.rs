@@ -97,7 +97,6 @@ pub async fn resolve_revision(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::path::PathBuf;

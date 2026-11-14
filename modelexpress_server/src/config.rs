@@ -547,7 +547,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_log_level_from_str() {
         assert_eq!(
             "trace"
@@ -600,7 +599,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_log_format_from_str() {
         assert_eq!(
             "json".parse::<LogFormat>().expect("Failed to parse 'json'"),
@@ -636,7 +634,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_parse_duration_string() {
         // Test various duration formats
         assert_eq!(
@@ -690,7 +687,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_duration_config_serde() {
         // Test deserializing from string
         let json = r#""2h""#;
@@ -709,7 +705,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_server_config_load_and_validate_strict_valid_config() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let config_file = temp_dir.path().join("valid_server_config.yaml");
@@ -763,7 +758,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_server_config_load_and_validate_strict_invalid_config() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let config_file = temp_dir.path().join("invalid_server_config.yaml");
@@ -797,7 +791,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_server_config_load_and_validate_strict_with_cli_overrides() {
         let temp_dir = tempdir().expect("Failed to create temp dir");
         let config_file = temp_dir.path().join("override_test_config.yaml");
@@ -853,7 +846,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn test_server_config_load_and_validate_strict_no_config_file() {
         let args = ServerArgs {
             config: None,
@@ -887,7 +879,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn service_account_ref_parses_namespace_and_sa() {
         let parsed: ServiceAccountRef = "vllm:worker".parse().expect("valid ns:sa");
         assert_eq!(parsed.namespace, "vllm");
@@ -905,7 +896,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::expect_used)]
     fn comma_list_parses_and_skips_blanks() {
         let list: CommaList<ServiceAccountRef> =
             "a:one, b:two ,, c:three".parse().expect("valid list");
@@ -947,7 +937,6 @@ mod tests {
     /// it). Both cases assert the *rest* of the file survived, because that is how
     /// the failure would present.
     #[test]
-    #[allow(clippy::expect_used)]
     fn metrics_port_never_costs_the_rest_of_the_config_file() {
         // (metrics_port line, expected port, expected metrics address)
         let cases = [

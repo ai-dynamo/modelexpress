@@ -941,7 +941,6 @@ impl ModelProviderTrait for NgcProvider {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::time::Duration;

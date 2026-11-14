@@ -132,7 +132,6 @@ pub(crate) async fn review_token(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::auth::test_util::{

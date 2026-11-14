@@ -322,7 +322,6 @@ fn file_checksum(path: &Path) -> Result<String> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::grpc::p2p::MxSourceType;

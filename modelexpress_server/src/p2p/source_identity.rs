@@ -93,7 +93,6 @@ fn insert_non_empty_lowercase(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

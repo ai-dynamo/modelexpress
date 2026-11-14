@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::expect_used)]
-
 use modelexpress_common::{
     artifact_manifest::ArtifactManifest,
     grpc::p2p::worker_metadata::SourcePayload,

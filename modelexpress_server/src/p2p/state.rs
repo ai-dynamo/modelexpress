@@ -293,7 +293,6 @@ impl P2pStateManager {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::p2p::backend::MockMetadataBackend;

@@ -169,7 +169,6 @@ impl Signer for OpensslRsaKey {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use object_store::client::{CryptoProvider, DigestAlgorithm, DigestContext, SigningAlgorithm};
     use openssl::ec::{EcGroup, EcKey};

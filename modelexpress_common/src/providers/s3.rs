@@ -388,7 +388,6 @@ fn collect_cached_models(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use clap::ValueEnum;
