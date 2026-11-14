@@ -74,6 +74,22 @@ stock behavior. Design: [NCCL_M2N_REFIT.md](../NCCL_M2N_REFIT.md).
 | `MX_NCCL_REFIT_SEND_WINDOW_BYTES` | `1073741824` | Trainer-side counterpart of `MX_NCCL_REFIT_RECEIVE_WINDOW_BYTES`: bounds the `pre` scratch one layer group keeps alive while it is sent, for example grouped experts stacked into a fresh buffer per call. Without it every such buffer stays allocated until the finish-time drain, so an integration that empties the allocator cache between rounds allocates and frees the whole set each round. `0` keeps every buffer until the drain. Ignored with `MX_NCCL_REFIT_GROUPED_SUBMISSION=1`. |
 | `MX_NCCL_REFIT_REGISTRATION_TTL_S` | `3 x MX_HEARTBEAT_INTERVAL_SECS`, so `90` | How long a participant's registration stays alive without a heartbeat. Derived from `MX_HEARTBEAT_INTERVAL_SECS` (default `30`), so raising the heartbeat interval raises this with it. |
 
+### MILES Integration (NCCL M2N)
+
+The MILES trainer-side adapter
+(`modelexpress_rl.collective.integrations.miles_protocol`) resolves the
+mx-server endpoint through the shared client resolver, with no localhost
+default. `MODEL_EXPRESS_URL` takes precedence over `MX_SERVER_ADDRESS`; one
+of the two must be set. Plain `host:port` and the `grpc://` and `http://`
+prefixes are accepted; `grpcs://` and `https://` are rejected.
+
+Trainer and engine processes honor the `MX_NCCL_REFIT_*` settings above.
+The SGLang side needs no endpoint variable: its allowlisted external receiver
+(requires the SG-1 hook, launched via `--weight-update-receivers
+modelexpress_rl.collective.integrations.sglang_receiver.create_receiver`)
+receives the endpoint in the trainer's `init_weights_update_group` request.
+See the [integration README](../../modelexpress_client/python/modelexpress_rl/collective/integrations/README.md).
+
 ## Generator refit connection settings
 
 vLLM's `init_info` and SGLang's `--modelexpress-config` select the checkpoint
