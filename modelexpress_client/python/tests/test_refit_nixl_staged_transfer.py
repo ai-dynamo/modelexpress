@@ -235,7 +235,7 @@ def test_fixed_mode_updates_receive_changed_values(harness, monkeypatch, failure
     manager = transfer._manager
     monkeypatch.setattr(transfer, "_device", torch.device("cpu"))
     monkeypatch.setattr(
-        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     capture_failure = False
 
@@ -643,7 +643,7 @@ def test_transfer_manager_is_closed_after_failed_init_and_only_once(monkeypatch)
 
 def test_registered_workspace_is_reused_only_for_the_same_layout(monkeypatch):
     monkeypatch.setattr(
-        transfer_module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        transfer_module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._weight_update_plan = None
@@ -1154,7 +1154,7 @@ def test_staging_synchronizes_and_allocates_through_the_device_backend(
     monkeypatch.setattr(
         transfer_module,
         "registered_buffer_alloc_scope",
-        lambda backend: scopes.append(backend) or nullcontext(),
+        lambda backend, *, device: scopes.append((backend, device)) or nullcontext(),
     )
     transfer = object.__new__(_NixlStagedTransfer)
     transfer._device = torch.device("xpu", 1)
@@ -1164,7 +1164,7 @@ def test_staging_synchronizes_and_allocates_through_the_device_backend(
         pass
 
     assert xpu_backend.synchronize_calls == [1]
-    assert scopes == [xpu_backend]
+    assert scopes == [(xpu_backend, torch.device("xpu", 1))]
 
 
 def test_host_device_staging_needs_no_backend(monkeypatch, xpu_backend):
