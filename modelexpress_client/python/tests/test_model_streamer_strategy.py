@@ -11,8 +11,7 @@ import pytest
 import torch
 
 from modelexpress import p2p_pb2
-from modelexpress.adapter import EngineAdapter
-from modelexpress.adapter import StrategyFailed
+from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.context import LoadResult
 
@@ -237,23 +236,33 @@ class TestModelStreamerLoad:
 
         assert exc.value.mutated is False
 
-    def test_apply_weight_iter_failure_is_mutated(self):
+    @pytest.mark.parametrize("cleanup_fails", [False, True])
+    def test_apply_weight_iter_failure_closes_iterator(self, cleanup_fails):
         model = MagicMock()
         adapter = _FakeAdapter()
         adapter.apply_weight_iter = MagicMock(side_effect=RuntimeError("partial load"))
         ctx = _make_load_context(adapter=adapter)
         strategy = self._make_strategy()
+        weights_iter = MagicMock()
+        if cleanup_fails:
+            weights_iter.close.side_effect = RuntimeError("close failed")
 
         with patch.dict("os.environ", {"MX_MODEL_URI": "s3://bucket/model"}):
             with patch(
                 "modelexpress.load_strategy.model_streamer_strategy."
                 "ModelStreamerStrategy._stream_weights",
-                return_value=iter([("layer.0.weight", torch.randn(4, 4))]),
+                return_value=weights_iter,
             ):
-                with pytest.raises(StrategyFailed, match="partial load") as exc:
+                expected = StrategyRecoveryError if cleanup_fails else StrategyFailed
+                match = "Failed to close ModelStreamer" if cleanup_fails else "partial load"
+                with pytest.raises(expected, match=match) as exc:
                     strategy.load(model, ctx)
 
-        assert exc.value.mutated is True
+        weights_iter.close.assert_called_once_with()
+        if cleanup_fails:
+            assert str(exc.value.__cause__) == "close failed"
+        else:
+            assert exc.value.mutated is True
 
     def test_after_weight_iter_failure_is_mutated(self):
         model = MagicMock()
