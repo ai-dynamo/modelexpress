@@ -21,12 +21,32 @@ _WorkItem = TypeVar("_WorkItem")
 _WorkResult = TypeVar("_WorkResult")
 
 
+_ADLER32_BASE = 65521
+
+
 class Adler32Checksum:
     def __init__(self) -> None:
         self._value = 1
 
     def update(self, data: Any) -> None:
         self._value = zlib.adler32(data, self._value)
+
+    def extend(self, following: Adler32Checksum, length: int) -> None:
+        """Append the ``length`` bytes that ``following`` checksummed from a fresh start.
+
+        This is zlib's ``adler32_combine``, so parts can be checksummed in parallel.
+        """
+        remainder = length % _ADLER32_BASE
+        low = self._value & 0xFFFF
+        high = (remainder * low) % _ADLER32_BASE
+        low += (following._value & 0xFFFF) + _ADLER32_BASE - 1
+        high += (
+            ((self._value >> 16) & 0xFFFF)
+            + ((following._value >> 16) & 0xFFFF)
+            + _ADLER32_BASE
+            - remainder
+        )
+        self._value = (low % _ADLER32_BASE) | ((high % _ADLER32_BASE) << 16)
 
     def hexdigest(self) -> str:
         return f"{self._value:08x}"
