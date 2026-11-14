@@ -117,6 +117,95 @@ The startup strategy name in telemetry is now `desired_version_object_storage`
 `object_storage_` prefix. Use the same client build on all ranks; mixed old and
 new labels cause a startup phase disagreement.
 
+### Runnable Azure refit example
+
+[`examples/rl/dynamo_vllm_azure_refit`](../../examples/rl/dynamo_vllm_azure_refit)
+runs the trainer, Redis-backed ModelExpress server, and one Dynamo/vLLM generator
+with Azurite. It publishes a full checkpoint and two XOR deltas, applies each
+version, then replaces the generator. The replacement must restore the final
+version from Blob storage. The default `SCENARIO=blob` disables peer loading and
+requests one GPU and zero RDMA devices.
+
+Set `SCENARIO=p2p` to use two generators with RDMA. For each version, one generator
+loads from Azure and the other receives weights through generator P2P. The script
+then replaces one generator and requires recovery from the surviving peer. It
+rejects a run that falls back to Blob storage during peer recovery. This scenario
+requires two available GPUs and an `rdma/ib` resource for each generator.
+
+The publisher also reconstructs the final checkpoint on the CPU and compares
+every canonical tensor. The generator checks its reported version and runs
+inference after each update and replacement. These checks do not compare every
+tensor installed on the GPU or measure model quality.
+
+Before each update, the orchestrator aborts active requests and clears the KV
+cache on every generator. It resumes generation only after every generator
+reports the requested version and the desired-version ConfigMap is updated.
+A failed update leaves paused generators paused. Inspect the failure before
+restarting a generator; its startup uses the last persisted desired version.
+
+Use a dedicated namespace with the Dynamo v1beta1 operator, one available GPU,
+`hf-token-secret`, and `nvcr-imagepullsecret`. Populate the `shared-model-cache`
+PVC with a complete Hugging Face checkpoint, including model configuration and
+tokenizer files. The example mounts this checkpoint read-only. Its default model
+is `Qwen/Qwen3-0.6B`, the small model used by the existing S3 example. Changing
+models can require larger memory, GPU, and cache limits in the manifests.
+
+Build from the repository root. Use matching Dynamo source and frontend image
+revisions. The following pair is also used by the S3 example:
+
+```bash
+export REGISTRY=registry.example.com/project
+export WORKER_IMAGE="$REGISTRY/modelexpress-dynamo-vllm:azure-refit"
+export DYNAMO_FRONTEND_IMAGE=nvcr.io/nvidia/ai-dynamo/dynamo-frontend-nightly:20260909-c3e05f0
+
+git clone https://github.com/ai-dynamo/dynamo.git /tmp/dynamo-azure-example
+git -C /tmp/dynamo-azure-example checkout c3e05f0244ae6264d7953f68e2499c6dc2f54723
+docker buildx build --platform linux/amd64 \
+  -f examples/rl/dynamo_vllm_azure_refit/Dockerfile \
+  --build-context dynamo=/tmp/dynamo-azure-example \
+  --push -t "$WORKER_IMAGE" .
+
+export NAMESPACE=my-azure-refit-example
+export RUN_ID="azure-$(date +%s)"
+export MODEL_NAME=Qwen/Qwen3-0.6B
+export MODEL_SUBPATH=Qwen/Qwen3-0.6B
+examples/rl/dynamo_vllm_azure_refit/run.sh
+```
+
+To exercise peer transfer and peer recovery, prepare a separate namespace with
+the same secrets and model PVC, then run:
+
+```bash
+NAMESPACE=my-azure-refit-p2p SCENARIO=p2p RUN_ID="azure-p2p-$(date +%s)" \
+  examples/rl/dynamo_vllm_azure_refit/run.sh
+```
+
+The script requires `kubectl` and `envsubst`. Prepare the namespace, secrets, and
+model PVC before running it. Resource names are fixed; use a fresh namespace for
+each run. The script leaves resources for inspection. To remove them, delete
+the dedicated namespace when its model PVC is no longer needed.
+
+Azurite uses public example credentials and temporary storage. Redis also has no
+persistence in this example. The restart check replaces only the generator; it
+does not test storage or catalog recovery. A successful run ends with
+`E2E PASS: Azure full checkpoint, two deltas, and blob replacement recovery`
+or the corresponding `p2p replacement recovery` message.
+This example does not validate Azure managed identity, live Azure performance,
+or full-checkpoint streaming into the GPU.
+
+Install the Python `azure` and `dev` extras, then run the focused tests without a GPU:
+
+```bash
+cd modelexpress_client/python
+python -m pytest tests/test_azure_refit_example.py
+```
+
+To include the real publication/replay test, set
+`MX_AZURE_EXAMPLE_TEST_SERVER_URL` to a disposable Redis-backed ModelExpress
+server and `AZURE_STORAGE_CONNECTION_STRING` to Azurite. The test creates and
+deletes its own Blob container. Its version records remain in the test server.
+Without these services, only the real-service test is skipped.
+
 ## Staging, streaming, and verification
 
 Trainer staging choices govern how framework tensors remain valid while a version is published; see [FSDP precision and trainer staging](#fsdp-precision-and-trainer-staging) below. Generator streaming limits bound registered receive arenas; scratch and engine-owned materialization need additional memory. Read [staged transfer architecture](ARCHITECTURE.md#staged-transfer-caching-and-failure-handling) before tuning arena sizes, descriptor reuse, checksum verification, or throughput thresholds.
