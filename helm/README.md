@@ -98,6 +98,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `serviceAccount.create`                      | Create a service account                       | `true`   |
 | `serviceAccount.annotations`                 | Service account annotations                    | `{}`     |
 | `serviceAccount.name`                        | Service account name                           | `""`     |
+| `serviceAccount.automount`                   | Mount service account credentials; required for the Kubernetes metadata backend | `false` |
 | `serviceAccount.rbac.enabled`                | Create a ClusterRole and ClusterRoleBinding for the Kubernetes metadata backend | `false` |
 | `podAnnotations`                             | Pod annotations                                | `{}`     |
 | `podSecurityContext`                         | Pod security context                           | `{runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}` |
@@ -239,10 +240,15 @@ extraEnv:
 
 Enabling `serviceAccount.rbac.enabled` creates a `ClusterRole` and
 `ClusterRoleBinding`, allowing a ModelExpress server deployed in a dedicated
-namespace to access metadata resources in a workload namespace:
+namespace to access metadata resources in a workload namespace.
+
+The Kubernetes backend also needs a service account token to authenticate to the
+API server. Set `serviceAccount.automount: true` explicitly; the chart defaults to
+`false`:
 
 ```yaml
 serviceAccount:
+  automount: true
   rbac:
     enabled: true
 
