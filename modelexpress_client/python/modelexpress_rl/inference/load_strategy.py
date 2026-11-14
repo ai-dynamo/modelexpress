@@ -194,17 +194,8 @@ class DesiredVersionP2PStrategy(RdmaStrategy):
         loaded = None
         failure: BaseException | None = None
         outcome = "loaded"
+        original_revision = ctx.identity.revision
         try:
-            with ModelExpressControlClient.connect(
-                server_url=ctx.mx_server_url
-            ) as client:
-                _fetch_ready_version(
-                    client,
-                    ctx,
-                    desired_version_uid,
-                    require_object_storage=False,
-                )
-            original_revision = ctx.identity.revision
             ctx.identity.revision = desired_version_uid
             try:
                 loaded = super().load(result, ctx)
