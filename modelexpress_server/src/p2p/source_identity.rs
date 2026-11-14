@@ -7,7 +7,7 @@
 //! normalizing all fields and taking the first 16 chars of SHA256.
 
 use modelexpress_common::digest::{DigestError, sha256_hex};
-use modelexpress_common::grpc::p2p::SourceIdentity;
+use modelexpress_common::grpc::p2p::{MxSourceType, SourceIdentity};
 use std::collections::BTreeMap;
 
 /// Compute the `mx_source_id` for a `SourceIdentity`.
@@ -23,6 +23,41 @@ pub fn compute_mx_source_id(identity: &SourceIdentity) -> Result<String, DigestE
 pub fn validate_identity(identity: &SourceIdentity) -> Result<(), String> {
     if identity.model_name.is_empty() {
         return Err("identity.model_name is required".to_string());
+    }
+    if identity.mx_source_type == MxSourceType::FrameworkCache as i32 {
+        if identity.backend_framework == 0 {
+            return Err("framework cache identity.backend_framework is required".to_string());
+        }
+        for (name, value) in [
+            (
+                "backend_framework_version",
+                identity.backend_framework_version.as_str(),
+            ),
+            (
+                "compile_config_digest",
+                identity.compile_config_digest.as_str(),
+            ),
+            (
+                "framework_cache_name",
+                identity
+                    .extra_parameters
+                    .get("framework_cache_name")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            ),
+            (
+                "framework_cache_schema",
+                identity
+                    .extra_parameters
+                    .get("framework_cache_schema")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("framework cache identity.{name} is required"));
+            }
+        }
     }
     Ok(())
 }
@@ -117,6 +152,99 @@ mod tests {
             gpu_arch: String::new(),
             compile_config_digest: String::new(),
         }
+    }
+
+    fn framework_cache_identity() -> SourceIdentity {
+        let mut identity = base_identity();
+        identity.mx_source_type = MxSourceType::FrameworkCache as i32;
+        identity.backend_framework_version = "0.29.1".to_string();
+        identity.compile_config_digest =
+            "7b3513d6e36486a78807e54b2a7b45b0eef985e941814eaa8013cf2f093c9e22".to_string();
+        identity.extra_parameters.extend([
+            (
+                "framework_cache_name".to_string(),
+                "startup_plan".to_string(),
+            ),
+            ("framework_cache_schema".to_string(), "1".to_string()),
+        ]);
+        identity
+    }
+
+    #[test]
+    fn test_framework_cache_identity_matches_python() {
+        let identity = framework_cache_identity();
+        assert!(validate_identity(&identity).is_ok());
+        assert_eq!(
+            compute_mx_source_id(&identity).expect("source id"),
+            "7d4cf89c29780927"
+        );
+    }
+
+    #[test]
+    fn test_unknown_numeric_source_type_remains_forward_compatible() {
+        let mut identity = base_identity();
+        identity.mx_source_type = 99;
+        assert!(validate_identity(&identity).is_ok());
+        assert_ne!(
+            compute_mx_source_id(&identity).expect("source id"),
+            compute_mx_source_id(&base_identity()).expect("source id")
+        );
+    }
+
+    #[test]
+    fn test_framework_cache_identity_requires_compatibility_fields() {
+        let identity = framework_cache_identity();
+        for missing in [
+            "backend_framework_version",
+            "compile_config_digest",
+            "framework_cache_name",
+            "framework_cache_schema",
+        ] {
+            let mut invalid = identity.clone();
+            match missing {
+                "backend_framework_version" => invalid.backend_framework_version.clear(),
+                "compile_config_digest" => invalid.compile_config_digest.clear(),
+                _ => {
+                    invalid.extra_parameters.remove(missing);
+                }
+            }
+            assert!(validate_identity(&invalid).is_err(), "missing {missing}");
+        }
+        let mut invalid = identity;
+        invalid.backend_framework = 0;
+        assert!(validate_identity(&invalid).is_err());
+        // Required generic-cache fields do not change the legacy contract.
+        assert!(validate_identity(&base_identity()).is_ok());
+    }
+
+    #[test]
+    fn test_framework_cache_identity_partitions_cache_formats_and_frameworks() {
+        let identity = framework_cache_identity();
+        for (key, value) in [
+            ("framework_cache_name", "another_cache"),
+            ("framework_cache_schema", "2"),
+        ] {
+            let mut different = identity.clone();
+            different
+                .extra_parameters
+                .insert(key.to_string(), value.to_string());
+            assert_ne!(
+                compute_mx_source_id(&identity).expect("source id"),
+                compute_mx_source_id(&different).expect("source id")
+            );
+        }
+        let mut different = identity.clone();
+        different.backend_framework = 2;
+        assert_ne!(
+            compute_mx_source_id(&identity).expect("source id"),
+            compute_mx_source_id(&different).expect("source id")
+        );
+        different = identity.clone();
+        different.backend_framework_version = "0.30.0".to_string();
+        assert_ne!(
+            compute_mx_source_id(&identity).expect("source id"),
+            compute_mx_source_id(&different).expect("source id")
+        );
     }
 
     #[test]

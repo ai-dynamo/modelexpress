@@ -12,6 +12,7 @@ import tarfile
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from concurrent import futures
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,7 +40,7 @@ from .artifact_manifest import (
     build_artifact_manifest,
 )
 from .payload import accelerators_compatible
-from .publisher import PublisherThread
+from .publisher import PublicationNotNeeded, PublisherThread
 from .publish import _get_worker_host, _publish_metadata_to_server
 from .worker_server import (
     WorkerGrpcServer,
@@ -151,8 +152,12 @@ class ArtifactTransfer(Protocol):
     def install(
         self,
         header: p2p_pb2.GetArtifactManifestHeaderResponse,
-    ) -> None:
-        """Install a transferred artifact into the target root."""
+    ) -> list[str] | None:
+        """Install a transferred artifact into the target root.
+
+        Return the files installed into the primary root, relative to it,
+        when the transfer knows them.
+        """
 
     def target_file_paths(self) -> list[Path]:
         """Return local staging paths used by file-oriented transports."""
@@ -160,7 +165,13 @@ class ArtifactTransfer(Protocol):
 
 @dataclass(frozen=True)
 class TarredArtifactTransfer(ArtifactTransfer):
-    """Tar-backed artifact used by all transport backends."""
+    """Tar-backed artifact used by all transport backends.
+
+    ``include``, when set, selects the files packaged from every source root.
+    It receives each file's POSIX path relative to its root. The primary root
+    must then contribute at least one file. Otherwise preparation raises
+    ``PublicationNotNeeded``, which ends publication without retrying.
+    """
 
     name: str
     mx_source_type: int
@@ -168,6 +179,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
     bundle_root: Path
     chunk_size: int | None = None
     tar_name: str = "artifact.tar"
+    include: Callable[[str], bool] | None = None
 
     def prepare_source(self) -> ArtifactBundle:
         """Tar the source directories into bundle_root and build their manifest."""
@@ -215,7 +227,15 @@ class TarredArtifactTransfer(ArtifactTransfer):
                 with tarfile.open(tar_path, "w"):
                     pass
                 continue
-            entries, skipped = _tar_source_entries(resolved_source)
+            entries, skipped = _tar_source_entries(resolved_source, self.include)
+            if (
+                self.include is not None
+                and tar_name == self.tar_name
+                and not _has_file_entries(entries)
+            ):
+                raise PublicationNotNeeded(
+                    f"artifact {self.name} selected no files under {resolved_source}"
+                )
             _log_skipped_entries(tar_name, skipped)
             _write_tar_from_entries(tar_path, resolved_source, entries)
 
@@ -248,7 +268,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
     def install(
         self,
         header: p2p_pb2.GetArtifactManifestHeaderResponse,
-    ) -> None:
+    ) -> list[str]:
         start = time.perf_counter()
         root_archives = self._root_archives()
         self._validate_archive_names(root_archives)
@@ -263,6 +283,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
                 f"{sorted(files_by_name)} != {sorted(expected_names)}"
             )
         installed_targets = []
+        installed_files: list[str] = []
         validate_total = 0.0
         extract_total = 0.0
         for tar_name, root in root_archives:
@@ -276,7 +297,9 @@ class TarredArtifactTransfer(ArtifactTransfer):
             # the target filesystem. One number could not say which is slow.
             step_start = time.perf_counter()
             with install_metrics.time_artifact_install_step(self.name, root.name, "validate"):
-                _validate_tar_members(tar_file)
+                members = _validate_tar_members(tar_file)
+            if tar_name == self.tar_name:
+                installed_files = members
             validate_seconds = time.perf_counter() - step_start
             step_start = time.perf_counter()
             with install_metrics.time_artifact_install_step(self.name, root.name, "extract"):
@@ -307,6 +330,7 @@ class TarredArtifactTransfer(ArtifactTransfer):
             extract_total,
             elapsed,
         )
+        return installed_files
 
     def target_file_paths(self) -> list[Path]:
         root_archives = self._root_archives()
@@ -1009,7 +1033,10 @@ class _SkippedEntry:
     detail: str
 
 
-def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
+def _tar_source_entries(
+    source_root: Path,
+    include: Callable[[str], bool] | None = None,
+) -> tuple[bytes, list[_SkippedEntry]]:
     """Enumerate the archive members under source_root for tar --null -T.
 
     Only regular files and directories are listed, which keeps the
@@ -1020,12 +1047,17 @@ def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
     caches this packs they are derived state that the engine rebuilds. Both
     this walk and tar stop at a symlinked directory, so dropping one costs the
     link entry alone, never a subtree tar would otherwise have archived.
+
+    With ``include``, only the root directory and the selected files are
+    listed; extraction recreates the parent directories of selected files.
+    Files that ``include`` rejects are not reported as skipped.
     """
     names: list[str] = []
     skipped: list[_SkippedEntry] = []
     for dirpath, dirnames, filenames in os.walk(source_root, followlinks=False):
         directory = Path(dirpath)
-        names.append(_tar_member_name(directory, source_root))
+        if include is None or directory == source_root:
+            names.append(_tar_member_name(directory, source_root))
         kept: list[str] = []
         for name in sorted(dirnames):
             path = directory / name
@@ -1036,11 +1068,20 @@ def _tar_source_entries(source_root: Path) -> tuple[bytes, list[_SkippedEntry]]:
         dirnames[:] = kept
         for name in sorted(filenames):
             path = directory / name
+            if include is not None and not include(
+                path.relative_to(source_root).as_posix()
+            ):
+                continue
             if path.is_symlink() or not path.is_file():
                 skipped.append(_classify_skipped_entry(path, source_root))
                 continue
             names.append(_tar_member_name(path, source_root))
     return b"\0".join(name.encode() for name in names) + b"\0", skipped
+
+
+def _has_file_entries(entries: bytes) -> bool:
+    # The root directory is always the first member and is listed as "./".
+    return any(name and name != b"./" for name in entries.split(b"\0"))
 
 
 def _tar_member_name(path: Path, source_root: Path) -> str:
@@ -1123,7 +1164,9 @@ def _write_tar_from_entries(
         member_list.unlink(missing_ok=True)
 
 
-def _validate_tar_members(tar_path: Path) -> None:
+def _validate_tar_members(tar_path: Path) -> list[str]:
+    """Reject unsafe members and return the regular files' relative paths."""
+    files = []
     with tarfile.open(tar_path, mode="r:") as archive:
         for member in archive:
             name = member.name
@@ -1134,6 +1177,9 @@ def _validate_tar_members(tar_path: Path) -> None:
                 raise ValueError(f"unsafe tar member path: {member.name}")
             if not (member.isfile() or member.isdir()):
                 raise ValueError(f"unsupported tar member type: {member.name}")
+            if member.isfile():
+                files.append(name)
+    return files
 
 
 def _run_tar(args: list[str]) -> None:

@@ -1634,6 +1634,30 @@ mod tests {
     }
 
     #[test]
+    fn test_framework_cache_identity_roundtrip_preserves_source_id() {
+        let mut identity = test_identity();
+        identity.mx_source_type = 10;
+        identity.backend_framework_version = "0.29.1".to_string();
+        identity.compile_config_digest = "startup-fingerprint".to_string();
+        identity.extra_parameters.extend([
+            (
+                "framework_cache_name".to_string(),
+                "startup_plan".to_string(),
+            ),
+            ("framework_cache_schema".to_string(), "1".to_string()),
+        ]);
+        let attrs = serde_json::to_string(&SourceAttributesJson::from(&identity))
+            .expect("serialize framework cache");
+        let (_, restored) = source_identity_from_attributes(Some(&attrs));
+        let restored = restored.expect("restore framework cache identity");
+        assert_eq!(restored, identity);
+        assert_eq!(
+            crate::p2p::source_identity::compute_mx_source_id(&restored).expect("source id"),
+            crate::p2p::source_identity::compute_mx_source_id(&identity).expect("source id"),
+        );
+    }
+
+    #[test]
     fn test_source_attributes_defaults_for_missing_fields() {
         // Old records that only stored model_name should deserialize with zero defaults.
         let json = r#"{"model_name":"my-model"}"#;

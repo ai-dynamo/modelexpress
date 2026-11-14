@@ -24,6 +24,7 @@ from ...load_strategy.context import LoadContext, LoadResult
 from ...metadata.client_factory import create_metadata_client
 from ...rank_utils import get_global_rank
 from ...tensor_utils import adopt_hidden_tensors, capture_tensor_attrs, collect_module_tensors
+from .framework_caches import build_framework_cache_artifacts
 from .host_quantization import refresh_host_quantization_state
 from .source_identity import build_source_identity
 
@@ -75,7 +76,7 @@ def cold_start_expected_workers(vllm_config) -> int:
     ):
         expected *= getattr(parallel, name, 1) or 1
     return expected
-  
+
 def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
     """Identify local state through the attention layer's declared backend."""
     tensors = []
@@ -325,6 +326,11 @@ class VllmAdapter(EngineAdapter):
         self.load_config = vllm_config.load_config
         self.target_device = self._resolve_target_device()
         self.accelerator_backend = accelerator_backend_for(self.target_device)
+        self.framework_cache_artifacts = (
+            build_framework_cache_artifacts(vllm_config)
+            if envs.MX_ARTIFACT_TRANSFER and not _is_speculative_draft(vllm_config, model_config)
+            else ()
+        )
 
     def build_identity(self):
         return build_source_identity(self.vllm_config, self._identity_model_config)

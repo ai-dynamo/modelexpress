@@ -52,6 +52,9 @@ enum MxSourceType {
   MX_SOURCE_TYPE_CUTE_DSL_CACHE = 7;      // CuTe DSL compiled kernel cache files
   MX_SOURCE_TYPE_FLASHINFER_CACHE = 8;    // FlashInfer JIT workspace cache files
   MX_SOURCE_TYPE_TVM_FFI_CACHE = 9;       // TVM-FFI compiled SGLang kernel modules
+  // Framework-owned file caches. SourceIdentity.extra_parameters identifies
+  // the cache name and format; no new enum value is needed for each cache.
+  MX_SOURCE_TYPE_FRAMEWORK_CACHE = 10;
 }
 
 // All fields that affect source compatibility for reusable model material.
@@ -87,7 +90,12 @@ message SourceIdentity {
   // Quantization method (e.g., "fp8", "awq", "gptq", or empty)
   string quantization = 9;
 
-  // Escape hatch for framework-specific config
+  // Escape hatch for framework-specific config. FRAMEWORK_CACHE sources require
+  // framework_cache_name and framework_cache_schema here, plus a non-UNKNOWN
+  // backend_framework, backend_framework_version, and compile_config_digest.
+  // These existing hash fields keep new cache kinds compatible with older
+  // coordinators that preserve unknown enum values. Local install paths are
+  // resolved by the receiving framework and are not part of source identity.
   map<string, string> extra_parameters = 10;
 
   // Content-addressed revision of the model weights (e.g., HuggingFace

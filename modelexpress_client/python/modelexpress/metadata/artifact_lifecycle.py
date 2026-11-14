@@ -55,6 +55,7 @@ READY_POLL_SECS = 5
 CACHE_SETTLE_SECS = 5
 
 ArtifactEntry = tuple[ArtifactTransfer, p2p_pb2.SourceIdentity]
+ArtifactPublicationKey = tuple[int, int | str]
 InstallCompleted = Callable[[ArtifactTransfer, p2p_pb2.SourceIdentity], None]
 _publish_leases: dict[Path, TextIO] = {}
 
@@ -178,7 +179,7 @@ def _install_artifact_via_transports(
         context = _artifact_transport_context(ctx)
         try:
             staged = transport.fetch(transfer, identity, context)
-            transfer.install(staged.header)
+            installed = transfer.install(staged.header)
             _write_artifact_install_state(
                 marker_path,
                 ArtifactInstallState(
@@ -186,6 +187,7 @@ def _install_artifact_via_transports(
                     artifact_id=staged.header.artifact_id,
                 ),
             )
+            record_install_receipt(transfer, identity, installed)
             if on_install_completed is not None:
                 on_install_completed(transfer, identity)
             return staged.header, staged.transport
@@ -205,7 +207,7 @@ def schedule_artifact_publish(
     artifact_publish_fn: Callable[
         [ArtifactTransfer, p2p_pb2.SourceIdentity], PublicationHandle
     ],
-    scheduled_publishers: dict[tuple[int, int], PublisherThread],
+    scheduled_publishers: dict[ArtifactPublicationKey, PublisherThread],
     log: logging.Logger = logger,
 ) -> None:
     """Schedule readiness-gated publication of local cache artifacts."""
@@ -235,7 +237,7 @@ def schedule_artifact_publish(
         if marker_path is None:
             continue
 
-        key = (ctx.device_id, transfer.mx_source_type)
+        key = _artifact_publication_key(ctx, transfer, identity)
         previous = scheduled_publishers.pop(key, None)
         if previous is not None:
             previous.stop()
@@ -302,8 +304,9 @@ def install_artifact_once(
                 node_rank=ctx.node_rank,
                 accelerator=ctx.accelerator_backend.name,
             )
-            transfer.install(header)
+            installed = transfer.install(header)
             _write_artifact_install_marker(marker_path, header.artifact_id)
+            record_install_receipt(transfer, identity, installed)
             if on_install_completed is not None:
                 on_install_completed(transfer, identity)
             return header
@@ -329,7 +332,7 @@ def publish_artifact(
     *,
     engine_label: str,
     accelerator: str,
-    published_sources: dict[tuple[int, int], PublicationHandle],
+    published_sources: dict[ArtifactPublicationKey, PublicationHandle],
     log: logging.Logger = logger,
 ) -> PublicationHandle:
     """Prepare and publish one artifact through the selected transport."""
@@ -360,7 +363,7 @@ def publish_artifact(
     transport.check_publishable()
     start = time.perf_counter()
     bundle = transfer.prepare_source()
-    key = (ctx.device_id, transfer.mx_source_type)
+    key = _artifact_publication_key(ctx, transfer, identity)
     previous = published_sources.pop(key, None)
     if previous is not None:
         previous.stop()
@@ -390,6 +393,14 @@ def publish_artifact(
         elapsed,
     )
     return published
+
+
+def _artifact_publication_key(
+    ctx: LoadContext, transfer: ArtifactTransfer, identity: p2p_pb2.SourceIdentity
+) -> ArtifactPublicationKey:
+    if transfer.mx_source_type == p2p_pb2.MX_SOURCE_TYPE_FRAMEWORK_CACHE:
+        return ctx.device_id, compute_mx_source_id(identity)
+    return ctx.device_id, transfer.mx_source_type
 
 
 def artifact_ready_fn(
@@ -570,6 +581,71 @@ def artifact_marker_path(
         f"{action}-{transfer.name}-"
         f"{artifact_marker_key(transfer, identity, action)}.done"
     )
+
+
+def install_receipt_path(
+    transfer: ArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+) -> Path:
+    """Return where the files installed for an artifact identity are recorded."""
+    return artifact_marker_path(transfer, identity, "install-receipt")
+
+
+def record_install_receipt(
+    transfer: ArtifactTransfer,
+    identity: p2p_pb2.SourceIdentity,
+    installed: list[str] | None,
+) -> None:
+    """Record digests of installed files so that a filtered transfer relays them.
+
+    A transfer with an ``include`` filter publishes only selected files; the
+    receipt lets a NIXL node also republish what it installed for the same
+    identity. Transfers without a filter publish their whole root and need no
+    receipt. Installation has already succeeded, so failures are only logged.
+    """
+    if getattr(transfer, "include", None) is None or not installed:
+        return
+    root = transfer.roots[0].target_root
+    try:
+        digests = {}
+        for name in installed:
+            digest = file_digest(root / name)
+            if digest is not None:
+                digests[name] = digest
+        _write_marker_atomically(
+            install_receipt_path(transfer, identity),
+            json.dumps(digests, sort_keys=True),
+        )
+    except OSError as exc:
+        logger.warning(
+            "Could not record the install receipt for artifact %s; this node "
+            "will not relay its installed files: %s",
+            transfer.name,
+            exc,
+        )
+
+
+def read_install_receipt(path: Path) -> dict[str, str]:
+    """Return the installed file digests recorded at ``path``, or none."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        name: digest
+        for name, digest in value.items()
+        if isinstance(name, str) and isinstance(digest, str)
+    }
+
+
+def file_digest(path: Path) -> str | None:
+    """Return the SHA-256 of a file's content, or None if it cannot be read."""
+    try:
+        return sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
 
 
 def _read_artifact_install_state(marker_path: Path) -> ArtifactInstallState:

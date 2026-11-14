@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from modelexpress.metadata.publisher import PublisherThread
+from modelexpress.metadata.publisher import PublicationNotNeeded, PublisherThread
 
 
 @pytest.fixture
@@ -253,6 +253,33 @@ class TestPublisherPublishAndReady:
         publish.assert_called_once_with()
         assert publisher._stop_event.is_set()
         assert "Source publish failed; not retrying" in caplog.text
+
+    def test_nothing_to_publish_stops_without_retrying(
+        self, mx_client, nixl_manager, caplog
+    ):
+        publish = MagicMock(side_effect=PublicationNotNeeded("no files selected"))
+        cleanup = MagicMock()
+        publisher = PublisherThread(
+            mx_client=mx_client,
+            worker_id="w1",
+            worker_rank=0,
+            nixl_manager=nixl_manager,
+            publish_fn=publish,
+            interval_secs=1,
+            heartbeat_after_publish=False,
+            retry_publish_on_failure=True,
+            cleanup_fn=cleanup,
+        )
+
+        with caplog.at_level("INFO", logger="modelexpress.metadata.publisher"):
+            publisher._tick()
+            publisher._tick()
+
+        publish.assert_called_once_with()
+        cleanup.assert_called_once_with()
+        assert publisher._stop_event.is_set()
+        assert "Nothing to publish; stopping: no files selected" in caplog.text
+        assert not [r for r in caplog.records if r.levelname in ("WARNING", "ERROR")]
 
 
 class TestHeartbeatStop:

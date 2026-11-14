@@ -31,7 +31,7 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 | Field | Example | Purpose |
 |-------|---------|---------|
 | `mx_version` | `"0.8.0"` | Format compatibility across upgrades |
-| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH`, `TORCH_COMPILE_CACHE`, `TRITON_CACHE`, `DEEP_GEMM_CACHE`, `TILELANG_CACHE`, `CUTE_DSL_CACHE`, `FLASHINFER_CACHE` | Type of source metadata being served |
+| `mx_source_type` | `WEIGHTS`, `LORA`, `CUDA_GRAPH`, `TORCH_COMPILE_CACHE`, `TRITON_CACHE`, `DEEP_GEMM_CACHE`, `TILELANG_CACHE`, `CUTE_DSL_CACHE`, `FLASHINFER_CACHE`, `TVM_FFI_CACHE`, `FRAMEWORK_CACHE` | Type of source metadata being served |
 | `model_name` | `"deepseek-ai/DeepSeek-V3"` | Model identifier |
 | `backend_framework` | `VLLM`, `SGLANG`, `TRT_LLM` | Inference framework |
 | `tensor_parallel_size` | `8` | TP degree |
@@ -178,6 +178,75 @@ Factory helpers provide the cache source types currently expected by loaders:
 | `tilelang_cache_artifact_transfer()` | `TILELANG_CACHE` | TileLang JIT cache directory (`TILELANG_CACHE_DIR`, or `~/.tilelang/cache`) |
 | `cute_dsl_cache_artifact_transfer()` | `CUTE_DSL_CACHE` | CuTe DSL compiled-kernel cache directory (`CUTE_DSL_CACHE_DIR`, or `$TMPDIR/<user>/cutlass_python_cache`) |
 | `flashinfer_cache_artifact_transfer()` | `FLASHINFER_CACHE` | Engine-selected FlashInfer JIT and autotune cache directories packaged as one artifact |
+| `FrameworkCacheArtifact.entry()` | `FRAMEWORK_CACHE` | Framework-owned cache directory registered by the local engine adapter |
+
+### Framework-owned caches
+
+`FrameworkCacheArtifact` describes a named cache, its framework and exact runtime
+version, format schema, compatibility key, local directory and an optional
+`include` filter.
+It produces the existing tar transfer and `SourceIdentity`; NIXL and Mooncake use
+the same compatibility identity. Adding a new cache for vLLM, SGLang, or TRT-LLM
+does not require another source-type enum value or a transport implementation.
+
+`FRAMEWORK_CACHE` (numeric value `10`) reserves `extra_parameters.framework_cache_name`
+and `extra_parameters.framework_cache_schema`. The SHA-256 of the adapter's raw,
+case-sensitive compatibility key is stored in `compile_config_digest`, avoiding
+loss of information under source-ID lowercase normalization. A nonempty
+`MX_ARTIFACT_COMPILE_CONFIG_DIGEST` is hashed together with the key, so it
+partitions framework caches as it partitions kernel caches. The framework, framework version, cache name,
+schema, and key all partition discovery. New servers reject an incomplete generic
+cache identity. Existing source types and their IDs are unchanged.
+
+These values use existing protobuf fields and existing canonicalization. Older
+artifact-capable servers retain the unknown enum number and hash the existing
+fields identically, so old and new coordinators derive the same source ID. Older
+Kubernetes coordinators may display the source type as `unknown`; discovery still
+uses the source-ID label. Old clients continue querying only their supported cache
+types. Python and Go bindings include the new symbolic enum value.
+
+Paths are not compatibility fields and are never supplied as remote installation
+instructions. The source packages its local directory; the receiving adapter
+supplies its own, which can differ across pods. Installation extracts into that
+directory and keeps files already there. Whether and how often a node publishes
+is the transport's policy, as for kernel caches: Mooncake publishes once after a
+confirmed miss, while every NIXL node publishes what it holds. Without an
+`include` filter the whole directory is published. An `include` filter,
+evaluated when the bundle is prepared after readiness, selects which locally
+produced files belong to the identity. Files installed for the same identity
+are recorded in a receipt beside the node's artifact markers and published as
+well while their content is unchanged, so NIXL peers relay them. When nothing
+is selected, publication ends without retrying. Generic bundle paths use a
+dedicated `framework_caches/<name>/<source_id>` namespace, separate from legacy
+artifact bundles. Publication handles are scoped by source identity so several
+framework caches can coexist on one worker.
+
+To add a framework cache:
+
+1. Write a provider that returns a `FrameworkCacheArtifact`, or `None` when the
+   running engine does not support the cache. Its compatibility key must cover
+   every setting that makes the cache content invalid on another process.
+   Leave `include` unset when files of other configurations in the directory
+   are harmless, as with hash-addressed kernel caches. Set it only when they
+   could be mistaken for this identity's files; it then judges locally produced
+   files, and installed files are handled by the receipt.
+2. Register the provider. For vLLM, add it to `_PROVIDERS` in
+   `engines/vllm/framework_caches.py`; the main-model adapter exposes the result
+   as `framework_cache_artifacts`. An SGLang or TRT-LLM adapter sets the same
+   attribute. Both engines' artifact lists already include
+   `framework_cache_entries()`.
+
+No protobuf, server or transport change is needed. A provider that raises is
+skipped without affecting other caches or model loading.
+
+The first provider is vLLM's optional `startup_plan` cache. Its compatibility key
+is fixed before model initialization, since initialization can mutate vLLM's
+native configuration hash. It adds the settings that change the profiled
+KV-cache size but that the native fingerprint omits, such as
+`gpu_memory_utilization`, speculative control settings and draft model/parallel
+hashes. Plans are installed into vLLM's own plan directory; vLLM selects each
+rank's plan and keeps its schema, fingerprint and free-memory checks. No vLLM
+function is replaced. See [vLLM startup plans](DEPLOYMENT.md#vllm-startup-plans).
 
 ### UpdateStatus
 

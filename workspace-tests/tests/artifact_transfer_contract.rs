@@ -181,6 +181,10 @@ fn tensor_payload_also_populates_legacy_tensors_for_old_readers() {
 #[test]
 fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
     assert_eq!(
+        ModelMetadataSpec::source_type_name_from_proto(MxSourceType::FrameworkCache as i32),
+        "framework_cache"
+    );
+    assert_eq!(
         ModelMetadataSpec::source_type_name_from_proto(MxSourceType::TorchCompileCache as i32),
         "torch_compile_cache"
     );
@@ -227,4 +231,24 @@ fn k8s_metadata_contract_carries_artifact_source_type_and_summary() {
     assert_eq!(json["artifactSource"]["fileCount"], 42);
     assert_eq!(json["artifactSource"]["chunkCount"], 4096);
     assert_eq!(json["artifactSource"]["nodeRank"], 2);
+}
+
+#[test]
+fn framework_cache_manifest_keeps_generic_source_type() {
+    let directory = tempfile::TempDir::new().expect("create startup plan cache");
+    fs::write(
+        directory.path().join("startup_plan_abc123.json"),
+        b"{\"schema\":1}",
+    )
+    .expect("write startup plan");
+    let sealed =
+        ArtifactManifest::from_directory(directory.path(), 64, MxSourceType::FrameworkCache as i32)
+            .expect("build framework cache manifest")
+            .seal()
+            .expect("seal framework cache manifest");
+    assert_eq!(sealed.manifest.mx_source_type, 10);
+    assert_eq!(
+        sealed.source_metadata().expect("derive summary").file_count,
+        1
+    );
 }
