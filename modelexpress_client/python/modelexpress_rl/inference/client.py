@@ -78,6 +78,9 @@ class ModelExpressGeneratorConfig:
     object_storage: ObjectStorageGeneratorConfig | None = None
     # Version read from the engine's serving-version API after cold start.
     initial_serving_version_id: str | None = None
+    # Workers sharing a group, such as the ranks of one engine, count as one trainer reader
+    # under the version's max_trainer_readers. Unset counts each worker alone.
+    reader_group: str | None = None
     # Ordered source fallback. Canonical object storage may be used alone or
     # combined with generator P2P in either order.
     source_order: tuple[WeightSource, ...] | None = None
@@ -209,6 +212,13 @@ class StagedWeightHandle:
         return self._update.installation_started and not self._update.applied
 
 
+_READ_SOURCE = {
+    WeightSource.TRAINER: refit_pb2.VERSION_READ_SOURCE_TRAINER,
+    WeightSource.GENERATOR: refit_pb2.VERSION_READ_SOURCE_GENERATOR,
+    WeightSource.OBJECT_STORAGE: refit_pb2.VERSION_READ_SOURCE_OBJECT_STORAGE,
+}
+
+
 class _VersionLease:
     """Keep one version protected through installation or staged release."""
 
@@ -251,6 +261,7 @@ class ModelExpressGeneratorClient:
         self._registration_thread: threading.Thread | None = None
         self._operation_lock = threading.RLock()
         self._active_handle: StagedWeightHandle | None = None
+        self._reader_group = ""
         self._serving_version_id: str | None = None
         self._has_initial_serving_version = False
         self._engine_state = _EngineState.READY
@@ -297,6 +308,7 @@ class ModelExpressGeneratorClient:
         client.server_url = server_url
         client._registration_ttl_seconds = registration_ttl_seconds
         client._lease_ttl_seconds = lease_ttl_seconds
+        client._reader_group = config.reader_group or ""
         client._rpc_timeout_seconds = config.rpc_timeout_seconds
         client._max_replay_chain_length = config.max_replay_chain_length
         if config.staging_buffer_bytes is not None:
@@ -610,12 +622,14 @@ class ModelExpressGeneratorClient:
                 "initial serving version model_name does not match the generator"
             )
 
-    def _register_lease(self, version_id: str):
+    def _register_lease(self, version_id: str, *, source: WeightSource):
         response = self._service.RegisterVersionLease(
             refit_pb2.RegisterVersionLeaseRequest(
                 version_id=version_id,
                 worker_id=self.worker_id,
                 ttl_seconds=self._lease_ttl_seconds,
+                read_source=_READ_SOURCE[source],
+                reader_group=self._reader_group,
             ),
             timeout=self._rpc_timeout_seconds,
         )
@@ -623,10 +637,11 @@ class ModelExpressGeneratorClient:
             raise RuntimeError("MX RegisterVersionLease response is missing lease")
         return response.lease
 
-    def _try_renew_lease(self, version_id: str) -> grpc.StatusCode | None:
-        """Renew one lease and return the RPC failure code, never raising."""
+    def _try_renew_lease(self, version_id: str, *, source: WeightSource) -> grpc.StatusCode | None:
+        """Renew one lease with its read source, so a lapsed trainer read is marked again, and return
+        the RPC failure code, never raising."""
         try:
-            self._register_lease(version_id)
+            self._register_lease(version_id, source=source)
         except grpc.RpcError as error:
             logger.warning("version %s lease renewal failed: %s", version_id, error)
             return error.code()
@@ -634,16 +649,19 @@ class ModelExpressGeneratorClient:
             logger.exception("unexpected version %s lease renewal failure", version_id)
         return None
 
-    def _start_version_lease(self, version_id: str) -> _VersionLease:
+    def _start_version_lease(self, version_id: str, *, source: WeightSource) -> _VersionLease:
+        """Lease ``version_id`` for one update read from ``source``. A trainer read is marked, which the
+        server refuses while the version's max_trainer_readers other reader groups hold a mark;
+        renewals keep the mark and closing the lease clears it."""
         # A restarted MX server loses registrations until the next renewal tick.
         self._register_worker()
-        lease = self._register_lease(version_id)
+        lease = self._register_lease(version_id, source=source)
         stop = threading.Event()
 
         def renew() -> None:
             interval_seconds = max(self._lease_ttl_seconds / 3, 0.1)
             while not stop.wait(interval_seconds):
-                code = self._try_renew_lease(version_id)
+                code = self._try_renew_lease(version_id, source=source)
                 # FAILED_PRECONDITION includes a missing worker registration (e.g. after an
                 # MX restart). RegisterWorker is an idempotent upsert, so it is harmless for
                 # the other causes.
@@ -651,7 +669,7 @@ class ModelExpressGeneratorClient:
                     code is grpc.StatusCode.FAILED_PRECONDITION
                     and self._try_register_worker()
                 ):
-                    self._try_renew_lease(version_id)
+                    self._try_renew_lease(version_id, source=source)
 
         renewal = threading.Thread(
             target=renew,

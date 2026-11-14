@@ -110,6 +110,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
     # ── Generator weight sync ──────────────────────────────────────────────
     "MX_GENERATOR_SOURCE_ORDER": lambda: os.environ.get("MX_GENERATOR_SOURCE_ORDER"),
+    # Generator workers reading one version from the trainer at once; the rest read
+    # it from peers that already installed it. 0 lets every worker read the trainer.
     "AZURE_STORAGE_ACCOUNT_NAME": lambda: (
         os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "").strip() or None
     ),

@@ -51,6 +51,9 @@ succeeds. Mesh-backed trainers
 can release published buffers before version retirement after all reader leases
 drain. Removing a worker or rebinding its endpoint atomically retires its
 publications and rejects the update while those versions have reader leases.
+A mesh-backed version is deleted once it is `RELEASING`, every source has
+unpublished it and no live lease reads it: the next version created on its mesh
+removes it, and so does deleting the mesh.
 `ListWeightVersions` filters by model and optionally mesh, newest first. Mesh-filtered
 listing uses the mesh's version index; metadata reads are pipelined.
 `version_number` is optional caller correlation metadata, not version identity.
