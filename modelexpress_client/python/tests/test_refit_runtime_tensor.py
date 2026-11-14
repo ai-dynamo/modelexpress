@@ -7,6 +7,7 @@ import modelexpress_rl.inference.methods.runtime_tensor as runtime_module
 import pytest
 import torch
 from modelexpress import p2p_pb2
+from modelexpress.types import ManifestMismatchError
 
 from modelexpress_rl import MeshIdentity, WeightPayloadFormat
 from modelexpress_rl.inference.methods import (
@@ -21,10 +22,27 @@ from modelexpress_rl.inference.plan import (
 )
 
 
+_IDENTITY = p2p_pb2.SourceIdentity(
+    model_name="model",
+    mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
+    dtype="bfloat16",
+)
+
+
+def _peer(identity=_IDENTITY):
+    return GeneratorPeerUpdateSource(
+        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
+        mx_source_id="source-1",
+        worker_id="worker-1",
+        identity=identity,
+    )
+
+
 class _Manager:
     bounded_staging = False
 
-    def __init__(self):
+    def __init__(self, accelerator="cuda"):
+        self.accelerator = accelerator
         self.prepared_tensors = None
         self.receive_tensors = None
         self.prepare_calls = 0
@@ -51,6 +69,7 @@ class _Manager:
         }
         manifest = p2p_pb2.GetTensorManifestResponse(
             agent_name="donor", metadata_endpoint="donor:19000",
+            accelerator=self.accelerator,
             tensors=[p2p_pb2.TensorDescriptor(
                 name=name, addr=tensor.data_ptr(), size=tensor.numel() * tensor.element_size(),
                 dtype=str(tensor.dtype), device_id=0,
@@ -78,11 +97,14 @@ class _Manager:
         self.removed.append(agent)
 
 
-def _runtime(monkeypatch, manager, runtime_tensors):
+def _runtime(monkeypatch, manager, runtime_tensors, accelerator="cuda"):
     manager.expected_tensors = runtime_tensors
     monkeypatch.setattr(runtime_module, "prepare_tensor_read", manager.reserve)
     return RuntimeTensorNixlUpdateMethod(
-        manager=manager, device_id=0, runtime_tensors=runtime_tensors,
+        manager=manager,
+        device_id=0,
+        accelerator=accelerator,
+        runtime_tensors=runtime_tensors,
     )
 
 
@@ -103,13 +125,7 @@ def test_runtime_method_defers_direct_receive_until_installation(monkeypatch):
         "model._mx_runtime_buffer": torch.empty(4, dtype=torch.float32),
     }
     method = _runtime(monkeypatch, transfer, runtime_tensors)
-    source = GeneratorPeerUpdateSource(
-        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
-        mx_source_id="source-1",
-        worker_id="worker-1",
-    )
-
-    prepared = method.prepare(version=object(), source=source)
+    prepared = method.prepare(version=object(), source=_peer())
 
     assert isinstance(prepared, PreparedRuntimeTensors)
     assert transfer.prepared_tensors is runtime_tensors
@@ -137,14 +153,7 @@ def test_runtime_method_keeps_pretransfer_failure_recoverable(monkeypatch):
     transfer = _Manager()
     transfer.fail_before_start = True
     method = _runtime(monkeypatch, transfer, {"model.weight": torch.empty(1)})
-    prepared = method.prepare(
-        version=object(),
-        source=GeneratorPeerUpdateSource(
-            worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
-            mx_source_id="source-1",
-            worker_id="worker-1",
-        ),
-    )
+    prepared = method.prepare(version=object(), source=_peer())
 
     with pytest.raises(RuntimeError, match="before transfer"):
         with method.installation_context(prepared):
@@ -158,14 +167,7 @@ def test_runtime_method_reacquires_lease_before_pretransfer_retry(monkeypatch):
     transfer = _Manager()
     transfer.fail_before_start = True
     method = _runtime(monkeypatch, transfer, {"model.weight": torch.empty(1)})
-    prepared = method.prepare(
-        version=object(),
-        source=GeneratorPeerUpdateSource(
-            worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
-            mx_source_id="source-1",
-            worker_id="worker-1",
-        ),
-    )
+    prepared = method.prepare(version=object(), source=_peer())
     first_lease = transfer.lease
 
     with pytest.raises(RuntimeError, match="before transfer"):
@@ -184,14 +186,7 @@ def test_runtime_method_reacquires_lease_before_pretransfer_retry(monkeypatch):
 def test_runtime_method_rejects_retry_after_transfer_started(monkeypatch):
     transfer = _Manager()
     method = _runtime(monkeypatch, transfer, {"model.weight": torch.empty(1)})
-    prepared = method.prepare(
-        version=object(),
-        source=GeneratorPeerUpdateSource(
-            worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
-            mx_source_id="source-1",
-            worker_id="worker-1",
-        ),
-    )
+    prepared = method.prepare(version=object(), source=_peer())
 
     with pytest.raises(RuntimeError, match="install failed"):
         with method.installation_context(prepared):
@@ -207,14 +202,7 @@ def test_runtime_method_rejects_retry_after_transfer_started(monkeypatch):
 def test_runtime_method_releases_reserved_peer_without_apply(monkeypatch):
     transfer = _Manager()
     method = _runtime(monkeypatch, transfer, {"model.weight": torch.empty(1)})
-    prepared = method.prepare(
-        version=object(),
-        source=GeneratorPeerUpdateSource(
-            worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
-            mx_source_id="source-1",
-            worker_id="worker-1",
-        ),
-    )
+    prepared = method.prepare(version=object(), source=_peer())
 
     method.release(prepared)
 
@@ -266,8 +254,6 @@ def test_staged_transfer_requires_capture_layout():
 
 @pytest.mark.parametrize("defect", ["empty", "name", "dtype", "size", "endpoint", "agent"])
 def test_runtime_method_releases_invalid_donor_before_transfer(monkeypatch, defect):
-    from modelexpress.types import ManifestMismatchError
-
     manager = _Manager()
     method = _runtime(monkeypatch, manager, {"weight": torch.zeros(4)})
     reserve = manager.reserve
@@ -288,10 +274,183 @@ def test_runtime_method_releases_invalid_donor_before_transfer(monkeypatch, defe
 
     monkeypatch.setattr(runtime_module, "prepare_tensor_read", invalid_manifest)
     with pytest.raises((RuntimeError, ManifestMismatchError)):
-        method.prepare(version=None, source=GeneratorPeerUpdateSource(
-            worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="donor:9000"),
-            mx_source_id="source", worker_id="worker",
-        ))
+        method.prepare(version=None, source=_peer())
     assert manager.lease.closed
     assert manager.receive_tensors is None
     assert not manager.received_leases
+
+
+def _identity(*, quantization="", dtype="bfloat16", mx_source_type=None):
+    return p2p_pb2.SourceIdentity(
+        model_name="model",
+        mx_source_type=(
+            p2p_pb2.MX_SOURCE_TYPE_WEIGHTS if mx_source_type is None else mx_source_type
+        ),
+        quantization=quantization,
+        dtype=dtype,
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "donor", "quantization", "dtype"),
+    [
+        ("cuda", "cuda", "fp8", "bfloat16"),
+        ("xpu", "xpu", "fp8", "bfloat16"),
+        ("xpu", "cuda", "", "bfloat16"),
+        ("cuda", "xpu", "none", "float16"),
+    ],
+)
+def test_runtime_method_accepts_compatible_donor_accelerator(
+    monkeypatch, target, donor, quantization, dtype
+):
+    manager = _Manager(accelerator=donor)
+    method = _runtime(monkeypatch, manager, {"weight": torch.zeros(4)}, target)
+
+    prepared = method.prepare(
+        version=None,
+        source=_peer(_identity(quantization=quantization, dtype=dtype)),
+    )
+
+    assert manager.lease.closed is False
+    method.release(prepared)
+    assert manager.lease.closed is True
+
+
+@pytest.mark.parametrize(
+    ("target", "donor", "identity"),
+    [
+        pytest.param("xpu", "cuda", _identity(quantization="fp8"), id="cuda-to-xpu-fp8"),
+        pytest.param("cuda", "xpu", _identity(quantization="fp8"), id="xpu-to-cuda-fp8"),
+        pytest.param("xpu", "", _identity(quantization="fp8"), id="unknown-to-xpu-fp8"),
+        pytest.param(
+            "xpu", "cuda", _identity(dtype="float8_e4m3fn"), id="cuda-to-xpu-fp8-dtype"
+        ),
+        pytest.param(
+            "xpu",
+            "cuda",
+            _identity(mx_source_type=p2p_pb2.MX_SOURCE_TYPE_LORA),
+            id="cuda-to-xpu-lora",
+        ),
+    ],
+)
+def test_runtime_method_rejects_incompatible_donor_before_transfer(
+    monkeypatch, target, donor, identity
+):
+    manager = _Manager(accelerator=donor)
+    method = _runtime(monkeypatch, manager, {"weight": torch.zeros(4)}, target)
+
+    with pytest.raises(ManifestMismatchError, match="accelerator is incompatible"):
+        method.prepare(version=None, source=_peer(identity))
+
+    assert manager.lease.closed is True
+    assert manager.received_leases == []
+    assert manager.receive_tensors is None
+
+
+def test_runtime_method_prepares_next_peer_after_accelerator_rejection(monkeypatch):
+    manager = _Manager(accelerator="cuda")
+    runtime_tensors = {"weight": torch.zeros(4)}
+    method = _runtime(monkeypatch, manager, runtime_tensors, "xpu")
+    identity = _identity(quantization="fp8")
+
+    with pytest.raises(ManifestMismatchError):
+        method.prepare(version=None, source=_peer(identity))
+    rejected_lease = manager.lease
+
+    manager.accelerator = "xpu"
+    prepared = method.prepare(version=None, source=_peer(identity))
+    with method.installation_context(prepared):
+        pass
+
+    assert rejected_lease.closed is True
+    assert manager.prepare_calls == 2
+    assert manager.received_leases == [manager.lease]
+    assert manager.receive_tensors is runtime_tensors
+    method.close()
+
+
+def test_runtime_method_rechecks_accelerator_on_reacquired_lease(monkeypatch):
+    manager = _Manager(accelerator="xpu")
+    manager.fail_before_start = True
+    method = _runtime(monkeypatch, manager, {"weight": torch.zeros(4)}, "xpu")
+    prepared = method.prepare(
+        version=None, source=_peer(_identity(quantization="fp8"))
+    )
+    with pytest.raises(RuntimeError, match="before transfer"):
+        with method.installation_context(prepared):
+            pass
+
+    manager.fail_before_start = False
+    manager.accelerator = "cuda"
+    with pytest.raises(ManifestMismatchError, match="accelerator is incompatible"):
+        with method.installation_context(prepared):
+            pass
+
+    assert manager.prepare_calls == 2
+    assert manager.lease.closed is True
+    assert len(manager.received_leases) == 1
+    assert manager.receive_tensors is None
+    assert method.mutated_during_installation_context(prepared) is False
+
+
+def test_generator_resolver_attaches_the_discovery_identity():
+    from modelexpress_rl.inference.source.generator import GeneratorSourceResolver
+
+    identity = _identity(quantization="fp8")
+    client = SimpleNamespace(
+        list_sources=lambda **kwargs: p2p_pb2.ListSourcesResponse(
+            instances=[
+                p2p_pb2.SourceInstanceRef(
+                    mx_source_id="source-1", worker_id="peer", worker_rank=0
+                )
+            ]
+        ),
+        get_metadata=lambda **kwargs: p2p_pb2.GetMetadataResponse(
+            found=True,
+            worker=p2p_pb2.WorkerMetadata(
+                worker_rank=0, worker_grpc_endpoint="peer:9000"
+            ),
+        ),
+    )
+    built = []
+
+    def build_identity(version_id):
+        built.append(version_id)
+        return identity
+
+    resolver = GeneratorSourceResolver(
+        p2p_client=client,
+        worker_id="self",
+        worker_rank=0,
+        build_identity=build_identity,
+    )
+
+    (source,) = resolver.candidates(SimpleNamespace(version_id="v1"))
+
+    assert source.identity is identity
+    assert built == ["v1"]
+
+
+def test_generator_runtime_passes_the_engine_accelerator():
+    from modelexpress_rl.inference.runtime import (
+        FullTensorEngineCapability,
+        _create_runtime_tensor_method,
+    )
+
+    capability = FullTensorEngineCapability(
+        device_id=0,
+        device=torch.device("cuda", 0),
+        worker_rank=0,
+        capture_layout=lambda: None,
+        generator_fingerprint=lambda: (),
+        runtime_tensors={"weight": torch.zeros(1)},
+        source_worker_id="self",
+        unpublish_runtime_tensors=lambda: None,
+        publish_runtime_tensors=lambda _version: None,
+        build_identity=lambda _version: _IDENTITY,
+        nixl_manager=object(),
+    )
+
+    method = _create_runtime_tensor_method(capability=capability)
+
+    assert method._accelerator == "cuda"

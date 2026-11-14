@@ -1249,7 +1249,15 @@ Active refit of a generator that publishes runtime tensors requires this default
 
 Generator-to-generator active refit validates the peer first, then receives
 directly into the target's registered live runtime tensors at the engine safe
-point. It does not allocate a second model-sized GPU buffer. If that direct
+point. Validation of each acquired lease, including the fresh lease of a
+pre-transfer retry, applies the shared `accelerators_compatible()` policy to
+the donor's `GetTensorManifest` accelerator and the identity the peer was
+discovered under. Quantized weights require the same known accelerator family;
+unquantized weights may cross between CUDA and XPU. A rejected donor's lease is
+closed before any transfer. A rejection during preparation makes the session
+try the next peer or source; a rejection of a pre-transfer retry's fresh lease
+during apply is raised to the caller, which must release and restage the
+update. It does not allocate a second model-sized GPU buffer. If that direct
 transfer fails after mutation starts, ModelExpress marks the engine state
 uncertain; reset or restart the worker before serving or retrying. For vLLM
 eager execution, peer refit refreshes the recognized host-scale state and

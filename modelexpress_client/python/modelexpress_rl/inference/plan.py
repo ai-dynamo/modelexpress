@@ -91,6 +91,9 @@ class GeneratorPeerUpdateSource:
     worker: p2p_pb2.WorkerMetadata
     mx_source_id: str
     worker_id: str
+    # Identity the peer was discovered under; its source type, quantization and
+    # dtype decide which donor accelerator families are compatible.
+    identity: p2p_pb2.SourceIdentity
     kind = WeightSource.GENERATOR
     payload_format = WeightPayloadFormat.FULL_TENSOR
 
