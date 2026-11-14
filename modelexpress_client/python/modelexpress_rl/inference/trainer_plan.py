@@ -124,6 +124,13 @@ class TrainerTransferPlan:
             raise IncompleteRefit("trainer transfer requires ordered source replay")
         if plan.replay_id != capture.replay_id:
             raise IncompleteRefit("trainer transfer belongs to a different captured replay plan")
+        if capture.loader_replay:
+            # vLLM's loader places the staged sources; installation checks its coverage.
+            if plan.fallback:
+                raise IncompleteRefit(
+                    f"loader refit could not stage {len(plan.fallback)} sources: {list(plan.fallback)[:10]}"
+                )
+            return
         for copy in capture.copies:
             shape, dtype = parameter_layout.get(copy.param_name, ((), None))
             owner_shape, owner_stride = capture.destination_layouts.get(

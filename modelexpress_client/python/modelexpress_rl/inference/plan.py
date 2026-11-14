@@ -214,6 +214,19 @@ class PreparedStreamingTensors(PreparedArtifact):
 
     def apply(self, install: Callable[[Any], None]) -> None:
         """Retain and fence each borrowed batch before advancing its source."""
+        commit_s = 0.0
+        for batch in self.batches():
+            started = time.perf_counter()
+            install(batch)
+            self._release_batch()
+            commit_s += time.perf_counter() - started
+        self.transfer_metrics["install_commit_s"] = commit_s
+
+    def batches(self) -> Iterator[Any]:
+        """Yield each borrowed batch, fencing and releasing it before the next is read.
+
+        A consumer that keeps a batch's tensors past advancing must copy them first.
+        """
         if self._drain is None:
             raise RuntimeError("stream consumption requires the installation context")
         if self._uncertain:
@@ -224,22 +237,17 @@ class PreparedStreamingTensors(PreparedArtifact):
             except BaseException:
                 self._uncertain = True
                 raise
-        commit_s = 0.0
         while True:
             self._release_batch()
             try:
                 self._batch = next(self._iterator)
             except StopIteration:
-                self.transfer_metrics["install_commit_s"] = commit_s
                 return
             except BaseException:
                 # A GPU fence cannot establish completion of a failed RDMA read.
                 self._uncertain = True
                 raise
-            started = time.perf_counter()
-            install(self._batch)
-            self._release_batch()
-            commit_s += time.perf_counter() - started
+            yield self._batch
 
     def _release_batch(self) -> None:
         if self._batch is not None:

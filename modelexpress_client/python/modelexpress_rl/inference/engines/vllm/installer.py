@@ -35,7 +35,12 @@ from modelexpress_rl.refit.reshard.geometry import (
     convert_source_weights,
     overlapping_destination_groups,
 )
-from modelexpress_rl.refit.reshard.types import IncompleteRefit
+from modelexpress_rl.refit.reshard.slice_plan import _row_major_strides
+from modelexpress_rl.refit.reshard.types import (
+    CaptureResult,
+    IncompleteRefit,
+    RecordedCopy,
+)
 from modelexpress_rl.refit.timing import refit_span
 
 from modelexpress_rl import envs as rl_envs
@@ -71,7 +76,6 @@ from modelexpress_rl.utils import index_checkpoint_tensors
 
 if TYPE_CHECKING:
     from modelexpress_rl.inference.streaming_checkpoint import StreamedCheckpoint
-    from modelexpress_rl.refit.reshard.types import CaptureResult
     from torch.nn import Module
     from vllm.config import ModelConfig, VllmConfig
 
@@ -98,6 +102,22 @@ _MODULE_GETATTR = torch.nn.Module.__getattr__
 _MODULE_GET_SUBMODULE = torch.nn.Module.get_submodule
 _MODULE_SETATTR = torch.nn.Module.__setattr__
 _MODULE_REGISTER_PARAMETER = torch.nn.Module.register_parameter
+
+
+def _rows_read(root: torch.Tensor, views) -> range | None:
+    """The leading-dim rows of ``root`` that ``views`` read, when every one is a view
+    of it and some rows go unread; otherwise ``None``."""
+    if root.dim() == 0 or any(view._base is not root for view in views):
+        return None
+    row = root.stride(0)
+    first = min(view.storage_offset() for view in views) // row
+    last = max(
+        view.storage_offset() + sum((size - 1) * stride for size, stride in zip(view.shape, view.stride()))
+        for view in views
+    ) // row
+    if first == 0 and last == root.shape[0] - 1:
+        return None
+    return range(first, last + 1)
 
 
 def _tensor_geometry(tensor):
@@ -336,6 +356,7 @@ class _VllmInstaller(EngineInstaller):
         device: torch.device,
         convert_native_to_hf: Callable[[dict], dict] | None = None,
         runtime_tensors: dict[str, torch.Tensor] | None = None,
+        install_through_loader: bool = False,
     ) -> None:
         self._model = model
         self._vllm_config = vllm_config
@@ -343,12 +364,15 @@ class _VllmInstaller(EngineInstaller):
         self._device = device
         self._convert_native_to_hf = convert_native_to_hf
         self._runtime_tensors = runtime_tensors
+        self._install_through_loader = install_through_loader
         # Version whose checkpoint bytes the engine holds; None when unknown.
         self._live_version: str | None = None
         self._debug_validate_generator_layout = (
             rl_envs.MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT
         )
         self.source_install_plan = None
+        # (cache key, (capture, staging layout)) of the sources vLLM's own loader installs.
+        self._loader_replay: tuple[tuple, tuple[CaptureResult, dict], dict[str, list]] | None = None
         self._tied_input_peak_bytes = 0
 
     @cached_property
@@ -607,6 +631,8 @@ class _VllmInstaller(EngineInstaller):
                 len(cached.capture_result[0].copies),
             )
             return copy.deepcopy(cached.capture_result)
+        if self._install_through_loader:
+            return self._loader_capture(manifest, gen_key)
         self.source_install_plan = None
         self.__dict__.pop("_reload_plan", None)
         try:
@@ -693,10 +719,130 @@ class _VllmInstaller(EngineInstaller):
         )
         return capture, param_layout
 
+    def _loader_capture(
+        self,
+        manifest: list[tuple[str, torch.dtype, tuple[int, ...]]],
+        gen_key: tuple,
+    ) -> tuple[CaptureResult, dict[str, tuple[tuple[int, ...], torch.dtype]]]:
+        """Stage only the rows of each source that this rank's vLLM loader keeps.
+
+        The trainer's converter runs on meta tensors. When every weight vLLM's
+        checkpoint filter keeps from a source is a view of it, as with per-expert
+        weights of stacked experts, only the rows they read are staged and
+        installation rebuilds the views on them. Other sources are staged whole
+        and converted at install; a source the filter drops entirely is never read.
+        """
+        from vllm.config import set_current_vllm_config
+
+        key = (gen_key, tuple(manifest))
+        if self._loader_replay is None or self._loader_replay[0] != key:
+            to_hf = self._convert_native_to_hf or dict
+            with set_current_vllm_config(self._vllm_config):
+                other_ranks = self._other_ranks_expert_filter()
+            copies, layout, source_to_views = [], {}, {}
+            for name, dtype, shape in manifest:
+                root = torch.empty(shape, dtype=dtype, device="meta")
+                kept = {hf_name: view for hf_name, view in to_hf({name: root}).items() if not other_ranks(hf_name)}
+                if not kept:
+                    continue
+                rows = _rows_read(root, kept.values())
+                staged_shape = tuple(shape) if rows is None else (len(rows), *shape[1:])
+                op_chain = () if rows is None else (("narrow", (0, rows.start, len(rows)), ()),)
+                if rows is not None:
+                    source_to_views[name] = [
+                        (hf_name, tuple(view.shape), view.stride(), view.storage_offset() - rows.start * root.stride(0))
+                        for hf_name, view in kept.items()
+                    ]
+                copies.append(
+                    RecordedCopy(name, op_chain, name, 0, staged_shape, tuple(_row_major_strides(staged_shape)), dtype)
+                )
+                layout[name] = (tuple(shape), dtype)
+            capture = CaptureResult(
+                copies=copies,
+                generator_fingerprint=gen_key,
+                source_replay=True,
+                loader_replay=True,
+            )
+            self._loader_replay = (key, (capture, layout), source_to_views)
+        return copy.deepcopy(self._loader_replay[1])
+
+    @torch.no_grad()
+    def _load_staged_sources(self, prepared: PreparedStreamingTensors | SourceReplayBatch) -> None:
+        """Install a version through vLLM's own reload, as a checkpoint reload does.
+
+        Staged batches stream into one ``load_weights`` call between vLLM's
+        ``initialize_layerwise_reload`` and ``finalize_layerwise_reload``, and nothing
+        else touches the model: vLLM processes each layer as its last weight arrives
+        and restores its kernel tensors in place. Every weight is copied to the device
+        before vLLM sees it, so nothing vLLM keeps aliases a staging arena that the
+        stream reuses. Other ranks' experts are dropped first, as vLLM's checkpoint
+        loader does.
+        """
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload.layerwise import (
+            finalize_layerwise_reload,
+            initialize_layerwise_reload,
+        )
+
+        assert self._loader_replay is not None
+        replay_id = self._loader_replay[1][0].replay_id
+        source_to_views = self._loader_replay[2]
+        if prepared.replay_id != replay_id:
+            raise IncompleteRefit("staged sources belong to a different loader replay plan")
+        to_hf = self._convert_native_to_hf or dict
+        streamed = not isinstance(prepared, SourceReplayBatch)
+
+        def weights(other_ranks: Callable[[str], bool]):
+            for batch in prepared.batches() if streamed else (prepared,):
+                if batch.replay_id != replay_id:
+                    raise IncompleteRefit("staged sources belong to a different loader replay plan")
+                whole = {}
+                for _, write, source in batch.writes:
+                    views = source_to_views.get(write.src_name)
+                    if views is None:
+                        whole[write.src_name] = source
+                        continue
+                    for name, shape, stride, offset in views:
+                        view = source.as_strided(shape, stride, source.storage_offset() + offset)
+                        yield name, view.to(self._device, copy=True)
+                for name, tensor in to_hf(whole).items():
+                    if not other_ranks(name):
+                        yield name, tensor.to(self._device, copy=True)
+
+        def reload() -> None:
+            with torch.device(self._device), set_current_vllm_config(self._vllm_config):
+                initialize_layerwise_reload(self._model)
+                # vLLM computes expert ownership from the current config.
+                self._model.load_weights(weights(self._other_ranks_expert_filter()))
+                finalize_layerwise_reload(self._model, self._model_config)
+
+        if streamed:
+            with prepared.consume(self._drain_streaming):
+                reload()
+        else:
+            reload()
+        with refit_span("post_install"):
+            self._synchronize()
+
+    def _other_ranks_expert_filter(self) -> Callable[[str], bool]:
+        """vLLM's own test for a checkpoint expert weight another EP rank owns."""
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+        from vllm.model_executor.model_loader.ep_weight_filter import should_skip_weight
+
+        load_config = copy.copy(self._vllm_config.load_config)
+        object.__setattr__(load_config, "load_format", "safetensors")
+        loader = DefaultModelLoader(load_config)
+        loader._init_ep_weight_filter(self._model_config)
+        local_expert_ids = loader.local_expert_ids
+        return lambda name: should_skip_weight(name, local_expert_ids)
+
     def install_tensors(self, tensors: SourceReplayBatch) -> None:
         """Replay verified source writes without changing graph addresses."""
         if not isinstance(tensors, SourceReplayBatch):
             raise IncompleteRefit("vLLM installation requires ordered source replay")
+        if self._install_through_loader:
+            self._load_staged_sources(tensors)
+            return
 
         captured = self._captured_source_plan()
 
@@ -721,6 +867,9 @@ class _VllmInstaller(EngineInstaller):
     @torch.no_grad()
     def install_streaming(self, prepared: PreparedStreamingTensors) -> None:
         """Replay source writes into engine storage before arena reuse."""
+        if self._install_through_loader:
+            self._load_staged_sources(prepared)
+            return
         metrics = prepared.transfer_metrics
         load_s = 0.0
         live_storages = {

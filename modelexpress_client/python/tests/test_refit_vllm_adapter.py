@@ -151,6 +151,7 @@ def test_vllm_engine_runtime_exposes_installation_and_full_tensor_geometry(
         "model_config": config.model_config,
         "device": torch.device("cuda:2"),
         "convert_native_to_hf": convert_native_to_hf,
+        "install_through_loader": False,
     }
     expected_runtime_tensors = (
         {"weight": model.weight} if runtime_p2p_available else None

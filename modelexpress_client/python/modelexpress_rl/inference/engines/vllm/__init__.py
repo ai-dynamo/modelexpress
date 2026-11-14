@@ -52,6 +52,7 @@ def _create_vllm_engine_runtime(
         device=engine.get_target_device(),
         convert_native_to_hf=engine_context.convert_native_to_hf,
         runtime_tensors=runtime_tensors,
+        install_through_loader=engine_context.install_through_loader,
     )
 
     def build_identity(version_id: str):
