@@ -588,9 +588,11 @@ class VllmAdapter(EngineAdapter):
         return result
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
+        self._release_loader_cache()
         return self._process_weights_after_loading(result)
 
     def after_native_load(self, result: LoadResult) -> LoadResult:
+        self._release_loader_cache()
         return self._process_weights_after_loading(result)
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
@@ -626,18 +628,41 @@ class VllmAdapter(EngineAdapter):
         self,
         result: LoadResult,
     ) -> LoadResult:
+        """Run the post-load steps of vLLM's ``BaseModelLoader.load_model``.
+
+        ModelExpress loads through the standalone ``load_weights`` API, so it
+        also runs the layerwise finalizer that native loading applies to online
+        quantized models. Without it, post-load processing can receive Meta
+        tensors.
+        """
         if result.model is None:
             raise RuntimeError("vLLM post-load processing requires result.model")
 
+        from vllm.model_executor.model_loader.base_loader import _has_online_quant
+        from vllm.model_executor.model_loader.reload import (
+            finalize_layerwise_processing,
+        )
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
         with capture_tensor_attrs(self.accelerator_backend):
+            if _has_online_quant(result.model):
+                finalize_layerwise_processing(result.model, self.model_config)
             process_weights_after_loading(
                 result.model,
                 self.model_config,
                 self.target_device,
             )
         return result
+
+    def _release_loader_cache(self) -> None:
+        """Release allocator blocks cached by checkpoint loading.
+
+        Native vLLM does this between ``load_weights`` and post-processing.
+        RDMA target preparation skips it and releases the cache only after a
+        successful receive.
+        """
+        gc.collect()
+        self.accelerator_backend.empty_cache()
 
     def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
         if result.model is None:
