@@ -80,6 +80,23 @@ def test_copy_preserves_per_tensor_dtype_and_warm_buffers(
     assert len(manager.registered) == 1
 
 
+def test_copy_serves_integer_state_exactly_as_held(dist_ready, monkeypatch):
+    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    _mock_host_allocation_without_cuda(monkeypatch)
+    manager = _Manager()
+    adapter = FSDPTrainerAdapter(manager=manager, nixl_metadata_endpoint="host:1234")
+    # A hash router's token-to-expert table: the bf16 wire default would corrupt expert ids.
+    table = torch.tensor([[3, 70001], [255, 1]], dtype=torch.int64)
+
+    staged = _stage(adapter, {"tid2eid": table, "w": torch.ones(2)}, TrainerStagingMode.COPY_TO_HOST)
+    staged.publish_ready.wait()
+
+    served = {key.split("__", 3)[-1]: value for key, value in manager.registered[0].items()}
+    published = {t.name: t for t in unwrap_rendezvous_blob(staged.metadata.data).tensors}
+    assert (served["tid2eid"].dtype, served["tid2eid"].tolist()) == (torch.int64, table.tolist())
+    assert (published["tid2eid"].dtype, published["tid2eid"].elsize) == ("torch.int64", 8)
+
+
 def test_in_place_accepts_fp32_override(dist_ready):
     adapter = FSDPTrainerAdapter(
         manager=_Manager(),
