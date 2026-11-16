@@ -49,6 +49,7 @@ from modelexpress_rl.collective.integrations._common import (
 )
 from modelexpress_rl.collective.integrations.miles import CollectiveTopology
 from modelexpress_rl.collective.plan import plan_digest
+from tests.test_collective_client import install_fake_m2n_handles
 
 
 @pytest.fixture(autouse=True)
@@ -605,6 +606,7 @@ class _FakeWire:
 def fake_wire(monkeypatch):
     holder = {}
     module = ModuleType("nccl.m2n")
+    install_fake_m2n_handles(module)
     module.reshard = lambda src, dst, handle, **kw: holder["wire"].reshard(
         src, dst, handle, **kw
     )
