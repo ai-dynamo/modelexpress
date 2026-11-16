@@ -193,9 +193,9 @@ def _install_fakes(miles_protocol, rank, scenario, record):
 def _run(rank, scenario, record, world, tp):
     from modelexpress_rl.collective.integrations import miles_protocol
 
-    if scenario == "stacked_reconnect":
+    if scenario.startswith("stacked_"):
         os.environ["MX_NCCL_REFIT_STACK_BYTES"] = str(1 << 20)
-        scenario = "reconnect"
+        scenario = scenario.removeprefix("stacked_")
     _install_fakes(miles_protocol, rank, scenario, record)
     dp_rank, tp_rank = divmod(rank, tp)
     dp = world // tp
@@ -223,6 +223,14 @@ def _run(rank, scenario, record, world, tp):
             raise AssertionError("stack allocation preceded stacking agreement")
 
         miles_protocol._stack_trainer_buffers = unexpected_allocation
+    if scenario in ("derivation_preflight_fails", "reuse_state_preflight_fails"):
+        original_allocation = miles_protocol._stack_trainer_buffers
+
+        def record_allocation(*args, **kwargs):
+            record["stack_allocations"] = record.get("stack_allocations", 0) + 1
+            return original_allocation(*args, **kwargs)
+
+        miles_protocol._stack_trainer_buffers = record_allocation
     protocol = miles_protocol.MilesCollectiveProtocolCore(SimpleNamespace())
     protocol.connect(
         [SimpleNamespace(name="original")],
@@ -285,9 +293,13 @@ def _run(rank, scenario, record, world, tp):
         "reuse_world_preflight_fails",
         "mesh_preflight_fails",
         "reuse_topology_preflight_fails",
+        "derivation_preflight_fails",
+        "reuse_state_preflight_fails",
     )
     versions = (1, 2, 3, 4) if scenario == "reconnect" else (1, 2)
     for version in versions:
+        if rank == 1 and version == 2 and scenario == "reuse_state_preflight_fails":
+            protocol._plan = None
         if rank == 1 and version == 2 and scenario in (
             "reuse_world_preflight_fails", "reuse_topology_preflight_fails",
         ):
@@ -354,6 +366,12 @@ def _run(rank, scenario, record, world, tp):
         try:
             if fault:
                 with patch.object(torch.Tensor, method, fail_staging):
+                    protocol.begin_sync(version, iter_buckets)
+            elif rank == 1 and scenario == "derivation_preflight_fails":
+                with patch.object(
+                    miles_protocol, "_derive_wire_plan",
+                    side_effect=ValueError("synthetic stack derivation failure"),
+                ):
                     protocol.begin_sync(version, iter_buckets)
             elif rank == 1 and scenario == "mesh_preflight_fails":
                 with patch.object(
@@ -754,9 +772,11 @@ def test_preparation_failure_drains_the_collective_iterator_on_every_rank(
 @pytest.mark.parametrize(
     "scenario,version", [("publish_fails", 1), ("reuse_publish_fails", 2)]
 )
+@pytest.mark.parametrize("stacked", [False, True])
 def test_publish_failure_stops_every_rank_before_updater_post_stream_barrier(
-    tmp_path, scenario, version
+    tmp_path, scenario, version, stacked
 ):
+    scenario = f"stacked_{scenario}" if stacked else scenario
     records = _launch(tmp_path, scenario, world=2, tp=1, timeout_s=5)
 
     for record in records:
@@ -808,6 +828,36 @@ def test_contract_preflight_failure_reaches_every_rank_before_contract_collectiv
             for action in record["generator_actions"]
         )
     assert message in records[1]["cause"]
+
+
+@pytest.mark.parametrize(
+    "scenario,version,message",
+    [
+        ("derivation_preflight_fails", 1, "synthetic stack derivation failure"),
+        ("reuse_state_preflight_fails", 2, "whether the frozen plan is reusable"),
+    ],
+)
+def test_stacked_contract_preflight_agrees_before_any_conditional_collective(
+    tmp_path, scenario, version, message
+):
+    records = _launch(tmp_path, f"stacked_{scenario}", timeout_s=5)
+
+    assert len({record["error"] for record in records}) == 1
+    for record in records:
+        assert record["error_type"] == "RuntimeError", record.get("traceback")
+        assert "contract preflight failed" in record["error"]
+        assert message in record["error"]
+        assert record["failure_elapsed_s"] < 3
+        assert record["rounds"] == version - 1
+        assert record.get("stack_allocations", 0) == version - 1
+        assert record["round_version_after_failure"] is None
+        assert record["buffers_unchanged"] is True
+        assert record.get("post_stream_barriers", []) == list(range(1, version))
+        assert [step for step in record["iterator_steps"] if step[0] == version] == [
+            [version, index] for index in range(len(_SHAPES))
+        ]
+
+
 def test_a_publish_failure_fails_send_bucket_on_every_rank(tmp_path):
     # _launch's wall deadline is the no-hang guard; below, the failure vote.
     records = _launch(tmp_path, "publish_rank3_fails")
