@@ -2215,7 +2215,9 @@ type PublishMetadataRequest struct {
 	Worker *WorkerMetadata `protobuf:"bytes,2,opt,name=worker,proto3" json:"worker,omitempty"`
 	// Unique identifier for this running instance (UUID).
 	// Differentiates multiple replicas with identical SourceIdentity.
-	// If empty, the server rejects the request.
+	// At most 63 bytes of lowercase alphanumerics, '-' and '.', where every
+	// dot-separated segment starts and ends with an alphanumeric. A UUID
+	// satisfies this. The server rejects an empty or non-conforming value.
 	WorkerId string `protobuf:"bytes,3,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
 	// Kubernetes pod name of the calling worker, set via the downward API.
 	// Used with pod_uid and pod_namespace to set an ownerReference on the
