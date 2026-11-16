@@ -2241,6 +2241,7 @@ def _failure_close_protocol(monkeypatch, executions, waits):
     monkeypatch.setattr(miles_protocol.dist, "is_available", lambda: True)
     monkeypatch.setattr(miles_protocol.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(miles_protocol.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(miles_protocol.dist, "get_world_size", lambda: 1)
     # A frozen clock makes the remaining-time arithmetic exact.
     monkeypatch.setattr(miles_protocol.time, "monotonic", lambda: 100.0)
     return protocol, tensors
