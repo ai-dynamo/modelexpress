@@ -31,7 +31,8 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 | `MX_S3_DOWNLOAD_BACKEND` | `transfer_manager` | Canonical S3 artifact downloader: `transfer_manager` or opt-in `preallocated`. See [transfer tuning](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning) for compatibility and memory requirements. |
 | `MX_REFIT_DOWNLOAD_WORKERS` | `MX_S3_DOWNLOAD_WORKERS`, then `16` | Concurrent shard downloads for S3 and Azure; also sets the per-client S3 data GET concurrency for either backend. |
 | `MX_S3_DOWNLOAD_WORKERS` | `16` | Legacy fallback when `MX_REFIT_DOWNLOAD_WORKERS` is unset. |
-| `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum format written by canonical S3 trainers. |
+| `MX_REFIT_UPLOAD_WORKERS` | `MX_S3_UPLOAD_WORKERS`, then `8` | Concurrent full-checkpoint shard uploads for S3 and Azure. S3 multipart concurrency still uses `MX_S3_UPLOAD_WORKERS`. |
+| `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum format written by canonical S3 and Azure trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object; oversized tensors occupy a separate object. |
 | `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the destination modules touched by the delta chain instead of the whole prepared checkpoint. Falls back to a full reload when lineage or the live version is unknown, or when a fed module is incomplete. See the [S3 delta refit guide](S3_DELTA_WEIGHT_REFIT.md). |
 | `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
@@ -43,6 +44,8 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 
 The selected download worker count must be a positive integer. An invalid
 `MX_REFIT_DOWNLOAD_WORKERS` value fails validation without falling back.
+`MX_REFIT_UPLOAD_WORKERS` also requires a positive integer and does not fall back
+when explicitly set to an invalid value.
 `MX_S3_MAX_POOL_CONNECTIONS` separately controls the Botocore HTTP connection pool.
 Azure's per-blob concurrency and connection pool remain controlled by
 `MX_AZURE_DOWNLOAD_CONCURRENCY` and `MX_AZURE_MAX_POOL_CONNECTIONS`.
@@ -81,15 +84,20 @@ the field is omitted. For S3, `object_storage_endpoint_url` and
 to use the S3 default. Miles uses `object_storage_uri_prefix` for trainer
 publication. See the [backend setup examples](S3_DELTA_WEIGHT_REFIT.md).
 
-Azure generator reads require the Python `azure` extra and `az://container/blob`
+Azure reads and trainer writes require the Python `azure` extra and `az://container/blob`
 sources. Authentication uses `AZURE_STORAGE_CONNECTION_STRING` first. Otherwise,
 set `AZURE_STORAGE_ACCOUNT_URL` or `AZURE_STORAGE_ACCOUNT_NAME` and use
 `DefaultAzureCredential`, including managed identity or AKS workload identity.
 Azure rejects `object_storage_endpoint_url` and `object_storage_region_name`.
 The server accepts Azure publications, and generators support full checkpoints
 and XOR delta replay during live updates and exact desired-version startup.
-The trainer SDK still publishes only to S3. An external producer must upload
-Azure artifacts before marking the registered version `READY`.
+For trainer publication, set `ObjectStorageConfig.storage_type=ObjectStorageType.AZURE`
+and an `az://container/prefix` in `uri_prefix`. Keep `WRITE_TO_STORAGE` and
+`XOR_DELTA` in the trainer configuration; individual registered versions can be
+full checkpoints or XOR deltas. The SDK rejects S3 `endpoint_url` and `region_name`
+fields for Azure. The orchestrator marks a version `READY` only after all trainer
+ranks complete publication. See the shared retry limits in the
+[trainer publication lifecycle](ARCHITECTURE.md).
 
 Upgrade every serving ModelExpress server replica before publishing Azure
 versions. Older replicas read only the S3 mirror and cannot consume Azure sources.

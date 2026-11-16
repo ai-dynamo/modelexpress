@@ -168,6 +168,14 @@ partial, or cross-namespace identity does not block publication; ModelExpress
 omits the owner reference and retains the previous reaper-based lifecycle. Redis
 and non-Kubernetes deployments ignore these fields.
 
+With [ServiceAccount authentication](#serviceaccount-authentication) enabled, a
+complete identity is also checked against the caller's verified token. A
+`POD_NAMESPACE` that differs from the ServiceAccount's namespace, or a
+`POD_NAME`/`POD_UID` that differs from the pod the token is bound to, rejects
+the publish. A token with no bound pod cannot confirm the claim, so the record is
+published without an owner reference. Partial identity is not checked and
+behaves as above.
+
 #### Storage access modes
 
 MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY`, default `./cache`). Its access-mode requirement depends on deployment topology, not on MX itself:
@@ -853,7 +861,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_METRICS_BIND_RETRY_SECS` | `15` | How often a rank that lost the `/metrics` bind re-attempts it, so endpoint ownership migrates when the current owner exits. |
 | `MX_METRICS_SOURCE_ID_LABEL` | `0` | Restore the per-peer `source_worker_id` label on `mx_p2p_source_selections_total`, for comparing source-selection policies; it likewise gates the label on `mx_p2p_source_load`. **Benchmark runs only:** the id is `uuid4().hex[:8]` minted per process, so its label domain grows with process count over time rather than with cluster size. Point such a run at a throwaway Prometheus. |
 | `MX_METRICS_SCHEME` | `""` | Optional run/scheme label, so multiple runs compare on one dashboard. On the client it is a label on `mx_build_info` **and** on every `mx_p2p_*` family; on the server it is on `mx_build_info` only. |
-| `MX_POOL_REG` | `0` | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
+| `MX_POOL_REG` | `1` (`0` with `MX_VMM_ARENA=1`) | Allocation-level NIXL registration via `cuMemGetAddressRange`. Registers each unique cudaMalloc block instead of each tensor, typically 80-99% fewer registrations, without changing transfer semantics. `MX_VMM_ARENA=1` uses direct arena registration and does not require pool-reg. |
 | `MX_VMM_ARENA` | `0` | Route weight allocations into a CUDA VMM arena via PyTorch's `CUDAPluggableAllocator`, then register the used arena range as one NIXL MR with dmabuf at end-of-load. Reserves 16.0 TiB of VA by default, with no physical commit until allocations are mapped. Requires the `modelexpress.vmm._alloc_ext` C extension to have built at install time; if it did not, this flag is a no-op with a warning and the loader falls back to the pool-reg path. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `MX_ARENA_SINGLE_MR` | `0` | Keep single-MR arena registration even when the arena spans several `cuMemCreate` handles. Only safe on transports that can register across handles (dmabuf/IB); cuda_ipc cannot, so the default falls back to per-tensor registration. See [VMM Arena](#vmm-arena-single-mr-registration). |
 | `UCX_CUDA_COPY_REG_WHOLE_ALLOC` | (UCX default) | Set to `off` with `MX_VMM_ARENA=1` on any UCX predating the `cuda_copy_md` length-truncation fix (openucx/ucx#11461). Scoped to the `cuda_copy` transport; it does not affect `cuda_ipc`. |
@@ -877,7 +885,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_MOONCAKE_CONFIG_PATH` | (unset) | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback. |
 | `MX_P2P_COLD_START` | `0` | Opt in to lease-coordinated concurrent cold starts with vLLM and a centralized Redis-backed MX server. Supports fixed non-elastic TP, PP, DP, EP and speculative decoding. TP, DP and PP have been validated on GPUs; EP has not. Prefill or decode context parallelism greater than one is rejected by the opt-in path; reload, sleep/wake and elastic EP are unsupported. |
 | `MX_P2P_COLD_START_WAIT_TIMEOUT_SECS` | `600` | Maximum time in seconds for cold-start donor discovery and election before skipping RDMA and continuing with the remaining load strategies. Also caps total donor lease renewal time from acquisition. Must be positive and less than 1500 seconds; invalid values use the default. This leaves a margin below the default 1800-second Gloo timeout, but deployments with a shorter CPU process-group timeout must configure a shorter MX wait. |
-| `MX_ARTIFACT_READY_URL` | Framework default for bundles; unset for vLLM weight publication | Readiness endpoint used before preparing and publishing cache artifact bundles. For vLLM weight metadata, readiness is gated only when explicitly configured. Bundle readiness defaults to `http://127.0.0.1:8000/health` for vLLM and `http://127.0.0.1:30000/health` for SGLang. See [Multi-node readiness](#multi-node-readiness). |
+| `MX_ARTIFACT_READY_URL` | engine-specific | Explicit HTTP readiness override for weights and artifacts. When unset, empty, or whitespace-only, both engines derive their health URLs from resolved serving settings. |
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time to wait for readiness and successful artifact publication before giving up. |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Adds compile configuration as a partitioning dimension for the torch compile and kernel JIT cache (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI) artifact source pools. Workers that share a value discover each other's caches; workers with different values do not. Unset removes **only this dimension** — the pool is still partitioned by every other `SourceIdentity` field (model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch), so workers matching on all of those share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](#pairing-workers-by-compile-configuration). |
 | `MX_MODEL_REVISION` | (from engine config) | Override for `SourceIdentity.revision`, used to distinguish checkpoint versions in the P2P source identity. Use the exact HF commit SHA or an immutable checkpoint version matching the weights actually loaded. This value only labels the identity: it does not pin downloads or verify weight contents. Pin the checkpoint through the engine's revision setting or an immutable storage location. Required for decentralized backends; SGLang draft P2P also requires a non-empty revision. |
@@ -1316,7 +1324,44 @@ and Kubernetes deployments must use the matching `ModelMetadata` CRD containing
 `status.worker.artifactSource.nodeRank`. Mooncake includes the same rank in its
 deterministic object key and needs no MX metadata record.
 
+#### Artifact startup readiness
+
+`MX_ARTIFACT_READY_URL` remains an optional HTTP(S) override. When unset, empty,
+or whitespace-only:
+
+- vLLM probes its resolved HTTP host and port, including CLI/config-file
+  overrides. For example, `vllm serve MODEL --port 8001 --load-format modelexpress`
+  probes `http://127.0.0.1:8001/health` without another setting.
+- SGLang probes its resolved HTTP listener without plugin hooks. Python follower
+  nodes use their local plain-HTTP health listener, including when the head uses
+  TLS. Rust listener placement follows SGLang's native helper.
+
+Both paths wait for cache files to settle. Weight-metadata policy is unchanged.
+Startup completion does not cover specializations compiled by later requests.
+
+vLLM carries the parsed endpoint to workers through its general-plugin
+compatibility adapter, without changing source identities or compilation-cache
+hashes. Wildcard bind hosts become loopback addresses. TLS selects HTTPS with
+normal certificate verification. Without serving configuration, the fallback
+is `http://127.0.0.1:8000/health`; this also applies when compatibility patches
+are disabled. UDS, gRPC-only serving, dynamic ports, and custom frontends require
+an explicit reachable HTTP(S) URL. Headless workers retain head-address routing.
+SGLang needs no runtime compatibility patch for listener discovery. Its fallback
+is `http://127.0.0.1:30000/health`; TLS uses normal certificate verification.
+No vLLM worker extension or endpoint plugin is required. Worker-local readiness
+is supplied through `LoadContext.artifact_ready_fn`; the artifact layer adds cache
+settling and keeps publication closed if the callback is missing. The serialized
+URL travels in `model_loader_extra_config` through a single CLI-conversion
+wrapper; MX removes its key from copies passed to native loaders.
+Automatic discovery only attaches metadata for MX loaders while artifact
+transfer is enabled and no explicit URL is set. Unsupported hook shapes, missing
+parsed arguments, or read-only configuration are logged; use
+`MX_ARTIFACT_READY_URL` when discovery cannot run.
+
 #### Multi-node readiness
+
+SGLang's inferred local follower health listeners are probed locally. The
+following head-address routing applies to other loopback health URLs.
 
 Only the head node of a multi-node engine serves HTTP; the others run headless
 (for vLLM, `--headless`, which starts the executor and no API server), so a

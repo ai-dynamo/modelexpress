@@ -6,9 +6,10 @@
 //! Metadata is keyed by mx_source_id, a 16-char hex hash of SourceIdentity.
 //! Clients send the full SourceIdentity; the server computes and returns the hash.
 
+use crate::auth::CallerIdentity;
 use crate::metrics::grpc::RpcOutcome;
 use crate::p2p::backend::SourceInstanceInfo;
-use crate::p2p::source_identity::{compute_mx_source_id, validate_identity};
+use crate::p2p::source_identity::{compute_mx_source_id, validate_identity, validate_worker_id};
 use crate::p2p::state::P2pStateManager;
 use modelexpress_common::grpc::p2p::{
     DonorLeaseAction, DonorLeaseRequest, DonorLeaseResponse, GetMetadataRequest,
@@ -18,7 +19,82 @@ use modelexpress_common::grpc::p2p::{
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+/// What to do with the pod fields a publisher asserts about itself.
+///
+/// `PublishMetadataRequest` carries `pod_name`, `pod_uid` and `pod_namespace`,
+/// which the caller fills in from the downward API and which become the
+/// `ownerReference` on the `ModelMetadata` CR. Nothing else checks them
+/// against the caller the auth layer verified, so a publisher can claim to be
+/// any pod and re-parent an existing record. These are the three answers.
+#[derive(Debug, PartialEq, Eq)]
+enum PodClaimCheck {
+    /// Consistent with the verified caller, or there is nothing to check.
+    Accept,
+    /// Auth is enabled but the caller's token carries no bound pod identity, so
+    /// the claim cannot be checked against anything. The publish proceeds with
+    /// the ownership fields cleared, which costs garbage collection rather than
+    /// the record.
+    Drop(&'static str),
+    /// The claim contradicts the verified caller.
+    Reject(String),
+}
+
+/// Check a publisher's self-asserted pod identity against the authenticated one.
+///
+/// `caller` is `None` when the auth layer is not enabled, in which case there is
+/// no verified identity to compare against and the claim is accepted as-is.
+/// That is deliberate: gRPC auth is opt-in, and a server without it configured
+/// must keep publishing.
+fn check_pod_claim(
+    caller: Option<&CallerIdentity>,
+    pod_name: &str,
+    pod_uid: &str,
+    pod_namespace: &str,
+) -> PodClaimCheck {
+    // An incomplete claim (any of the three fields empty, including all of
+    // them) never becomes an ownerReference: the Kubernetes backend omits it
+    // unless name, UID and namespace are all present. There is no ownership to
+    // forge, and DEPLOYMENT.md promises that partial identity does not block
+    // publication, so it passes through exactly as it did before this check.
+    if pod_name.is_empty() || pod_uid.is_empty() || pod_namespace.is_empty() {
+        return PodClaimCheck::Accept;
+    }
+
+    let Some(caller) = caller else {
+        return PodClaimCheck::Accept;
+    };
+
+    // A pod's ServiceAccount lives in the pod's own namespace, so the verified
+    // SA namespace is the authority on which namespace the caller runs in.
+    if pod_namespace != caller.namespace {
+        return PodClaimCheck::Reject(format!(
+            "pod_namespace '{}' does not match the authenticated namespace '{}'",
+            pod_namespace, caller.namespace
+        ));
+    }
+
+    match (caller.pod_name.as_deref(), caller.pod_uid.as_deref()) {
+        (Some(name), Some(uid)) => {
+            if pod_name != name {
+                return PodClaimCheck::Reject(format!(
+                    "pod_name '{pod_name}' does not match the authenticated pod '{name}'"
+                ));
+            }
+            if pod_uid != uid {
+                return PodClaimCheck::Reject(
+                    "pod_uid does not match the authenticated pod".to_string(),
+                );
+            }
+            PodClaimCheck::Accept
+        }
+        _ => PodClaimCheck::Drop(
+            "caller token carries no bound pod identity, so the asserted pod ownership cannot be \
+             verified; publishing without an ownerReference",
+        ),
+    }
+}
 
 /// Return `body` with the handler's own verdict attached.
 ///
@@ -132,8 +208,11 @@ impl P2pService for P2pServiceImpl {
 
     async fn publish_metadata(
         &self,
-        request: Request<PublishMetadataRequest>,
+        mut request: Request<PublishMetadataRequest>,
     ) -> Result<Response<PublishMetadataResponse>, Status> {
+        // Taken before `into_inner()`, which consumes the message and drops the
+        // extensions the auth layer attached the verified caller to.
+        let caller = request.extensions_mut().remove::<CallerIdentity>();
         let req = request.into_inner();
 
         let identity = match req.identity {
@@ -163,17 +242,53 @@ impl P2pService for P2pServiceImpl {
             );
         }
 
-        if req.worker_id.is_empty() {
+        if let Err(e) = validate_worker_id(&req.worker_id) {
             return tagged(
                 PublishMetadataResponse {
                     success: false,
-                    message: "worker_id is required".to_string(),
+                    message: e,
                     mx_source_id: String::new(),
                     worker_id: String::new(),
                 },
                 RpcOutcome::InvalidArgument,
             );
         }
+
+        let (pod_name, pod_uid, pod_namespace) = match check_pod_claim(
+            caller.as_ref(),
+            &req.pod_name,
+            &req.pod_uid,
+            &req.pod_namespace,
+        ) {
+            PodClaimCheck::Accept => (req.pod_name, req.pod_uid, req.pod_namespace),
+            PodClaimCheck::Drop(reason) => {
+                warn!(
+                    caller_namespace = caller.as_ref().map(|c| c.namespace.as_str()),
+                    caller_service_account = caller.as_ref().map(|c| c.service_account.as_str()),
+                    worker_id = %req.worker_id,
+                    "PublishMetadata: {reason}"
+                );
+                (String::new(), String::new(), String::new())
+            }
+            PodClaimCheck::Reject(reason) => {
+                warn!(
+                    caller_namespace = caller.as_ref().map(|c| c.namespace.as_str()),
+                    caller_service_account = caller.as_ref().map(|c| c.service_account.as_str()),
+                    worker_id = %req.worker_id,
+                    reason = %reason,
+                    "PublishMetadata: rejected pod ownership claim"
+                );
+                return tagged(
+                    PublishMetadataResponse {
+                        success: false,
+                        message: reason,
+                        mx_source_id: String::new(),
+                        worker_id: String::new(),
+                    },
+                    RpcOutcome::Unauthenticated,
+                );
+            }
+        };
 
         let worker = match req.worker {
             Some(w) => w,
@@ -216,9 +331,9 @@ impl P2pService for P2pServiceImpl {
                 &identity,
                 &worker_id,
                 worker,
-                &req.pod_name,
-                &req.pod_uid,
-                &req.pod_namespace,
+                &pod_name,
+                &pod_uid,
+                &pod_namespace,
             )
             .await
         {
@@ -353,7 +468,17 @@ impl P2pService for P2pServiceImpl {
     ) -> Result<Response<GetMetadataResponse>, Status> {
         let req = request.into_inner();
 
-        if req.mx_source_id.is_empty() || req.worker_id.is_empty() {
+        // Validated on the read path too, so the caller gets an explicit answer
+        // rather than whatever the backend makes of an unusable object name. On
+        // Kubernetes nothing this rejects could have been published, since the
+        // CR create would have failed. Redis stored worker IDs verbatim before
+        // this check, so a record published under a custom ID that is now
+        // invalid (uppercase, for example) still lists but can no longer be
+        // fetched or updated; such IDs have to change when upgrading. The
+        // built-in producers emit IDs that pass, and the deployment guide has
+        // stale Redis metadata flushed on redeploy, so no migration path is
+        // provided.
+        if req.mx_source_id.is_empty() || validate_worker_id(&req.worker_id).is_err() {
             return tagged(
                 GetMetadataResponse {
                     found: false,
@@ -451,11 +576,11 @@ impl P2pService for P2pServiceImpl {
             );
         }
 
-        if req.worker_id.is_empty() {
+        if let Err(e) = validate_worker_id(&req.worker_id) {
             return tagged(
                 UpdateStatusResponse {
                     success: false,
-                    message: "worker_id is required".to_string(),
+                    message: e,
                 },
                 RpcOutcome::InvalidArgument,
             );
@@ -531,6 +656,109 @@ mod tests {
         ArtifactSourceMetadata, MxSourceType, SourceIdentity, SourceStatus, TensorSourceMetadata,
     };
     use std::collections::HashMap;
+
+    fn caller(namespace: &str, pod_name: Option<&str>, pod_uid: Option<&str>) -> CallerIdentity {
+        CallerIdentity {
+            namespace: namespace.to_string(),
+            service_account: "publisher".to_string(),
+            pod_name: pod_name.map(str::to_string),
+            pod_uid: pod_uid.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pod_claim_accepts_a_matching_caller() {
+        let c = caller("team-a", Some("worker-0"), Some("uid-0"));
+        assert_eq!(
+            check_pod_claim(Some(&c), "worker-0", "uid-0", "team-a"),
+            PodClaimCheck::Accept
+        );
+    }
+
+    #[test]
+    fn pod_claim_accepts_when_nothing_is_asserted() {
+        // No ownerReference is set downstream, so there is nothing to forge.
+        let c = caller("team-a", Some("worker-0"), Some("uid-0"));
+        assert_eq!(check_pod_claim(Some(&c), "", "", ""), PodClaimCheck::Accept);
+    }
+
+    #[test]
+    fn pod_claim_accepts_a_partial_claim() {
+        // A client that only sets POD_NAMESPACE (or any other incomplete subset)
+        // never produced an ownerReference, and partial identity is documented
+        // as not blocking publication, so a bound-pod token must not turn it
+        // into a rejection.
+        let c = caller("team-a", Some("worker-0"), Some("uid-0"));
+        assert_eq!(
+            check_pod_claim(Some(&c), "", "", "team-a"),
+            PodClaimCheck::Accept
+        );
+        assert_eq!(
+            check_pod_claim(Some(&c), "worker-0", "", "team-a"),
+            PodClaimCheck::Accept
+        );
+        assert_eq!(
+            check_pod_claim(Some(&c), "", "uid-0", ""),
+            PodClaimCheck::Accept
+        );
+    }
+
+    #[test]
+    fn pod_claim_is_unchanged_when_auth_is_disabled() {
+        // gRPC auth is opt-in. With no verified caller there is nothing to
+        // compare against, and a server without auth configured must keep
+        // publishing with the claim accepted as-is.
+        assert_eq!(
+            check_pod_claim(None, "someone-elses-pod", "someone-elses-uid", "team-b"),
+            PodClaimCheck::Accept
+        );
+    }
+
+    #[test]
+    fn pod_claim_rejects_a_foreign_pod_name() {
+        let c = caller("team-a", Some("worker-0"), Some("uid-0"));
+        assert!(matches!(
+            check_pod_claim(Some(&c), "victim-pod", "uid-0", "team-a"),
+            PodClaimCheck::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn pod_claim_rejects_a_foreign_pod_uid() {
+        // The UID is what actually binds the ownerReference, so a matching name
+        // with a foreign UID must not pass.
+        let c = caller("team-a", Some("worker-0"), Some("uid-0"));
+        assert!(matches!(
+            check_pod_claim(Some(&c), "worker-0", "victim-uid", "team-a"),
+            PodClaimCheck::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn pod_claim_rejects_a_cross_namespace_claim() {
+        let c = caller("team-a", Some("worker-0"), Some("uid-0"));
+        assert!(matches!(
+            check_pod_claim(Some(&c), "worker-0", "uid-0", "team-b"),
+            PodClaimCheck::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn pod_claim_drops_an_unverifiable_claim() {
+        // A token with no bound pod extras cannot confirm or deny the claim.
+        // Publishing proceeds, but the ownership fields are cleared rather than
+        // trusted, which costs GC instead of the record.
+        let c = caller("team-a", None, None);
+        assert!(matches!(
+            check_pod_claim(Some(&c), "worker-0", "uid-0", "team-a"),
+            PodClaimCheck::Drop(_)
+        ));
+        let half = caller("team-a", Some("worker-0"), None);
+        assert!(matches!(
+            check_pod_claim(Some(&half), "worker-0", "uid-0", "team-a"),
+            PodClaimCheck::Drop(_)
+        ));
+    }
 
     fn make_service(mock: MockMetadataBackend) -> P2pServiceImpl {
         P2pServiceImpl::new(Arc::new(P2pStateManager::with_backend(Arc::new(mock))))
@@ -787,6 +1015,107 @@ mod tests {
         assert!(!resp.mx_source_id.is_empty());
         assert_eq!(resp.mx_source_id.len(), 16);
         assert_eq!(resp.worker_id, "worker-uuid-1");
+    }
+
+    /// A publish request asserting a complete pod identity, carrying `caller` in
+    /// its extensions the way the auth layer attaches it.
+    fn publish_as(
+        caller: CallerIdentity,
+        pod_name: &str,
+        pod_uid: &str,
+        pod_namespace: &str,
+    ) -> Request<PublishMetadataRequest> {
+        let mut request = Request::new(PublishMetadataRequest {
+            identity: Some(test_identity()),
+            worker: Some(WorkerMetadata {
+                worker_rank: 0,
+                source_payload: empty_tensor_source(),
+                status: SourceStatus::Initializing as i32,
+                ..Default::default()
+            }),
+            worker_id: "worker-uuid-1".to_string(),
+            pod_name: pod_name.to_string(),
+            pod_uid: pod_uid.to_string(),
+            pod_namespace: pod_namespace.to_string(),
+        });
+        request.extensions_mut().insert(caller);
+        request
+    }
+
+    #[tokio::test]
+    async fn test_publish_metadata_rejects_a_forged_owner_before_writing() {
+        // The handler, not just check_pod_claim, has to see the verified caller:
+        // a claim naming someone else's pod must never reach the backend.
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_publish_metadata().never();
+
+        let svc = make_service(mock);
+        let resp = svc
+            .publish_metadata(publish_as(
+                caller("team-a", Some("worker-0"), Some("uid-0")),
+                "victim-pod",
+                "victim-uid",
+                "team-a",
+            ))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(!resp.success);
+        assert!(
+            resp.message.contains("does not match"),
+            "unexpected message: {}",
+            resp.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_publish_metadata_clears_an_unverifiable_owner() {
+        // A token with no bound pod cannot vouch for the claim, so the backend
+        // must receive empty ownership fields and the publish still succeeds.
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_publish_metadata()
+            .withf(|_, _, _, pod_name, pod_uid, pod_namespace| {
+                pod_name.is_empty() && pod_uid.is_empty() && pod_namespace.is_empty()
+            })
+            .once()
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        let svc = make_service(mock);
+        let resp = svc
+            .publish_metadata(publish_as(
+                caller("team-a", None, None),
+                "worker-0",
+                "uid-0",
+                "team-a",
+            ))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(resp.success, "{}", resp.message);
+    }
+
+    #[tokio::test]
+    async fn test_publish_metadata_forwards_a_verified_owner() {
+        let mut mock = MockMetadataBackend::new();
+        mock.expect_publish_metadata()
+            .withf(|_, _, _, pod_name, pod_uid, pod_namespace| {
+                pod_name == "worker-0" && pod_uid == "uid-0" && pod_namespace == "team-a"
+            })
+            .once()
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        let svc = make_service(mock);
+        let resp = svc
+            .publish_metadata(publish_as(
+                caller("team-a", Some("worker-0"), Some("uid-0")),
+                "worker-0",
+                "uid-0",
+                "team-a",
+            ))
+            .await
+            .expect("rpc")
+            .into_inner();
+        assert!(resp.success, "{}", resp.message);
     }
 
     #[tokio::test]

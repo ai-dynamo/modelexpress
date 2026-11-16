@@ -25,6 +25,7 @@ from ...tensor_utils import (
     collect_module_tensors,
 )
 from .draft_weights import draft_weight_adapter_for
+from .readiness import sglang_server_readiness
 from .runtime_state import finalize_runtime_state, prepare_runtime_tensors
 
 logger = logging.getLogger("modelexpress.engines.sglang.adapter")
@@ -507,11 +508,14 @@ def build_sglang_load_context(
 ) -> LoadContext:
     """Build a LoadContext from SGLang config objects."""
 
+    from . import artifacts
+
     adapter = SglangAdapter(load_config, model_config, device_config)
     worker_rank = adapter.get_worker_rank()
     global_rank = adapter.get_global_rank()
     server_url = getattr(load_config, "modelexpress_url", None)
-    return LoadContext(
+    readiness = sglang_server_readiness()
+    ctx = LoadContext(
         model_config=model_config,
         load_config=load_config,
         target_device=adapter.get_target_device(),
@@ -528,3 +532,5 @@ def build_sglang_load_context(
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )
+    ctx.artifact_ready_fn = lambda: artifacts._sglang_health_ready(ctx, readiness)
+    return ctx

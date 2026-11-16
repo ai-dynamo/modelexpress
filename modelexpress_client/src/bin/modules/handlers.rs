@@ -17,13 +17,21 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
+fn display_model_size(stats: &CacheStats, model: &ModelInfo) -> String {
+    if model.accessible {
+        stats.format_model_size(model)
+    } else {
+        "inaccessible".red().to_string()
+    }
+}
+
 fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> String {
     if detailed {
         format!(
             "  [{}] {} ({}) - {:?}",
             model.provider,
             model.name,
-            stats.format_model_size(model),
+            display_model_size(stats, model),
             model.path
         )
     } else {
@@ -31,7 +39,7 @@ fn format_model_line(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> S
             "  [{}] {} ({})",
             model.provider,
             model.name,
-            stats.format_model_size(model)
+            display_model_size(stats, model)
         )
     }
 }
@@ -43,6 +51,7 @@ fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_js
             "name": model.name,
             "size": model.size,
             "formatted_size": stats.format_model_size(model),
+            "accessible": model.accessible,
             "path": model.path
         })
     } else {
@@ -50,7 +59,8 @@ fn model_json(stats: &CacheStats, model: &ModelInfo, detailed: bool) -> serde_js
             "provider": model.provider.to_string(),
             "name": model.name,
             "size": model.size,
-            "formatted_size": stats.format_model_size(model)
+            "formatted_size": stats.format_model_size(model),
+            "accessible": model.accessible
         })
     }
 }
@@ -764,13 +774,22 @@ async fn show_model_stats(
             if detailed && !stats.models.is_empty() {
                 println!("Detailed Statistics:");
                 for model in &stats.models {
-                    println!(
-                        "  [{}] {}: {} bytes ({})",
-                        model.provider,
-                        model.name,
-                        model.size,
-                        stats.format_model_size(model)
-                    );
+                    if model.accessible {
+                        println!(
+                            "  [{}] {}: {} bytes ({})",
+                            model.provider,
+                            model.name,
+                            model.size,
+                            stats.format_model_size(model)
+                        );
+                    } else {
+                        println!(
+                            "  [{}] {}: {}",
+                            model.provider,
+                            model.name,
+                            "inaccessible".red()
+                        );
+                    }
                 }
             }
         }
