@@ -514,6 +514,7 @@ def test_the_loader_fails_closed_when_sglang_rebinds_aliased_storage(cpu_storage
         tp_size=tp,
     )
     loader.start_new_round("v1")
+    loader.install(0)
     loader.finish()
 
     down = layers["mlp.down_proj"]
