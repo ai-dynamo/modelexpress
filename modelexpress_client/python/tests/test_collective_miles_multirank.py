@@ -124,6 +124,7 @@ def _install_fakes(miles_protocol, rank, scenario, record):
                     "worker_id": kwargs["worker_id"],
                     "slot_id": kwargs["slot_id"],
                     "index_in_role": kwargs["index_in_role"],
+                    "layer_groups": kwargs["layer_groups"],
                     "buffers": {
                         name: spec.base.data_ptr()
                         for name, spec in publisher.local_params().items()
@@ -192,6 +193,9 @@ def _install_fakes(miles_protocol, rank, scenario, record):
 def _run(rank, scenario, record, world, tp):
     from modelexpress_rl.collective.integrations import miles_protocol
 
+    if scenario == "stacked_reconnect":
+        os.environ["MX_NCCL_REFIT_STACK_BYTES"] = str(1 << 20)
+        scenario = "reconnect"
     _install_fakes(miles_protocol, rank, scenario, record)
     dp_rank, tp_rank = divmod(rank, tp)
     dp = world // tp
@@ -553,8 +557,16 @@ def test_dp2_tp2_without_layouts_publishes_whole_tensors_from_every_rank(tmp_pat
     ]
 
 
-def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
-    records = _launch(tmp_path, "reconnect")
+@pytest.mark.parametrize("stacked", [False, True])
+def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path, stacked):
+    from modelexpress_rl.collective.integrations._common import _derive_wire_plan
+    from modelexpress_rl.collective.integrations.manifest import (
+        manifest_from_wire,
+        manifest_to_wire,
+        plan_to_wire,
+    )
+
+    records = _launch(tmp_path, "stacked_reconnect" if stacked else "reconnect")
 
     for record in records:
         assert "error" not in record, record.get("traceback")
@@ -566,7 +578,15 @@ def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
     assert first["plan"] == replacement["plan"]
     for field in ("trainer_slots", "generator_slots", "m2n_abi_version"):
         assert first["topology"][field] == replacement["topology"][field]
-    assert first["topology"]["m2n_abi_version"] == "miles-sglang-bf16-replicated-v1"
+    expected_abi = "miles-sglang-bf16-replicated-v1" + ("+stack1" if stacked else "")
+    assert first["topology"]["m2n_abi_version"] == expected_abi
+    calls = records[0]["engine_payloads"]
+    prepares = [call for call in calls if call["endpoint"] == "init_weights_update_group"]
+    per_tensor, _topology = manifest_from_wire(prepares[0]["payload"]["receiver_init_payload"])
+    wire_plan, stacks = _derive_wire_plan(per_tensor)
+    assert bool(stacks) is stacked
+    assert plan_to_wire(wire_plan) == first["plan"]
+    members = {name for stack in stacks for name in stack.members}
     for record in records:
         assert record["rounds"] == 4
         sessions = record["sessions"]
@@ -576,6 +596,11 @@ def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
         assert sessions[0]["slot_id"] == sessions[1]["slot_id"]
         assert sessions[0]["slot_id"] == first["topology"]["trainer_slots"][record["rank"]]
         assert all(session["index_in_role"] == record["rank"] for session in sessions)
+        expected_groups = (
+            [[entry.name] for entry in wire_plan.bulk]
+            if stacked else [[entry.name for entry in wire_plan.bulk]]
+        )
+        assert all(session["layer_groups"] == expected_groups for session in sessions)
         rounds = record["connection_rounds"]
         assert [item["generation"] for item in rounds] == [0, 0, 1, 1]
         assert [item["worker_id"] for item in rounds] == [
@@ -586,16 +611,25 @@ def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
         assert record["events"].count("prepare") == 2
         assert record["events"].count("session-close") == 2
         for version in range(1, 5):
-            assert record["published"][str(version)] == {
-                name: hashlib.sha256(
-                    _global(name, version).view(torch.uint8).numpy().tobytes()
-                ).hexdigest()
-                for name in _SHAPES
+            tensors = {
+                name: _global(name, version) for name in _SHAPES if name not in members
             }
-    calls = records[0]["engine_payloads"]
-    prepares = [call for call in calls if call["endpoint"] == "init_weights_update_group"]
+            tensors.update({
+                stack.name: torch.stack([_global(name, version) for name in stack.members])
+                for stack in stacks
+            })
+            assert record["published"][str(version)] == {
+                name: hashlib.sha256(tensor.view(torch.uint8).numpy().tobytes()).hexdigest()
+                for name, tensor in tensors.items()
+            }
+        assert all(all(views) for views in record["stack_views"].values())
     assert [call["engine"] for call in prepares] == ["original", "replacement"]
-    assert [call["payload"]["receiver_init_payload"] for call in prepares] == reference_manifests
+    for call, expected in zip(prepares, reference_manifests, strict=True):
+        receiver_plan, receiver_topology = manifest_from_wire(
+            call["payload"]["receiver_init_payload"]
+        )
+        receiver_wire, _stacks = _derive_wire_plan(receiver_plan)
+        assert manifest_to_wire(receiver_wire, receiver_topology) == expected
     assert prepares[0]["payload"]["group_name"] != prepares[1]["payload"]["group_name"]
     destroys = [call for call in calls if call["endpoint"] == "destroy_weights_update_group"]
     assert [(call["engine"], call["payload"]["group_name"]) for call in destroys] == [
