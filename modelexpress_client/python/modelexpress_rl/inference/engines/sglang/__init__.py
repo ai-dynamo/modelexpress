@@ -17,15 +17,11 @@ if TYPE_CHECKING:
 
 
 def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient:
-    """Create or reuse the runner's object-storage refit client from modelexpress_config.
+    """Create an object-storage refit client from the runner's modelexpress_config.
 
-    The client is cached on model_runner.modelexpress_generator; SGLang closes
-    it during scheduler shutdown.
+    Each call creates a new client and stores nothing on model_runner. The
+    caller owns the client: it reuses it for later refits and closes it.
     """
-    generator = getattr(model_runner, "modelexpress_generator", None)
-    if generator is not None:
-        return generator
-
     from ....object_storage import ObjectStorageType
     from ...client import ModelExpressGeneratorClient, ModelExpressGeneratorConfig
     from ...receiver import (
@@ -45,7 +41,7 @@ def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient
             model_runner.model_config.revision,
             False,
         )
-    generator = ModelExpressGeneratorClient.initialize(
+    return ModelExpressGeneratorClient.initialize(
         ModelExpressGeneratorConfig(
             engine_context=SglangGeneratorContext(model_runner),
             model_name=config.get("model_name"),
@@ -69,8 +65,6 @@ def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient
             ),
         )
     )
-    model_runner.modelexpress_generator = generator
-    return generator
 
 
 def _create_sglang_engine_runtime(
