@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import time
 from concurrent.futures import TimeoutError as _FutureTimeoutError
+from dataclasses import replace
 from typing import Any
 from uuid import uuid4
 
@@ -35,7 +36,7 @@ from .manifest import manifest_to_wire
 logger = logging.getLogger("modelexpress_rl.collective.integrations.miles_protocol")
 
 # Fixed for the basic path: one trainer rank, one publish group, and the
-# receiver build's ABI identity. Change them only in step with the receiver.
+# adapter protocol ABI. Each session also hashes its locally installed M2N build.
 _CONNECT_TIMEOUT_S = 10.0
 _ABI_VERSION = "miles-sglang-bf16-replicated-v1"
 
@@ -200,6 +201,8 @@ class MilesCollectiveProtocolCore:
         _server_host_port(self._endpoint)
         # The engine-side receiver group, named at prepare.
         self._engine_group_name: str | None = None
+        self._retired_engine_groups: list[tuple[tuple[Any, ...], str]] = []
+        self._connection_generation = 0
         # A fresh hex id per protocol: it prefixes every slot, and hex can
         # never contain the Redis lane-record delimiters.
         self._run_id = uuid4().hex
@@ -306,6 +309,16 @@ class MilesCollectiveProtocolCore:
         ):
             logger.info("MILES NCCL M2N reconnect: tearing down the previous session")
             self._teardown_for_reconnect()
+            if self._engine_group_name is not None:
+                self._retired_engine_groups.append(
+                    (self.rollout_engines, self._engine_group_name)
+                )
+                self._engine_group_name = None
+            # Redis retains old READY membership and bootstraps until TTL.
+            # Change group identity before either side can rejoin, without
+            # changing the frozen tensor/physical-topology contract.
+            self._connection_generation += 1
+            self._slot_worker_id = None
         self.rollout_engines = tuple(rollout_engines)
         self._engine_gpu_counts = counts
         self._engine_gpu_offsets = offsets
@@ -721,22 +734,38 @@ class MilesCollectiveProtocolCore:
             return "destroy_weights_update_group", {"group_name": group_name}
         raise ValueError(f"unknown engine action {action!r}")
 
+    def _session_topology(self) -> CollectiveTopology:
+        if self._topology is None:
+            raise RuntimeError("begin_sync must build the frozen topology")
+        if not self._connection_generation:
+            return self._topology
+        return replace(
+            self._topology,
+            model_name=f"{self._topology.model_name}-connection-{self._connection_generation}",
+        )
+
     def _public_engine_calls(self, action: str, **kwargs: Any) -> list:
         """One SGLang public-contract call per engine for ``action``."""
+        if action == "close":
+            groups = list(self._retired_engine_groups)
+            if self._engine_group_name is not None and self.rollout_engines:
+                groups.append((self.rollout_engines, self._engine_group_name))
+            return [
+                self._destroy_on_engine(client, {"group_name": group_name})
+                for engines, group_name in groups
+                for client in engines
+            ]
         if not self.rollout_engines:
             return []
         manifest = None
         if action == "prepare":
             if self._plan is None or self._topology is None:
                 raise RuntimeError("begin_sync must run before engine preparation")
-            # A fresh group per prepare: a reconnect's engines never saw the
-            # old name, and the old engines were destroyed before it.
+            # A fresh receiver group per prepare; any unsettled old group
+            # retains its original engine handles for cleanup retries.
             self._engine_group_name = f"mx-m2n-{uuid4().hex}"
-            manifest = manifest_to_wire(self._plan, self._topology)
+            manifest = manifest_to_wire(self._plan, self._session_topology())
         elif self._engine_group_name is None:
-            if action == "close":
-                # Nothing was prepared, so no engine holds a group.
-                return []
             raise RuntimeError("the engine receiver group was not prepared")
         calls = []
         # rank_offset is each engine's dense start position in the flattened
@@ -754,10 +783,7 @@ class MilesCollectiveProtocolCore:
                 manifest=manifest,
                 **kwargs,
             )
-            if action == "close":
-                calls.append(self._destroy_on_engine(client, payload))
-            else:
-                calls.append(self._call_engine(client, endpoint, payload))
+            calls.append(self._call_engine(client, endpoint, payload))
             generator_slot_offset += count
         return calls
 
@@ -885,14 +911,14 @@ class MilesCollectiveProtocolCore:
             tensors=dict(self._tensors),
         )
         slot_id = self._topology.trainer_slots[0]
-        # The slot's worker id is stable for the life of this protocol: a
+        # The slot's worker id is stable within this connection: a
         # fresh id per prepare would re-present an already-held slot as a new
         # generation, which the server turns into an epoch bump.
         if self._slot_worker_id is None:
             self._slot_worker_id = f"miles-{slot_id}-{uuid4().hex}"
         session = MilesTrainerSession.create(
             rendezvous=rendezvous,
-            topology=self._topology,
+            topology=self._session_topology(),
             publisher=publisher,
             source_partition=0,
             slot_id=slot_id,
@@ -1105,6 +1131,7 @@ class MilesCollectiveProtocolCore:
                 return
             raise
         self._engine_group_name = None
+        self._retired_engine_groups = []
 
     def close(self, *, failing: bool = False) -> None:
         """Tear down the generator fan-out, session, rendezvous, and channel.
@@ -1177,8 +1204,10 @@ class MilesCollectiveProtocolCore:
                 tore_down = True
         if first_error is not None:
             raise first_error
-        self._close_pending = False
-        if tore_down:
+        self._close_pending = bool(
+            self._engine_group_name is not None or self._retired_engine_groups
+        )
+        if tore_down and not self._close_pending:
             rank = (
                 dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
             )

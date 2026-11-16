@@ -382,7 +382,9 @@ class TestSglangGeneratorSession:
         assert captured["generator_slots"] == ["run:generator-0", "run:generator-1"]
         assert captured["slot_id"] == "run:generator-1"
         assert captured["index_in_role"] == 1
-        assert captured["m2n_abi_version"] == "nccl-m2n-2.30.7"
+        assert captured["m2n_abi_version"] == sglang_integration._local_m2n_abi(
+            "nccl-m2n-2.30.7"
+        )
         assert captured["device"] == "cuda:0"
 
 

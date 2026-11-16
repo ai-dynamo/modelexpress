@@ -6,12 +6,19 @@
 from __future__ import annotations
 
 import copy
+import json
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
 from .. import envs
+from ..backend import installed_m2n_build
 from ..types import PlacementKind, ReshardPlan
+
+
+def _local_m2n_abi(protocol_abi: str) -> str:
+    """Bind the adapter ABI to this process's independently observed M2N build."""
+    return json.dumps([protocol_abi, installed_m2n_build()], separators=(",", ":"))
 
 
 def _text(value: object, label: str) -> str:

@@ -155,23 +155,32 @@ def test_session_admission_digests_observe_each_local_native_build(
     publisher = MilesPublisher(
         plan=plan,
         source_partition=0,
-        tensors={name: FakeTensor((4, 4), address=0x1000 + index * 0x100)
-                 for index, name in enumerate(plan.parameter_names())},
+        tensors={
+            name: FakeTensor((4, 4), address=0x1000 + index * 0x100)
+            for index, name in enumerate(plan.parameter_names())
+        },
     )
     trainer = miles.MilesTrainerSession.create(
-        rendezvous=FakeRendezvous(), topology=topology, publisher=publisher,
-        source_partition=0, slot_id=topology.trainer_slots[0],
-        worker_id="trainer", index_in_role=0,
+        rendezvous=FakeRendezvous(),
+        topology=topology,
+        publisher=publisher,
+        source_partition=0,
+        slot_id=topology.trainer_slots[0],
+        worker_id="trainer",
+        index_in_role=0,
     )
     trainer._client.initialize(publisher, source_partition=0)
     trainer_digest = trainer._client._digest
     local_build = receiver_build
     monkeypatch.setattr(receiver_module.grpc, "insecure_channel", FakeChannel)
     monkeypatch.setattr(receiver_module.auth, "with_auth", lambda channel: channel)
-    monkeypatch.setattr(receiver_module, "CollectiveRendezvous", lambda channel: FakeRendezvous())
+    monkeypatch.setattr(
+        receiver_module, "CollectiveRendezvous", lambda channel: FakeRendezvous()
+    )
     # Capture the real client admission digest, stopping before NCCL bootstrap.
     monkeypatch.setattr(
-        sglang.SglangGeneratorSession, "prepare",
+        sglang.SglangGeneratorSession,
+        "prepare",
         lambda self: self._client.initialize(self._loader),
     )
     receiver = create_receiver(_context(init_payload=manifest_to_wire(plan, topology)))
@@ -179,7 +188,10 @@ def test_session_admission_digests_observe_each_local_native_build(
 
     assert (trainer_digest == receiver_digest) is (receiver_build == "1.0")
     assert "nccl-extensions==1.0" in trainer._client._m2n_abi_version
-    assert f"nccl-extensions=={receiver_build}" in receiver._session._client._m2n_abi_version
+    assert (
+        f"nccl-extensions=={receiver_build}"
+        in receiver._session._client._m2n_abi_version
+    )
     assert topology.m2n_abi_version in trainer._client._m2n_abi_version
     receiver.destroy()
     trainer.close()

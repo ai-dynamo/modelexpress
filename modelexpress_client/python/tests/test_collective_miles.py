@@ -496,7 +496,9 @@ def test_trainer_session_factory_passes_the_frozen_topology_and_abi(monkeypatch)
     assert captured["trainer_slots"] == list(_topology().trainer_slots)
     assert captured["generator_slots"] == list(_topology().generator_slots)
     assert captured["source_partition_count"] == 2
-    assert captured["m2n_abi_version"] == "nccl-m2n-2.30.7"
+    assert captured["m2n_abi_version"] == miles_integration._local_m2n_abi(
+        "nccl-m2n-2.30.7"
+    )
     assert captured["receiver_protocol"] == _topology().receiver_protocol
     assert captured["device"] == "cuda:0"
     assert captured["streams"] == [lane_stream]

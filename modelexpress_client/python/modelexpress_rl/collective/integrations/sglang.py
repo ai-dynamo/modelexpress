@@ -19,6 +19,7 @@ from ._common import (
     _collective_streams,
     _FrozenPlan,
     _layer_groups,
+    _local_m2n_abi,
     _order_current_cuda_stream_before,
     _single_device,
     _tensor_signature,
@@ -222,7 +223,7 @@ class SglangGeneratorSession:
             worker_id=_text(worker_id, "worker_id"),
             index_in_role=index_in_role,
             receiver_protocol=topology.receiver_protocol,
-            m2n_abi_version=topology.m2n_abi_version,
+            m2n_abi_version=_local_m2n_abi(topology.m2n_abi_version),
             device=device,
             streams=streams,
         )

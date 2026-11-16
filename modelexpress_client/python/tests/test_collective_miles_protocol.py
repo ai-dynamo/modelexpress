@@ -1781,7 +1781,10 @@ def _frozen_protocol(monkeypatch):
     return protocol
 
 
-def test_reconnect_bootstraps_a_fresh_group_before_replacement_engines_join(monkeypatch):
+@pytest.mark.parametrize("old_destroy_fails", [False, True])
+def test_reconnect_bootstraps_a_fresh_group_before_replacement_engines_join(
+    monkeypatch, old_destroy_fails
+):
     from modelexpress_rl.collective.integrations.manifest import manifest_from_wire
 
     _install_fake_miles_async(monkeypatch, [])
@@ -1819,7 +1822,15 @@ def test_reconnect_bootstraps_a_fresh_group_before_replacement_engines_join(monk
     monkeypatch.delattr(protocol, "_generator_futures")
     monkeypatch.delattr(protocol, "_wait_generator_futures")
     monkeypatch.setattr(protocol, "_drives_destroy_fan_out", lambda: True)
-    old_engine = _RecordingEngine([])
+    class OldEngine(_RecordingEngine):
+        async def _make_request(self, endpoint, payload=None):
+            response = await super()._make_request(endpoint, payload)
+            if endpoint == "destroy_weights_update_group" and old_destroy_fails:
+                if len(self.payloads) == 2:
+                    raise RuntimeError("old engine temporarily unreachable")
+            return response
+
+    old_engine = OldEngine([])
     protocol.rollout_engines = (old_engine,)
     frozen_topology = protocol._topology
     frozen_plan = protocol._plan
@@ -1832,7 +1843,7 @@ def test_reconnect_bootstraps_a_fresh_group_before_replacement_engines_join(monk
         [replacement], [1], [0], _parallel_state(), _placement(), "target"
     )
     protocol.begin_sync(
-        2, lambda *, materialize: iter([[('model.weight', wire_buffer)]])
+        2, lambda *, materialize: iter([[("model.weight", wire_buffer)]])
     )
     protocol._prepare_sessions()
 
@@ -1853,6 +1864,12 @@ def test_reconnect_bootstraps_a_fresh_group_before_replacement_engines_join(monk
         "destroy_weights_update_group", {"group_name": payload["group_name"]}
     )
     assert sessions[1].closed and channels[1].closed
+    assert len(old_engine.payloads) == (3 if old_destroy_fails else 2)
+    assert old_engine.payloads[-1] == (
+        "destroy_weights_update_group", {"group_name": old_group}
+    )
+    assert not protocol._retired_engine_groups
+    assert not protocol._close_pending
 
 
 def test_prepare_sessions_rebuilds_after_an_epoch_move(monkeypatch):
