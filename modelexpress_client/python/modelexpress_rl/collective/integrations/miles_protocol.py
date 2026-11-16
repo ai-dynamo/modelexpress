@@ -487,38 +487,50 @@ class MilesCollectiveProtocolCore:
             seen: set[str] = set()
             shapes: dict[str, tuple[int, ...]] = {}
             for bucket in iter_buckets(materialize=True):
-                for name, tensor in bucket:
-                    if ":" in name:
-                        raise ValueError("LoRA/adaptor tensors are not supported")
-                    if name in seen:
-                        raise ValueError(f"duplicate HF weight name {name!r}")
-                    seen.add(name)
-                    if tensor.ndim == 0:
-                        raise ValueError(f"{name}: scalar weights are not supported")
-                    if tensor.dtype is not torch.bfloat16:
-                        raise ValueError(
-                            f"{name}: only BF16 base weights are supported"
-                        )
-                    if not tensor.is_contiguous():
-                        raise ValueError(
-                            f"{name}: materialized HF weight is not contiguous"
-                        )
-                    shape = tuple(int(dim) for dim in tensor.shape)
-                    if first_round:
-                        # The contiguity check above already pins the memory
-                        # format, so clone() preserves it.
-                        prepared[name] = tensor.clone()
-                    else:
-                        # A mid-stream failure can leave earlier wire buffers
-                        # already overwritten; that is safe because a failed
-                        # begin_sync never arms a round, and the next begin_sync
-                        # rewrites every buffer before use.
-                        if frozen.get(name) != shape:
-                            raise RuntimeError(
-                                "MILES tensor names or canonical shapes changed"
+                # MILES materialization can run TP collectives before each
+                # yield. After a consumer-side failure, drain this SAME iterator
+                # before voting; do not stage or validate any more tensors.
+                if local_exception is not None:
+                    continue
+                try:
+                    for name, tensor in bucket:
+                        if ":" in name:
+                            raise ValueError("LoRA/adaptor tensors are not supported")
+                        if name in seen:
+                            raise ValueError(f"duplicate HF weight name {name!r}")
+                        seen.add(name)
+                        if tensor.ndim == 0:
+                            raise ValueError(
+                                f"{name}: scalar weights are not supported"
                             )
-                        prepared[name].copy_(tensor)
-                    shapes[name] = shape
+                        if tensor.dtype is not torch.bfloat16:
+                            raise ValueError(
+                                f"{name}: only BF16 base weights are supported"
+                            )
+                        if not tensor.is_contiguous():
+                            raise ValueError(
+                                f"{name}: materialized HF weight is not contiguous"
+                            )
+                        shape = tuple(int(dim) for dim in tensor.shape)
+                        if first_round:
+                            # Contiguity already pins the memory format.
+                            prepared[name] = tensor.clone()
+                        else:
+                            # A failed begin_sync never arms a round; a retry
+                            # rewrites every stable buffer before use.
+                            if frozen.get(name) != shape:
+                                raise RuntimeError(
+                                    "MILES tensor names or canonical shapes changed"
+                                )
+                            prepared[name].copy_(tensor)
+                        shapes[name] = shape
+                except BaseException as error:
+                    local_exception = error
+                    local_error = repr(error)
+                    if first_round:
+                        prepared.clear()
+            if local_exception is not None:
+                raise local_exception
             if not shapes:
                 raise ValueError("MILES produced no base-model tensors")
             if not first_round and shapes.keys() != frozen.keys():
@@ -531,8 +543,9 @@ class MilesCollectiveProtocolCore:
             local_shapes = shapes
             prepared_tensors = prepared
         except BaseException as error:
-            local_exception = error
-            local_error = repr(error)
+            if local_exception is None:
+                local_exception = error
+                local_error = repr(error)
         failures = _gathered_failures(local_error)
         if failures:
             _rank, world = _rank_and_world()
@@ -846,7 +859,25 @@ class MilesCollectiveProtocolCore:
         if not operation_id:
             raise RuntimeError("MX did not create a transfer operation")
         self._round_operation_id = operation_id
-        session.begin_round(version=version, operation_id=operation_id)
+        local_exception: BaseException | None = None
+        local_error = ""
+        try:
+            session.begin_round(version=version, operation_id=operation_id)
+        except BaseException as error:
+            local_exception = error
+            local_error = repr(error)
+        # Freshness checks and bind-transfer RPCs are rank-local. No trainer
+        # may publish or advance the collective iterator until all have started.
+        failures = _gathered_failures(local_error)
+        if failures:
+            if _world == 1 and local_exception is not None:
+                raise local_exception
+            error = RuntimeError(
+                "MILES NCCL M2N round start failed: " + "; ".join(failures[:4])
+            )
+            if local_exception is not None:
+                raise error from local_exception
+            raise error
         self._round_begun = True
 
     def _drain_ready_groups(self, version: str) -> tuple[tuple[str, ...], ...]:

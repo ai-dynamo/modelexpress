@@ -25,6 +25,7 @@ import time
 import traceback
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -126,6 +127,13 @@ def _install_fakes(miles_protocol, rank, scenario, record):
         def begin_round(self, *, version, operation_id):
             assert operation_id == f"operation-{version}"
             record["events"].append(("begin", version))
+            failed_version = "2" if scenario == "reuse_begin_fails" else "1"
+            if (
+                scenario in ("begin_fails", "reuse_begin_fails")
+                and rank == 1
+                and version == failed_version
+            ):
+                raise RuntimeError("synthetic bind-transfer failure on rank 1")
 
         def publish_group(self, *, version, layer_group_id):
             specs = self._publisher.local_params()
@@ -198,17 +206,70 @@ def _run(rank, scenario, record):
         "events"
     ].append("wait-generators")
 
+    collective_iterator = scenario in (
+        "begin_fails",
+        "reuse_begin_fails",
+        "clone_fails",
+        "copy_fails",
+        "validation_fails",
+        "shape_fails",
+    )
     for version in (1, 2):
         # A gathered stream: every rank holds every tensor whole.
         tensors = [(name, _global(name, version)) for name in names]
-        protocol.begin_sync(version, lambda *, materialize, t=tensors: iter([t]))
+        if rank == 1 and scenario == "validation_fails":
+            tensors[0] = (names[0], tensors[0][1].float())
+        if rank == 1 and scenario == "shape_fails" and version == 2:
+            tensors[0] = (names[0], torch.zeros((1,), dtype=torch.bfloat16))
+
+        def iter_buckets(*, materialize):
+            assert materialize is True
+            record.setdefault("iterator_calls", []).append(version)
+            for index, tensor in enumerate(tensors):
+                if collective_iterator:
+                    # Model MILES' TP gather BEFORE each yielded bucket.
+                    value = torch.tensor([1])
+                    torch.distributed.all_reduce(value)
+                    assert value.item() == WORLD
+                record.setdefault("iterator_steps", []).append([version, index])
+                yield [tensor]
+
+        def fail_staging(tensor, *args, **kwargs):
+            record["staging_calls"] = record.get("staging_calls", 0) + 1
+            if record["staging_calls"] == 2:
+                raise torch.OutOfMemoryError(f"synthetic {method} OOM on rank 1")
+            return original(tensor, *args, **kwargs)
+
+        method = "copy_" if scenario == "copy_fails" else "clone"
+        original = getattr(torch.Tensor, method)
+        fault = rank == 1 and (
+            (scenario == "clone_fails" and version == 1)
+            or (scenario == "copy_fails" and version == 2)
+        )
+        old_tensors = protocol._tensors
+        try:
+            if fault:
+                with patch.object(torch.Tensor, method, fail_staging):
+                    protocol.begin_sync(version, iter_buckets)
+            else:
+                protocol.begin_sync(version, iter_buckets)
+        except BaseException:
+            record["round_version_after_failure"] = protocol._round_version
+            record["buffers_unchanged"] = protocol._tensors is old_tensors
+            raise
         record["run_id"] = protocol._run_id
-        for index, (name, tensor) in enumerate(tensors):
+        # The updater drives a separate materialized iterator for sending.
+        for index, bucket in enumerate(iter_buckets(materialize=True)):
             if scenario == "diverged_bucket" and rank == 3 and index == 0:
                 # One rank's bucket stream alone diverges from the frozen plan.
-                protocol.send_bucket([("model.forged.weight", tensor)])
+                protocol.send_bucket([("model.forged.weight", bucket[0][1])])
                 continue
-            protocol.send_bucket([(name, tensor)])
+            try:
+                protocol.send_bucket(bucket)
+            except BaseException:
+                record["closed"] = protocol._closed
+                record["round_begun"] = protocol._round_begun
+                raise
         protocol.finalize(version)
         record["rounds"] += 1
 
@@ -231,9 +292,11 @@ def _rank_main(rank, init_file, scenario, result_dir):
             world_size=WORLD,
             timeout=timedelta(seconds=DEADLINE_S / 2),
         )
+        started = time.monotonic()
         try:
             _run(rank, scenario, record)
         except BaseException as error:
+            record["failure_elapsed_s"] = time.monotonic() - started
             record["error"] = str(error)
             record["error_type"] = type(error).__name__
             record["cause"] = repr(error.__cause__)
@@ -383,6 +446,74 @@ def test_a_diverged_bucket_stream_fails_send_bucket_on_every_rank(tmp_path):
     # Rank 0's terminal close still destroys the (never-joined) engine group.
     assert records[0]["generator_actions"] == [["close", None]]
     assert all(record["generator_actions"] == [] for record in records[1:])
+
+
+@pytest.mark.parametrize(
+    "scenario,version", [("begin_fails", 1), ("reuse_begin_fails", 2)]
+)
+def test_a_round_start_failure_stops_every_rank_before_next_bucket(
+    tmp_path, scenario, version
+):
+    records = _launch(tmp_path, scenario)
+
+    for record in records:
+        assert record["error_type"] == "RuntimeError", record.get("traceback")
+        assert "round start failed" in record["error"]
+        assert "rank 1: RuntimeError('synthetic bind-transfer failure" in record["error"]
+        assert record["failure_elapsed_s"] < DEADLINE_S / 4
+        assert record["rounds"] == version - 1
+        assert record["closed"] is True
+        assert record["round_begun"] is False
+        assert "session-close" in record["events"]
+        assert "rendezvous-close" in record["events"]
+        assert "channel-close" in record["events"]
+        assert ["report", f"operation-{version}"] in record["events"]
+        assert str(version) not in record["published"]
+        # Preparation drained all six valid BF16 buckets; sending stopped at
+        # the first bucket, before the next TP iterator collective.
+        assert record["iterator_steps"].count([version, 0]) == 2
+        for index in range(1, len(_SHAPES)):
+            assert record["iterator_steps"].count([version, index]) == 1
+    assert "synthetic bind-transfer failure" in records[1]["cause"]
+    assert "cancel-run_round" in records[0]["events"]
+    assert records[0]["generator_actions"][-1] == ["close", None]
+    assert all(record["generator_actions"] == [] for record in records[1:])
+
+
+@pytest.mark.parametrize(
+    "scenario,version,message",
+    [
+        ("clone_fails", 1, "synthetic clone OOM on rank 1"),
+        ("copy_fails", 2, "synthetic copy_ OOM on rank 1"),
+        ("validation_fails", 1, "only BF16 base weights are supported"),
+        ("shape_fails", 2, "MILES tensor names or canonical shapes changed"),
+    ],
+)
+def test_preparation_failure_drains_the_collective_iterator_on_every_rank(
+    tmp_path, scenario, version, message
+):
+    records = _launch(tmp_path, scenario)
+
+    for record in records:
+        assert record["error_type"] == "RuntimeError", record.get("traceback")
+        assert "begin_sync preparation failed: rank 1:" in record["error"]
+        assert message in record["error"]
+        assert record["failure_elapsed_s"] < DEADLINE_S / 4
+        assert record["rounds"] == version - 1
+        assert record["round_version_after_failure"] is None
+        assert record["buffers_unchanged"] is True
+        assert str(version) not in record["published"]
+        # Exactly the original materializing iterator was exhausted, even on
+        # the failed rank: no restart and no switch to materialize=False.
+        assert record["iterator_calls"].count(version) == 1
+        assert [step for step in record["iterator_steps"] if step[0] == version] == [
+            [version, index] for index in range(len(_SHAPES))
+        ]
+    assert message in records[1]["cause"]
+    if scenario in ("clone_fails", "copy_fails"):
+        # One successful stage, then OOM; no more clone/copy allocations on
+        # that rank while the rest of the iterator is drained.
+        assert records[1]["staging_calls"] == 2
 
 
 def test_a_finish_failure_on_one_rank_fails_finalize_on_every_rank(tmp_path):
