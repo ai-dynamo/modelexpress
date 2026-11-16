@@ -302,7 +302,21 @@ class SglangLoader:
             for stack in stacks
             for index, member in enumerate(stack.members)
         }
+        scratch_stacks = {
+            stack.name
+            for stack in stacks
+            if stack.entry.dst_placements[-1].kind is PlacementKind.SHARD
+        }
+        if not layer_groups and scratch_stacks:
+            layer_groups = tuple((name,) for name in self._wire.names())
         self._groups = _layer_groups(layer_groups, self._wire.names())
+        for group in self._groups:
+            if len(scratch_stacks.intersection(group)) > 1:
+                raise ValueError(
+                    "a layer group may contain at most one sharded stack: "
+                    "sharded stacks reuse receive scratch until the group's "
+                    "transfer completes; use singleton layer_groups"
+                )
         self._tp_rank = tp_rank
         self._tp_size = tp_size
         # A stack's size is checked before any buffer exists, at prepare.

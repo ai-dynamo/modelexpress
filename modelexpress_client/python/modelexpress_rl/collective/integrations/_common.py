@@ -282,15 +282,17 @@ class _FrozenPlan:
                 f"{self._dst_mesh.size} ({self._dst_mesh.canonical()})"
             )
         if self._stacked:
-            base = (
-                SHARDED_DESTINATION_ABI
-                if self._sharded_destination
-                else REPLICATED_DESTINATION_ABI
-            )
-            if topology.m2n_abi_version != base + STACK_ABI_SUFFIX:
+            # Sharded protocol mode may produce only replicated entries (TP1,
+            # norms, or other destination fallbacks). Placements constrain the
+            # ABI but do not uniquely identify the configured protocol mode.
+            bases = (SHARDED_DESTINATION_ABI,)
+            if not self._sharded_destination:
+                bases += (REPLICATED_DESTINATION_ABI,)
+            compatible = tuple(base + STACK_ABI_SUFFIX for base in bases)
+            if topology.m2n_abi_version not in compatible:
                 raise ValueError(
                     "a plan with stacked wire entries requires the "
-                    f"{base + STACK_ABI_SUFFIX!r} receiver ABI, got "
+                    f"receiver ABI to be one of {compatible!r}, got "
                     f"{topology.m2n_abi_version!r}"
                 )
         elif topology.m2n_abi_version.endswith(STACK_ABI_SUFFIX):

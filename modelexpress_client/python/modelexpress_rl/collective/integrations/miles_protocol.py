@@ -675,8 +675,14 @@ class MilesCollectiveProtocolCore:
                     "MILES NCCL M2N contract preflight failed: trainer run identities differ"
                 )
             return
-        manifests = _all_gather((self._lane_rank, local_manifest))
-        lane_ranks = sorted(lane_rank for lane_rank, _manifest in manifests)
+        manifests = _all_gather((self._lane_rank, local_manifest, self._stack_bytes))
+        budgets = [budget for _lane_rank, _manifest, budget in manifests]
+        if any(budget != budgets[0] for budget in budgets):
+            raise ValueError(
+                "every trainer rank must use the same MX_NCCL_REFIT_STACK_BYTES "
+                f"before allocating stacks; per-rank budgets: {budgets}"
+            )
+        lane_ranks = sorted(lane_rank for lane_rank, _manifest, _budget in manifests)
         if lane_ranks != list(range(trainer_world)):
             raise ValueError(
                 "trainer ranks must cover every (DP, TP) coordinate exactly once; "
@@ -685,7 +691,7 @@ class MilesCollectiveProtocolCore:
         reference = manifests[0][1]
         diverged = [
             rank
-            for rank, (_lane_rank, manifest) in enumerate(manifests)
+            for rank, (_lane_rank, manifest, _budget) in enumerate(manifests)
             if manifest != reference
         ]
         if diverged:

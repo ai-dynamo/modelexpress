@@ -386,6 +386,18 @@ class TestDigestAndAbi:
         with pytest.raises(ValueError, match="disagree on stacking"):
             old.validate_topology(_topology(src, dst, trainer_abi))
 
+    def test_replicated_stacks_accept_both_protocol_layouts_but_not_unknown_abis(self):
+        src, dst = _mesh_pair()
+        wire, _ = _derive_wire_plan(
+            _stacked_plan(_four_equal(src_dim=None, dst_dim=None), 1 << 20)
+        )
+        frozen = _FrozenPlan(wire)
+        for base in (REPLICATED_DESTINATION_ABI, SHARDED_DESTINATION_ABI):
+            frozen.validate_topology(_topology(src, dst, base + STACK_ABI_SUFFIX))
+        for abi in ("other" + STACK_ABI_SUFFIX, REPLICATED_DESTINATION_ABI):
+            with pytest.raises(ValueError, match="requires the"):
+                frozen.validate_topology(_topology(src, dst, abi))
+
     def test_unstacked_plans_keep_their_existing_abi_rules(self):
         src, dst = _mesh_pair()
         plain = _FrozenPlan(ReshardPlan(bulk=_canonical(_four_equal(src_dim=None))))

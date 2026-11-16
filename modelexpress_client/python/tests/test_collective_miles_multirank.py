@@ -202,6 +202,23 @@ def _run(rank, scenario, record, world, tp):
         names.remove("model.norm.weight")
     if scenario == "stacked":
         os.environ["MX_NCCL_REFIT_STACK_BYTES"] = str(1 << 20)
+    if scenario.startswith("stack_budget_"):
+        # Four equal 16-byte norms distinguish a pair of two-member stacks
+        # from one four-member stack, as well as off/too-small budgets.
+        _SHAPES.update(
+            {f"model.layers.{index}.input_layernorm.weight": (8,) for index in (1, 2)}
+        )
+        names = list(_SHAPES)
+        contrasting_budget = int(scenario.removeprefix("stack_budget_"))
+        os.environ["MX_NCCL_REFIT_STACK_BYTES"] = str(
+            contrasting_budget if rank == 3 else 64
+        )
+
+        def unexpected_allocation(*args, **kwargs):
+            record["stack_allocation_attempted"] = True
+            raise AssertionError("stack allocation preceded stacking agreement")
+
+        miles_protocol._stack_trainer_buffers = unexpected_allocation
     protocol = miles_protocol.MilesCollectiveProtocolCore(SimpleNamespace())
     protocol.connect(
         [SimpleNamespace(name="original")],
@@ -417,6 +434,7 @@ def _rank_main(rank, init_file, scenario, result_dir, world, tp, timeout_s):
             record["cause"] = repr(error.__cause__)
             record["traceback"] = traceback.format_exc()
         finally:
+            record["elapsed_s"] = time.monotonic() - started
             dist.destroy_process_group()
     except BaseException as error:
         record["fatal"] = traceback.format_exc() or repr(error)
@@ -462,6 +480,23 @@ def _launch(tmp_path, scenario, *, world=WORLD, tp=TP, timeout_s=DEADLINE_S / 2)
 def _server_address(monkeypatch):
     monkeypatch.setenv("MX_SERVER_ADDRESS", "mx:50051")
     monkeypatch.delenv("MX_MILES_DST_LAYOUT", raising=False)
+    monkeypatch.delenv("MX_NCCL_REFIT_STACK_BYTES", raising=False)
+
+
+@pytest.mark.parametrize("contrasting_budget", [0, 16, 32])
+def test_mixed_stack_budgets_fail_uniformly_before_allocation(tmp_path, contrasting_budget):
+    records = _launch(tmp_path, f"stack_budget_{contrasting_budget}")
+
+    assert len({record["error"] for record in records}) == 1
+    for record in records:
+        assert record["error_type"] == "ValueError", record.get("traceback")
+        assert "same MX_NCCL_REFIT_STACK_BYTES" in record["error"]
+        assert f"[64, 64, 64, {contrasting_budget}]" in record["error"]
+        assert record["elapsed_s"] < DEADLINE_S / 4
+        assert not record.get("stack_allocation_attempted", False)
+        assert record["events"] == []
+        assert record["generator_actions"] == []
+        assert record["rounds"] == 0
 
 
 def test_dp2_tp2_without_layouts_publishes_whole_tensors_from_every_rank(tmp_path):

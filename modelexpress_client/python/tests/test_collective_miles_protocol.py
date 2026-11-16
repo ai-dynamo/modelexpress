@@ -1608,8 +1608,8 @@ def test_a_failed_later_begin_sync_keeps_the_committed_contract(monkeypatch):
     # A DP x TP world stand-in: the contract build's collectives run on both
     # ranks while a contract failure on round two leaves round one's state.
     def all_gather(value):
-        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], list):
-            return [(rank, value[1]) for rank in range(2)]
+        if isinstance(value, tuple) and len(value) == 3 and isinstance(value[1], list):
+            return [(rank, value[1], value[2]) for rank in range(2)]
         return [value, value]
 
     monkeypatch.setattr(miles_protocol, "_rank_and_world", lambda: (0, 2))
