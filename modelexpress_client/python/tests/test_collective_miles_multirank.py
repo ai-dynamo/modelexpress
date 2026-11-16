@@ -114,6 +114,21 @@ def _install_fakes(miles_protocol, rank, scenario, record):
             }
             plan = publisher.capture()
             record["plan"] = [entry.canonical() for entry in plan.bulk]
+            if scenario == "reconnect":
+                from modelexpress_rl.collective.integrations.manifest import (
+                    manifest_to_wire,
+                )
+
+                record.setdefault("sessions", []).append({
+                    "manifest": manifest_to_wire(plan, kwargs["topology"]),
+                    "worker_id": kwargs["worker_id"],
+                    "slot_id": kwargs["slot_id"],
+                    "index_in_role": kwargs["index_in_role"],
+                    "buffers": {
+                        name: spec.base.data_ptr()
+                        for name, spec in publisher.local_params().items()
+                    },
+                })
             self._publisher = publisher
 
         def prepare(self):
@@ -175,7 +190,7 @@ def _run(rank, scenario, record):
         names.remove("model.norm.weight")
     protocol = miles_protocol.MilesCollectiveProtocolCore(SimpleNamespace())
     protocol.connect(
-        [object()],
+        [SimpleNamespace(name="original")],
         [2],
         [0],
         SimpleNamespace(
@@ -199,8 +214,23 @@ def _run(rank, scenario, record):
             record["events"].append(f"cancel-{action}")
             return True
 
+        if scenario == "reconnect":
+            return protocol._public_engine_calls(action, **kwargs)
         return [SimpleNamespace(cancel=cancel)]
 
+    def call_engine(engine, endpoint, payload):
+        record.setdefault("engine_payloads", []).append({
+            "engine": engine.name,
+            "endpoint": endpoint,
+            "payload": payload,
+        })
+        return SimpleNamespace(cancel=lambda: True)
+
+    if scenario == "reconnect":
+        protocol._call_engine = call_engine
+        protocol._destroy_on_engine = lambda engine, payload: call_engine(
+            engine, "destroy_weights_update_group", payload
+        )
     protocol._generator_futures = generator_futures
     protocol._wait_generator_futures = lambda futures, *, timeout_s=None: record[
         "events"
@@ -213,8 +243,27 @@ def _run(rank, scenario, record):
         "copy_fails",
         "validation_fails",
         "shape_fails",
+        "reconnect",
     )
-    for version in (1, 2):
+    versions = (1, 2, 3, 4) if scenario == "reconnect" else (1, 2)
+    for version in versions:
+        if scenario == "reconnect" and version == 3:
+            frozen_plan, frozen_topology = protocol._plan, protocol._topology
+            frozen_buffers = dict(protocol._tensors)
+            protocol.connect(
+                [SimpleNamespace(name="replacement")],
+                [2],
+                [0],
+                protocol._parallel_state,
+                SimpleNamespace(gather_pp=False, gather_tp=True, gather_ep=True),
+                "target",
+            )
+            assert protocol._plan is frozen_plan
+            assert protocol._topology is frozen_topology
+            assert all(
+                protocol._tensors[name] is tensor
+                for name, tensor in frozen_buffers.items()
+            )
         # A gathered stream: every rank holds every tensor whole.
         tensors = [(name, _global(name, version)) for name in names]
         if rank == 1 and scenario == "validation_fails":
@@ -272,6 +321,16 @@ def _run(rank, scenario, record):
                 raise
         protocol.finalize(version)
         record["rounds"] += 1
+        if scenario == "reconnect":
+            record.setdefault("connection_rounds", []).append({
+                "generation": protocol._connection_generation,
+                "worker_id": protocol._slot_worker_id,
+                "frozen_model": protocol._topology.model_name,
+            })
+    if scenario == "reconnect":
+        protocol.close()
+        assert not protocol._close_pending
+        assert not protocol._retired_engine_groups
 
 
 def _rank_main(rank, init_file, scenario, result_dir):
@@ -401,6 +460,57 @@ def test_dp2_tp2_without_layouts_publishes_whole_tensors_from_every_rank(tmp_pat
         ["create", "1"],
         ["create", "2"],
     ]
+
+
+def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
+    records = _launch(tmp_path, "reconnect")
+
+    for record in records:
+        assert "error" not in record, record.get("traceback")
+    reference_manifests = [session["manifest"] for session in records[0]["sessions"]]
+    assert len(reference_manifests) == 2
+    first, replacement = reference_manifests
+    assert first["topology"]["model_name"] == "miles-model"
+    assert replacement["topology"]["model_name"] == "miles-model-connection-1"
+    assert first["plan"] == replacement["plan"]
+    for field in ("trainer_slots", "generator_slots", "m2n_abi_version"):
+        assert first["topology"][field] == replacement["topology"][field]
+    assert first["topology"]["m2n_abi_version"] == "miles-sglang-bf16-replicated-v1"
+    for record in records:
+        assert record["rounds"] == 4
+        sessions = record["sessions"]
+        assert [session["manifest"] for session in sessions] == reference_manifests
+        assert sessions[0]["buffers"] == sessions[1]["buffers"]
+        assert sessions[0]["worker_id"] != sessions[1]["worker_id"]
+        assert sessions[0]["slot_id"] == sessions[1]["slot_id"]
+        assert sessions[0]["slot_id"] == first["topology"]["trainer_slots"][record["rank"]]
+        assert all(session["index_in_role"] == record["rank"] for session in sessions)
+        rounds = record["connection_rounds"]
+        assert [item["generation"] for item in rounds] == [0, 0, 1, 1]
+        assert [item["worker_id"] for item in rounds] == [
+            sessions[0]["worker_id"], sessions[0]["worker_id"],
+            sessions[1]["worker_id"], sessions[1]["worker_id"],
+        ]
+        assert all(item["frozen_model"] == "miles-model" for item in rounds)
+        assert record["events"].count("prepare") == 2
+        assert record["events"].count("session-close") == 2
+        for version in range(1, 5):
+            assert record["published"][str(version)] == {
+                name: hashlib.sha256(
+                    _global(name, version).view(torch.uint8).numpy().tobytes()
+                ).hexdigest()
+                for name in _SHAPES
+            }
+    calls = records[0]["engine_payloads"]
+    prepares = [call for call in calls if call["endpoint"] == "init_weights_update_group"]
+    assert [call["engine"] for call in prepares] == ["original", "replacement"]
+    assert [call["payload"]["receiver_init_payload"] for call in prepares] == reference_manifests
+    assert prepares[0]["payload"]["group_name"] != prepares[1]["payload"]["group_name"]
+    destroys = [call for call in calls if call["endpoint"] == "destroy_weights_update_group"]
+    assert [(call["engine"], call["payload"]["group_name"]) for call in destroys] == [
+        (call["engine"], call["payload"]["group_name"]) for call in prepares
+    ]
+    assert all(record.get("engine_payloads", []) == [] for record in records[1:])
 
 
 def test_a_diverged_manifest_fails_the_plan_on_every_rank(tmp_path):
