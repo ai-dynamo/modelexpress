@@ -124,6 +124,7 @@ def _install_fakes(miles_protocol, rank, scenario, record):
                     "worker_id": kwargs["worker_id"],
                     "slot_id": kwargs["slot_id"],
                     "index_in_role": kwargs["index_in_role"],
+                    "layer_groups": kwargs["layer_groups"],
                     "buffers": {
                         name: spec.base.data_ptr()
                         for name, spec in publisher.local_params().items()
@@ -158,6 +159,8 @@ def _install_fakes(miles_protocol, rank, scenario, record):
                 and version == failed_version
             ):
                 raise torch.OutOfMemoryError("synthetic publish allocation failure on rank 0")
+            if scenario == "publish_rank3_fails" and rank == 3:
+                raise RuntimeError("synthetic publish failure on rank 3")
             specs = self._publisher.local_params()
             record["published"][version] = {
                 name: hashlib.sha256(
@@ -190,6 +193,9 @@ def _install_fakes(miles_protocol, rank, scenario, record):
 def _run(rank, scenario, record, world, tp):
     from modelexpress_rl.collective.integrations import miles_protocol
 
+    if scenario.startswith("stacked_"):
+        os.environ["MX_NCCL_REFIT_STACK_BYTES"] = str(1 << 20)
+        scenario = scenario.removeprefix("stacked_")
     _install_fakes(miles_protocol, rank, scenario, record)
     dp_rank, tp_rank = divmod(rank, tp)
     dp = world // tp
@@ -198,6 +204,33 @@ def _run(rank, scenario, record, world, tp):
     names = list(_SHAPES)
     if scenario == "diverged_manifest" and rank == 3:
         names.remove("model.norm.weight")
+    if scenario == "stacked":
+        os.environ["MX_NCCL_REFIT_STACK_BYTES"] = str(1 << 20)
+    if scenario.startswith("stack_budget_"):
+        # Four equal 16-byte norms distinguish a pair of two-member stacks
+        # from one four-member stack, as well as off/too-small budgets.
+        _SHAPES.update(
+            {f"model.layers.{index}.input_layernorm.weight": (8,) for index in (1, 2)}
+        )
+        names = list(_SHAPES)
+        contrasting_budget = int(scenario.removeprefix("stack_budget_"))
+        os.environ["MX_NCCL_REFIT_STACK_BYTES"] = str(
+            contrasting_budget if rank == 3 else 64
+        )
+
+        def unexpected_allocation(*args, **kwargs):
+            record["stack_allocation_attempted"] = True
+            raise AssertionError("stack allocation preceded stacking agreement")
+
+        miles_protocol._stack_trainer_buffers = unexpected_allocation
+    if scenario in ("derivation_preflight_fails", "reuse_state_preflight_fails"):
+        original_allocation = miles_protocol._stack_trainer_buffers
+
+        def record_allocation(*args, **kwargs):
+            record["stack_allocations"] = record.get("stack_allocations", 0) + 1
+            return original_allocation(*args, **kwargs)
+
+        miles_protocol._stack_trainer_buffers = record_allocation
     protocol = miles_protocol.MilesCollectiveProtocolCore(SimpleNamespace())
     protocol.connect(
         [SimpleNamespace(name="original")],
@@ -260,9 +293,13 @@ def _run(rank, scenario, record, world, tp):
         "reuse_world_preflight_fails",
         "mesh_preflight_fails",
         "reuse_topology_preflight_fails",
+        "derivation_preflight_fails",
+        "reuse_state_preflight_fails",
     )
     versions = (1, 2, 3, 4) if scenario == "reconnect" else (1, 2)
     for version in versions:
+        if rank == 1 and version == 2 and scenario == "reuse_state_preflight_fails":
+            protocol._plan = None
         if rank == 1 and version == 2 and scenario in (
             "reuse_world_preflight_fails", "reuse_topology_preflight_fails",
         ):
@@ -330,6 +367,12 @@ def _run(rank, scenario, record, world, tp):
             if fault:
                 with patch.object(torch.Tensor, method, fail_staging):
                     protocol.begin_sync(version, iter_buckets)
+            elif rank == 1 and scenario == "derivation_preflight_fails":
+                with patch.object(
+                    miles_protocol, "_derive_wire_plan",
+                    side_effect=ValueError("synthetic stack derivation failure"),
+                ):
+                    protocol.begin_sync(version, iter_buckets)
             elif rank == 1 and scenario == "mesh_preflight_fails":
                 with patch.object(
                     protocol, "_destination_mesh",
@@ -343,6 +386,18 @@ def _run(rank, scenario, record, world, tp):
             record["buffers_unchanged"] = protocol._tensors is old_tensors
             raise
         record["run_id"] = protocol._run_id
+        record["stack_views"] = {
+            stack.name: [
+                protocol._tensors[member].untyped_storage().data_ptr()
+                == protocol._stack_storage[stack.name].untyped_storage().data_ptr()
+                and protocol._tensors[member].data_ptr()
+                == protocol._stack_storage[stack.name].data_ptr()
+                + index * protocol._tensors[member].numel() * 2
+                for index, member in enumerate(stack.members)
+            ]
+            for stack in protocol._stacks
+        }
+        record["abi"] = protocol._topology.m2n_abi_version
         # The updater drives a separate materialized iterator for sending.
         for index, bucket in enumerate(iter_buckets(materialize=True)):
             if scenario == "diverged_bucket" and rank == 3 and index == 0:
@@ -401,6 +456,7 @@ def _rank_main(rank, init_file, scenario, result_dir, world, tp, timeout_s):
             record["cause"] = repr(error.__cause__)
             record["traceback"] = traceback.format_exc()
         finally:
+            record["elapsed_s"] = time.monotonic() - started
             dist.destroy_process_group()
     except BaseException as error:
         record["fatal"] = traceback.format_exc() or repr(error)
@@ -446,6 +502,23 @@ def _launch(tmp_path, scenario, *, world=WORLD, tp=TP, timeout_s=DEADLINE_S / 2)
 def _server_address(monkeypatch):
     monkeypatch.setenv("MX_SERVER_ADDRESS", "mx:50051")
     monkeypatch.delenv("MX_MILES_DST_LAYOUT", raising=False)
+    monkeypatch.delenv("MX_NCCL_REFIT_STACK_BYTES", raising=False)
+
+
+@pytest.mark.parametrize("contrasting_budget", [0, 16, 32])
+def test_mixed_stack_budgets_fail_uniformly_before_allocation(tmp_path, contrasting_budget):
+    records = _launch(tmp_path, f"stack_budget_{contrasting_budget}")
+
+    assert len({record["error"] for record in records}) == 1
+    for record in records:
+        assert record["error_type"] == "ValueError", record.get("traceback")
+        assert "same MX_NCCL_REFIT_STACK_BYTES" in record["error"]
+        assert f"[64, 64, 64, {contrasting_budget}]" in record["error"]
+        assert record["elapsed_s"] < DEADLINE_S / 4
+        assert not record.get("stack_allocation_attempted", False)
+        assert record["events"] == []
+        assert record["generator_actions"] == []
+        assert record["rounds"] == 0
 
 
 def test_dp2_tp2_without_layouts_publishes_whole_tensors_from_every_rank(tmp_path):
@@ -502,8 +575,16 @@ def test_dp2_tp2_without_layouts_publishes_whole_tensors_from_every_rank(tmp_pat
     ]
 
 
-def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
-    records = _launch(tmp_path, "reconnect")
+@pytest.mark.parametrize("stacked", [False, True])
+def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path, stacked):
+    from modelexpress_rl.collective.integrations._common import _derive_wire_plan
+    from modelexpress_rl.collective.integrations.manifest import (
+        manifest_from_wire,
+        manifest_to_wire,
+        plan_to_wire,
+    )
+
+    records = _launch(tmp_path, "stacked_reconnect" if stacked else "reconnect")
 
     for record in records:
         assert "error" not in record, record.get("traceback")
@@ -515,7 +596,15 @@ def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
     assert first["plan"] == replacement["plan"]
     for field in ("trainer_slots", "generator_slots", "m2n_abi_version"):
         assert first["topology"][field] == replacement["topology"][field]
-    assert first["topology"]["m2n_abi_version"] == "miles-sglang-bf16-replicated-v1"
+    expected_abi = "miles-sglang-bf16-replicated-v1" + ("+stack1" if stacked else "")
+    assert first["topology"]["m2n_abi_version"] == expected_abi
+    calls = records[0]["engine_payloads"]
+    prepares = [call for call in calls if call["endpoint"] == "init_weights_update_group"]
+    per_tensor, _topology = manifest_from_wire(prepares[0]["payload"]["receiver_init_payload"])
+    wire_plan, stacks = _derive_wire_plan(per_tensor)
+    assert bool(stacks) is stacked
+    assert plan_to_wire(wire_plan) == first["plan"]
+    members = {name for stack in stacks for name in stack.members}
     for record in records:
         assert record["rounds"] == 4
         sessions = record["sessions"]
@@ -525,6 +614,11 @@ def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
         assert sessions[0]["slot_id"] == sessions[1]["slot_id"]
         assert sessions[0]["slot_id"] == first["topology"]["trainer_slots"][record["rank"]]
         assert all(session["index_in_role"] == record["rank"] for session in sessions)
+        expected_groups = (
+            [[entry.name] for entry in wire_plan.bulk]
+            if stacked else [[entry.name for entry in wire_plan.bulk]]
+        )
+        assert all(session["layer_groups"] == expected_groups for session in sessions)
         rounds = record["connection_rounds"]
         assert [item["generation"] for item in rounds] == [0, 0, 1, 1]
         assert [item["worker_id"] for item in rounds] == [
@@ -535,16 +629,25 @@ def test_reconnect_uses_one_fresh_session_topology_on_every_rank(tmp_path):
         assert record["events"].count("prepare") == 2
         assert record["events"].count("session-close") == 2
         for version in range(1, 5):
-            assert record["published"][str(version)] == {
-                name: hashlib.sha256(
-                    _global(name, version).view(torch.uint8).numpy().tobytes()
-                ).hexdigest()
-                for name in _SHAPES
+            tensors = {
+                name: _global(name, version) for name in _SHAPES if name not in members
             }
-    calls = records[0]["engine_payloads"]
-    prepares = [call for call in calls if call["endpoint"] == "init_weights_update_group"]
+            tensors.update({
+                stack.name: torch.stack([_global(name, version) for name in stack.members])
+                for stack in stacks
+            })
+            assert record["published"][str(version)] == {
+                name: hashlib.sha256(tensor.view(torch.uint8).numpy().tobytes()).hexdigest()
+                for name, tensor in tensors.items()
+            }
+        assert all(all(views) for views in record["stack_views"].values())
     assert [call["engine"] for call in prepares] == ["original", "replacement"]
-    assert [call["payload"]["receiver_init_payload"] for call in prepares] == reference_manifests
+    for call, expected in zip(prepares, reference_manifests, strict=True):
+        receiver_plan, receiver_topology = manifest_from_wire(
+            call["payload"]["receiver_init_payload"]
+        )
+        receiver_wire, _stacks = _derive_wire_plan(receiver_plan)
+        assert manifest_to_wire(receiver_wire, receiver_topology) == expected
     assert prepares[0]["payload"]["group_name"] != prepares[1]["payload"]["group_name"]
     destroys = [call for call in calls if call["endpoint"] == "destroy_weights_update_group"]
     assert [(call["engine"], call["payload"]["group_name"]) for call in destroys] == [
@@ -669,9 +772,11 @@ def test_preparation_failure_drains_the_collective_iterator_on_every_rank(
 @pytest.mark.parametrize(
     "scenario,version", [("publish_fails", 1), ("reuse_publish_fails", 2)]
 )
+@pytest.mark.parametrize("stacked", [False, True])
 def test_publish_failure_stops_every_rank_before_updater_post_stream_barrier(
-    tmp_path, scenario, version
+    tmp_path, scenario, version, stacked
 ):
+    scenario = f"stacked_{scenario}" if stacked else scenario
     records = _launch(tmp_path, scenario, world=2, tp=1, timeout_s=5)
 
     for record in records:
@@ -725,6 +830,59 @@ def test_contract_preflight_failure_reaches_every_rank_before_contract_collectiv
     assert message in records[1]["cause"]
 
 
+@pytest.mark.parametrize(
+    "scenario,version,message",
+    [
+        ("derivation_preflight_fails", 1, "synthetic stack derivation failure"),
+        ("reuse_state_preflight_fails", 2, "whether the frozen plan is reusable"),
+    ],
+)
+def test_stacked_contract_preflight_agrees_before_any_conditional_collective(
+    tmp_path, scenario, version, message
+):
+    records = _launch(tmp_path, f"stacked_{scenario}", timeout_s=5)
+
+    assert len({record["error"] for record in records}) == 1
+    for record in records:
+        assert record["error_type"] == "RuntimeError", record.get("traceback")
+        assert "contract preflight failed" in record["error"]
+        assert message in record["error"]
+        assert record["failure_elapsed_s"] < 3
+        assert record["rounds"] == version - 1
+        assert record.get("stack_allocations", 0) == version - 1
+        assert record["round_version_after_failure"] is None
+        assert record["buffers_unchanged"] is True
+        assert record.get("post_stream_barriers", []) == list(range(1, version))
+        assert [step for step in record["iterator_steps"] if step[0] == version] == [
+            [version, index] for index in range(len(_SHAPES))
+        ]
+
+
+def test_a_publish_failure_fails_send_bucket_on_every_rank(tmp_path):
+    # _launch's wall deadline is the no-hang guard; below, the failure vote.
+    records = _launch(tmp_path, "publish_rank3_fails")
+
+    for record in records:
+        assert record["error_type"] == "RuntimeError", record.get("traceback")
+        assert "publish failed" in record["error"]
+        assert "rank 3:" in record["error"]
+        assert record["rounds"] == 0
+        # The round began, but the publish group never finished on rank 3 and
+        # the vote stops every rank at the same bucket: nobody finalizes.
+        assert not any(
+            isinstance(event, list) and event[0] == "finish"
+            for event in record["events"]
+        )
+    # Rank 0 submitted the round, then the terminal close retires the
+    # futures and destroys the engine group.
+    assert records[0]["generator_actions"] == [
+        ["prepare", None],
+        ["run_round", "operation-1"],
+        ["close", None],
+    ]
+    assert all(record["generator_actions"] == [] for record in records[1:])
+
+
 def test_a_finish_failure_on_one_rank_fails_finalize_on_every_rank(tmp_path):
     records = _launch(tmp_path, "finish_fails")
 
@@ -744,3 +902,54 @@ def test_a_finish_failure_on_one_rank_fails_finalize_on_every_rank(tmp_path):
     ]
     assert "cancel-run_round" in records[0]["events"]
     assert all(record["generator_actions"] == [] for record in records[1:])
+
+
+def test_dp2_tp2_stacked_ranks_agree_and_publish_the_stacks(tmp_path):
+    records = _launch(tmp_path, "stacked")
+
+    for record in records:
+        assert "error" not in record, record.get("traceback")
+        assert record["rounds"] == 2
+        assert record["abi"] == "miles-sglang-bf16-replicated-v1+stack1"
+    # One wire plan on every rank: the two norms are one stacked entry.
+    assert len({json.dumps(record["plan"]) for record in records}) == 1
+    plan = [json.loads(entry) for entry in records[0]["plan"]]
+    stacked = [entry for entry in plan if entry[0].startswith("m2n-stack1/")]
+    assert len(plan) == len(_SHAPES) - 1
+    assert len(stacked) == 1
+    assert stacked[0][1] == [2, 8]
+    assert stacked[0][4] == "2x2@0"
+    assert stacked[0][5] == ["R", "R"]
+    assert stacked[0][6] == "2@4"
+    assert stacked[0][7] == ["R"]
+    assert stacked[0][8] == "m2n-stack1-0"
+    members = ("model.layers.0.input_layernorm.weight", "model.norm.weight")
+    for record in records:
+        (virtual,) = record["stack_views"]
+        assert virtual == stacked[0][0]
+        assert record["stack_views"][virtual] == [True, True]
+        assert record["local_shapes"][virtual] == [2, 8]
+        assert set(record["local_shapes"]) == {
+            name for name in _SHAPES if name not in members
+        } | {virtual}
+        for version in ("1", "2"):
+            stack = torch.stack([_global(name, int(version)) for name in members])
+            published = record["published"][version]
+            assert (
+                published[virtual]
+                == hashlib.sha256(stack.view(torch.uint8).numpy().tobytes()).hexdigest()
+            )
+            for name in _SHAPES:
+                if name in members:
+                    continue
+                assert (
+                    published[name]
+                    == hashlib.sha256(
+                        _global(name, int(version)).view(torch.uint8).numpy().tobytes()
+                    ).hexdigest()
+                )
+    assert records[0]["generator_actions"] == [
+        ["prepare", None],
+        ["run_round", "operation-1"],
+        ["run_round", "operation-2"],
+    ]

@@ -108,8 +108,8 @@ def _fake_world(monkeypatch, world):
     """Stand in for a trainer world: this process is rank 0 of ``world``."""
 
     def all_gather(value):
-        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], list):
-            return [(lane_rank, value[1]) for lane_rank in range(world)]
+        if isinstance(value, tuple) and len(value) == 3 and isinstance(value[1], list):
+            return [(lane_rank, value[1], value[2]) for lane_rank in range(world)]
         return [value] * world
 
     monkeypatch.setattr(miles_protocol, "_rank_and_world", lambda: (0, world))
@@ -205,9 +205,9 @@ class TestTensorLayoutContract:
         whole = [("model.norm.weight", torch.zeros(HIDDEN, dtype=torch.bfloat16))]
 
         def all_gather(value):
-            if isinstance(value, tuple) and len(value) == 2:
+            if isinstance(value, tuple) and len(value) == 3:
                 other = [("model.norm.weight", (HIDDEN // 2,), None)]
-                return [value, (1, other)]
+                return [value, (1, other, value[2])]
             return [value, value]
 
         monkeypatch.setattr(miles_protocol, "_all_gather", all_gather)

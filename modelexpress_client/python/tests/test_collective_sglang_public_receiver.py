@@ -37,6 +37,9 @@ from modelexpress_rl.collective.integrations.manifest import (
 )
 from tests.test_collective_sglang_receiver import (
     _NAMES,
+    _STACK_KEYS,
+    _stack_topology,
+    _stacked_plan,
     FakeChannel,
     FakeTensor,
     FakeModel,
@@ -127,13 +130,21 @@ def _round(version="3", operation_id="op-3"):
 
 @pytest.mark.usefixtures("fake_buffers")
 @pytest.mark.parametrize("receiver_build", ["1.0", "2.0"])
+@pytest.mark.parametrize("layout", ["plain", "stacked-replicated", "stacked-sharded"])
 def test_session_admission_digests_observe_each_local_native_build(
-    monkeypatch, receiver_build
+    monkeypatch, receiver_build, layout
 ):
     from importlib import metadata
     from pathlib import PurePosixPath
 
+    from dataclasses import replace
+
     from modelexpress_rl.collective.integrations import miles, sglang
+    from modelexpress_rl.collective.integrations._common import (
+        SHARDED_DESTINATION_ABI,
+        STACK_ABI_SUFFIX,
+        _derive_wire_plan,
+    )
     from modelexpress_rl.collective.integrations.miles import MilesPublisher
 
     # Use the existing metadata-only probe, with no native imports. The
@@ -152,12 +163,21 @@ def test_session_admission_digests_observe_each_local_native_build(
     for module in (miles, sglang):
         monkeypatch.setattr(module, "_collective_streams", lambda *a, **kw: [None])
     plan, topology = _plan(), _topology()
+    if layout != "plain":
+        plan, topology = _stacked_plan(), _stack_topology()
+        if layout == "stacked-sharded":
+            # A sharded protocol may legitimately carry only replicated weights.
+            topology = replace(
+                topology, m2n_abi_version=SHARDED_DESTINATION_ABI + STACK_ABI_SUFFIX
+            )
+    wire_plan, _stacks = _derive_wire_plan(plan)
+    manifest = manifest_to_wire(plan, topology)
     publisher = MilesPublisher(
-        plan=plan,
+        plan=wire_plan,
         source_partition=0,
         tensors={
-            name: FakeTensor((4, 4), address=0x1000 + index * 0x100)
-            for index, name in enumerate(plan.parameter_names())
+            entry.name: FakeTensor(entry.global_shape, address=0x1000 + index * 0x100)
+            for index, entry in enumerate(wire_plan.bulk)
         },
     )
     trainer = miles.MilesTrainerSession.create(
@@ -171,6 +191,7 @@ def test_session_admission_digests_observe_each_local_native_build(
     )
     trainer._client.initialize(publisher, source_partition=0)
     trainer_digest = trainer._client._digest
+    assert trainer._client._m2n_abi_version == miles._local_m2n_abi(topology.m2n_abi_version)
     local_build = receiver_build
     monkeypatch.setattr(receiver_module.grpc, "insecure_channel", FakeChannel)
     monkeypatch.setattr(receiver_module.auth, "with_auth", lambda channel: channel)
@@ -183,9 +204,14 @@ def test_session_admission_digests_observe_each_local_native_build(
         "prepare",
         lambda self: self._client.initialize(self._loader),
     )
-    receiver = create_receiver(_context(init_payload=manifest_to_wire(plan, topology)))
+    receiver = create_receiver(_context(init_payload=manifest))
     receiver_digest = receiver._session._client._digest
 
+    assert receiver._session._client._m2n_abi_version == sglang._local_m2n_abi(
+        topology.m2n_abi_version
+    )
+    assert manifest["topology"]["m2n_abi_version"] == topology.m2n_abi_version
+    assert receiver._session._loader.capture().bulk == wire_plan.bulk
     assert (trainer_digest == receiver_digest) is (receiver_build == "1.0")
     assert "nccl-extensions==1.0" in trainer._client._m2n_abi_version
     assert (
@@ -231,6 +257,14 @@ class TestFactory:
     def test_rank_offset_selects_the_generator_slot(self, fake_mx):
         context = _context(rank_offset=1, tp_rank=0, tp_size=2)
         assert create_receiver(context).slot_id == "run:generator-1"
+
+    def test_a_stacking_plan_uses_one_group_per_wire_entry(self, fake_mx):
+        manifest = manifest_to_wire(_stacked_plan(_STACK_KEYS), _stack_topology())
+        create_receiver(_context(init_payload=manifest))
+        kwargs = FakeSession.instances[0].kwargs
+        loader = kwargs["loader"]
+        assert loader.layer_groups == tuple((n,) for n in loader.parameter_names())
+        assert len(loader.layer_groups) == 2
 
     def test_a_round_runs_under_its_version_and_operation(
         self,

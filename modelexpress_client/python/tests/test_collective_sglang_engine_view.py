@@ -27,11 +27,17 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from dataclasses import replace
 from torch import nn
 
 import modelexpress_rl.collective.integrations._common as common
 import modelexpress_rl.collective.integrations.sglang as sglang_integration
-from modelexpress_rl.collective.integrations._common import _expected_index
+from modelexpress_rl.collective.integrations._common import (
+    _derive_wire_plan,
+    _expected_index,
+    _stack_classes,
+    _stack_trainer_buffers,
+)
 from modelexpress_rl.collective.integrations.sglang import SglangLoader, _engine_view
 from modelexpress_rl.collective.integrations.sglang_layout import (
     SglangModelFacts,
@@ -41,6 +47,7 @@ from modelexpress_rl.collective.types import (
     MeshSpec,
     ParamPlan,
     Placement,
+    PlacementKind,
     ReshardPlan,
 )
 
@@ -507,6 +514,7 @@ def test_the_loader_fails_closed_when_sglang_rebinds_aliased_storage(cpu_storage
         tp_size=tp,
     )
     loader.start_new_round("v1")
+    loader.install(0)
     loader.finish()
 
     down = layers["mlp.down_proj"]
@@ -552,3 +560,598 @@ def test_the_loader_refuses_sharded_entries_it_cannot_prove(
             tp_rank=rank,
             tp_size=tp,
         )
+
+
+# --- equal-geometry stacks over the same live layers ------------------------
+
+
+def _more_norms(tensors):
+    tensors = _norm_tensors(tensors)
+    for index, name in enumerate(
+        (
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+        )
+    ):
+        tensors[name] = torch.full((HIDDEN,), float(index + 2), dtype=torch.bfloat16)
+    return tensors
+
+
+def _with_stacks(plan, budget=1 << 20):
+    keys = _stack_classes(plan.bulk, budget)
+    return ReshardPlan(
+        bulk=[
+            replace(entry, group_key=keys[entry.name]) if entry.name in keys else entry
+            for entry in plan.bulk
+        ],
+        source_partition_count=1,
+    )
+
+
+def _receive(loader, tensors, rank):
+    """Receive one round the way the backend does, then install each group."""
+    wire = loader.capture()
+    stacks = {
+        stack.name: stack for stack in _derive_wire_plan(loader._plan.capture())[1]
+    }
+    specs = loader.local_params()
+    loader.start_new_round("v1")
+    from modelexpress_rl.collective.backend import _check_storage
+
+    entries = {entry.name: entry for entry in wire.bulk}
+    for group_id, group in enumerate(loader.layer_groups):
+        regions = []
+        pending = []
+        for name in group:
+            entry = entries[name]
+            if name in stacks:
+                full = torch.stack([tensors[m] for m in stacks[name].members])
+            else:
+                full = tensors[name]
+            index = _expected_index(
+                entry.global_shape, entry.dst_mesh, entry.dst_placements, 1 + rank
+            )
+            spec = specs[name]
+            ctx = spec.enter()
+            _check_storage(regions, entry, None, ctx.buf)
+            pending.append((spec, ctx, full[index]))
+        for spec, ctx, received in pending:
+            ctx.buf.copy_(received)
+        for spec, ctx, _received in pending:
+            spec.leave(ctx)
+        loader.install(group_id)
+    loader.finish()
+    return wire
+
+
+def _loader_for(plan, model, *, tp, rank):
+    wire, _ = _derive_wire_plan(plan)
+    return SglangLoader(
+        plan=plan,
+        model=model,
+        device="cpu",
+        layer_groups=tuple((entry.name,) for entry in wire.bulk),
+        generator_index=rank,
+        tp_rank=rank,
+        tp_size=tp,
+    )
+
+
+@pytest.mark.parametrize("build", BACKENDS)
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_a_stacked_receive_installs_exactly_what_a_per_tensor_receive_does(
+    cpu_storage, build, tp
+):
+    kv_heads = 4
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    for rank in range(tp):
+        per_tensor = _sharded_plan(tensors, tp=tp, kv_heads=kv_heads)
+        stacked = _with_stacks(per_tensor)
+        wire, stacks = _derive_wire_plan(stacked)
+        # k/v, gate/up and the three norms stack; everything else stays plain.
+        assert sorted(len(stack.members) for stack in stacks) == [2, 2, 3]
+        assert len(wire.bulk) == len(per_tensor.bulk) - 4
+
+        ref_layers = build(kv_heads, rank, tp, VOCAB)
+        ref_model = _model(ref_layers, kv_heads=kv_heads)
+        _receive(_loader_for(per_tensor, ref_model, tp=tp, rank=rank), tensors, rank)
+
+        layers = build(kv_heads, rank, tp, VOCAB)
+        model = _model(layers, kv_heads=kv_heads)
+        loader = _loader_for(stacked, model, tp=tp, rank=rank)
+        _receive(loader, tensors, rank)
+
+        stock = build(kv_heads, rank, tp, VOCAB)
+        _stock_load(stock, {k: v for k, v in tensors.items() if "norm" not in k})
+        for key, module in stock.items():
+            # At TP1 every entry is staged and only recorded by this model's
+            # stand-in load_weights, so the live layers are untouched; the
+            # staged inputs are compared below instead.
+            if tp > 1:
+                assert torch.equal(module.weight, layers[key].weight), (key, rank)
+            assert torch.equal(ref_layers[key].weight, layers[key].weight), (
+                key,
+                rank,
+            )
+        loaded = {
+            name: tensor.clone() for call in model.loaded for name, tensor in call
+        }
+        reference = {
+            name: tensor.clone() for call in ref_model.loaded for name, tensor in call
+        }
+        assert loaded.keys() == reference.keys()
+        for name, tensor in loaded.items():
+            assert torch.equal(tensor, reference[name]), name
+            assert torch.equal(tensor, tensors[name]), name
+        # All staged weights share one call, independently of wire stacking.
+        assert len(model.loaded) == 1
+        assert sum("norm" in name for name, _tensor in model.loaded[0]) == 3
+        # TP1 keeps every entry whole, so every stack is staged; at TP>1 the
+        # sharded stacks are received through the scratch instead.
+        assert (loader._scratch_elements > 0) == (tp > 1)
+
+
+@pytest.mark.parametrize("tp", [2, 4])
+def test_a_sharded_stack_never_installs_through_load_weights(cpu_storage, tp):
+    kv_heads = 4
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    layers = _reproduced_layers(kv_heads, 0, tp, VOCAB)
+    loader = _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=0)
+    flags = {
+        tuple(group): bool(loader._staged_members(index))
+        for index, group in enumerate(loader.layer_groups)
+    }
+    stacks = {stack.name: stack for stack in _derive_wire_plan(plan)[1]}
+    for (name,), reads in flags.items():
+        if name in stacks and "norm" in stacks[name].members[0]:
+            assert reads is True
+        else:
+            assert reads is False, name
+
+
+@pytest.mark.parametrize("grouping", ["default", "compatible", "incompatible"])
+def test_sharded_stack_groups_respect_backend_storage_lifetime(cpu_storage, grouping):
+    from modelexpress_rl.collective.backend import _check_storage
+
+    kv_heads, tp, rank = 4, 2, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    wire, stacks = _derive_wire_plan(plan)
+    scratch_names = {
+        stack.name
+        for stack in stacks
+        if stack.entry.dst_placements[-1].kind is PlacementKind.SHARD
+    }
+    assert len(scratch_names) == 2
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    model = _model(layers, kv_heads=kv_heads)
+    kwargs = dict(
+        plan=plan,
+        model=model,
+        device="cpu",
+        generator_index=rank,
+        tp_rank=rank,
+        tp_size=tp,
+    )
+    if grouping == "incompatible":
+        # The backend really rejects the shared spans, not just the group names.
+        loader = SglangLoader(**kwargs)
+        entries = {entry.name: entry for entry in wire.bulk}
+        specs = loader.local_params()
+        regions = []
+        with pytest.raises(RuntimeError, match="group storage overlap"):
+            for name in sorted(scratch_names):
+                ctx = specs[name].enter()
+                _check_storage(regions, entries[name], None, ctx.buf)
+        with pytest.raises(ValueError, match="at most one sharded stack"):
+            SglangLoader(**kwargs, layer_groups=(tuple(e.name for e in wire.bulk),))
+        return
+    if grouping == "compatible":
+        # Allow explicit multi-entry groups while keeping scratch stacks apart.
+        groups = []
+        group = []
+        scratch_count = 0
+        for entry in wire.bulk:
+            if entry.name in scratch_names:
+                if scratch_count:
+                    groups.append(tuple(group))
+                    group = []
+                scratch_count = 1
+            group.append(entry.name)
+        groups.append(tuple(group))
+        assert any(len(group) > 1 for group in groups)
+        kwargs["layer_groups"] = tuple(groups)
+    loader = SglangLoader(**kwargs)
+    _receive(loader, tensors, rank)
+    stock = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    _stock_load(stock, {name: t for name, t in tensors.items() if "norm" not in name})
+    for name, module in stock.items():
+        assert torch.equal(module.weight, layers[name].weight), name
+    assert len(loader._scratch) == 1
+    assert loader._scratch_primary.numel() == max(
+        len(stack.members) * loader._buffers[stack.members[0]].numel()
+        for stack in stacks
+        if stack.name in scratch_names
+    )
+
+
+def test_a_stack_whose_engine_views_overlap_is_refused(cpu_storage, monkeypatch):
+    kv_heads, tp, rank = 4, 2, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    original = sglang_integration._engine_view
+
+    def overlapping(model, name, global_shape, tp_rank, tp_size):
+        # up_proj resolves to gate_proj's slice: two members, one memory range.
+        name = name.replace("up_proj", "gate_proj")
+        return original(model, name, global_shape, tp_rank, tp_size)
+
+    monkeypatch.setattr(sglang_integration, "_engine_view", overlapping)
+    with pytest.raises(ValueError, match="overlap in memory"):
+        _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=rank)
+
+
+def test_a_non_bf16_sharded_stack_is_refused_with_the_stack_named(
+    cpu_storage, monkeypatch
+):
+    kv_heads, tp, rank = 4, 2, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    original = sglang_integration._derive_wire_plan
+
+    def doctored(frozen):
+        # The plan's bf16 gate sits in front of this path; doctoring only the
+        # sharded stacks proves the scratch path names its own failure if a
+        # non-bf16 wire dtype ever arrives past it.
+        wire, stacks = original(frozen)
+        out = []
+        for stack in stacks:
+            if stack.entry.dst_placements[-1].kind is PlacementKind.SHARD:
+                stack = replace(stack, entry=replace(stack.entry, dtype="float32"))
+            out.append(stack)
+        return wire, tuple(out)
+
+    monkeypatch.setattr(sglang_integration, "_derive_wire_plan", doctored)
+    with pytest.raises(ValueError, match="bfloat16 scratch"):
+        _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=rank)
+
+
+def test_each_stream_gets_its_own_receive_scratch(cpu_storage, monkeypatch):
+    kv_heads, tp, rank = 4, 2, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    loader = _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=rank)
+    specs = loader.local_params()
+    (sharded,) = [
+        specs[name]
+        for name, stack in loader._stacks.items()
+        if name not in loader._stack_buffers and "gate_proj" in stack.members[0]
+    ]
+    key = {"value": 1}
+    monkeypatch.setattr(sglang_integration, "_current_stream_key", lambda: key["value"])
+
+    first = sharded.enter().buf
+    # The stream allocated at prepare claims the scratch that was made then.
+    assert (
+        first.untyped_storage().data_ptr()
+        == loader._scratch_primary.untyped_storage().data_ptr()
+    )
+    assert sharded.enter().buf.untyped_storage().data_ptr() == (
+        first.untyped_storage().data_ptr()
+    )
+    key["value"] = 2
+    second = sharded.enter().buf
+    assert second.untyped_storage().data_ptr() != first.untyped_storage().data_ptr()
+    assert tuple(second.shape) == tuple(first.shape)
+
+
+class _FusedAProjectionModel:
+    """Reproduce the BF16 fused-loading branch in SGLang v0.5.6.post2.
+
+    deepseek_v2.py:3648-3652,3788-3851 keeps this cache local to load_weights;
+    neither half writes the fused parameter without its partner in that call.
+    """
+
+    def __init__(self, q_rows):
+        self.params = {
+            f"model.layers.{index}.self_attn.fused_qkv_a_proj_with_mqa.weight": nn.Parameter(
+                torch.zeros(rows + 2, 8, dtype=torch.bfloat16), requires_grad=False
+            )
+            for index, rows in enumerate(q_rows)
+        }
+        self.quant_config = None
+        self.loaded = []
+
+    def load_weights(self, weights):
+        weights = list(weights)
+        self.loaded.append(weights)
+        cached_a_proj = {}
+        for name, loaded_weight in weights:
+            cached_a_proj[name] = loaded_weight
+            q_name = name.replace("kv_a_proj_with_mqa", "q_a_proj")
+            kv_name = name if "kv_a_proj_with_mqa" in name else name.replace(
+                "q_a_proj", "kv_a_proj_with_mqa"
+            )
+            if q_name in cached_a_proj and kv_name in cached_a_proj:
+                fused = torch.cat([cached_a_proj[q_name], cached_a_proj[kv_name]], dim=0)
+                param_name = q_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
+                self.params[param_name].copy_(fused)
+                cached_a_proj.pop(q_name)
+                cached_a_proj.pop(kv_name)
+
+
+@pytest.mark.parametrize("q_rows", [(4, 4), (4, 6)], ids=["two-stacks", "plain-leftovers"])
+@pytest.mark.parametrize("budget", [0, 4096], ids=["disabled", "stacked"])
+def test_protocol_stacking_preserves_fused_loader_atomicity(
+    cpu_storage, monkeypatch, q_rows, budget
+):
+    from modelexpress_rl.collective.integrations import miles_protocol
+    from modelexpress_rl.collective.integrations.sglang import build_generator_loader
+
+    monkeypatch.setenv("MX_SERVER_ADDRESS", "mx:50051")
+    monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
+    monkeypatch.setenv("MX_MILES_DST_LAYOUT", "replicate")
+    monkeypatch.setenv("MX_NCCL_REFIT_STACK_BYTES", str(budget))
+    protocol = miles_protocol.MilesCollectiveProtocolCore(SimpleNamespace())
+    protocol.connect(
+        [object()],
+        [1],
+        [0],
+        SimpleNamespace(
+            **{
+                name: SimpleNamespace(size=1, rank=0)
+                for name in ("pp", "tp", "ep", "etp", "cp", "intra_dp", "indep_dp")
+            }
+        ),
+        SimpleNamespace(gather_pp=False, gather_tp=True, gather_ep=True),
+        "target",
+    )
+    model = _FusedAProjectionModel(q_rows)
+    loader = None
+    addresses = None
+    for version in (1, 2):
+        tensors = {}
+        for index, rows in enumerate(q_rows):
+            prefix = f"model.layers.{index}.self_attn."
+            tensors[prefix + "q_a_proj.weight"] = torch.full(
+                (rows, 8), version * 10 + index + 1, dtype=torch.bfloat16
+            )
+            tensors[prefix + "kv_a_proj_with_mqa.weight"] = torch.full(
+                (2, 8), version * 20 + index + 1, dtype=torch.bfloat16
+            )
+        protocol.begin_sync(version, lambda *, materialize: iter([list(tensors.items())]))
+        if loader is None:
+            assert bool(protocol._stacks) is bool(budget)
+            loader = build_generator_loader(
+                plan=protocol._plan,
+                topology=protocol._topology,
+                model=model,
+                device="cpu",
+                generator_slot_offset=0,
+                tp_rank=0,
+                tp_size=1,
+            ).loader
+            addresses = {name: t.data_ptr() for name, t in loader._buffers.items()}
+        model.loaded.clear()
+        _receive(loader, tensors, 0)
+        for index in range(len(q_rows)):
+            prefix = f"model.layers.{index}.self_attn."
+            expected = torch.cat([
+                tensors[prefix + "q_a_proj.weight"],
+                tensors[prefix + "kv_a_proj_with_mqa.weight"],
+            ])
+            actual = model.params[prefix + "fused_qkv_a_proj_with_mqa.weight"]
+            assert torch.equal(actual, expected), (budget, version, index, actual.sum())
+        assert len(model.loaded) == 1
+        assert [name for name, _tensor in model.loaded[0]] == protocol._plan.parameter_names()
+        assert {name: t.data_ptr() for name, t in loader._buffers.items()} == addresses
+        protocol._disarm_round()
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4])
+def test_fused_install_waits_for_every_pipelined_receive(cpu_storage, monkeypatch, depth):
+    from modelexpress_rl.collective.backend import _check_storage
+    from modelexpress_rl.collective.client import RefitClientGenerator
+
+    monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", str(depth))
+    model = _FusedAProjectionModel((4, 4, 6))
+    tensors = {}
+    for index, rows in enumerate((4, 4, 6)):
+        prefix = f"model.layers.{index}.self_attn."
+        tensors[prefix + "q_a_proj.weight"] = torch.full(
+            (rows, 8), index + 1, dtype=torch.bfloat16
+        )
+        tensors[prefix + "kv_a_proj_with_mqa.weight"] = torch.full(
+            (2, 8), index + 11, dtype=torch.bfloat16
+        )
+    plan = _with_stacks(_sharded_plan(tensors, tp=1, kv_heads=4))
+    loader = _loader_for(plan, model, tp=1, rank=0)
+    wire, stacks = _derive_wire_plan(plan)
+    entries = {entry.name: entry for entry in wire.bulk}
+    full = dict(tensors)
+    full.update({stack.name: torch.stack([tensors[m] for m in stack.members]) for stack in stacks})
+    specs = loader.local_params()
+    waited = []
+    pending = {}
+    original_load = model.load_weights
+
+    def coherent_load(weights):
+        assert waited == list(range(len(loader.layer_groups)))
+        original_load(weights)
+
+    monkeypatch.setattr(model, "load_weights", coherent_load)
+
+    class Half:
+        def start_weight_update(self, version):
+            pass
+
+        def issue_weights(self, group_id):
+            regions = []
+            pending[group_id] = []
+            for name in loader.layer_groups[group_id]:
+                ctx = specs[name].enter()
+                _check_storage(regions, entries[name], None, ctx.buf)
+                pending[group_id].append((name, ctx))
+
+        def wait_weights(self, group_id):
+            # Deliberately leave issued transfers unwritten until their wait.
+            assert model.loaded == []
+            for name, ctx in pending.pop(group_id):
+                ctx.buf.copy_(full[name])
+                specs[name].leave(ctx)
+            waited.append(group_id)
+
+        def finish_weight_update(self, broadcast_lane_id):
+            assert not pending
+            assert len(model.loaded) == 1
+
+    client = RefitClientGenerator(
+        rendezvous=object(), model_name="m", trainer_slots=["t0"],
+        generator_slots=["g0"], source_partition_count=1, slot_id="g0",
+        worker_id="w0", index_in_role=0,
+    )
+    client.initialize(loader)
+    client._half = Half()
+    client._membership = SimpleNamespace(broadcast_lane=SimpleNamespace(lane_id=0))
+    monkeypatch.setattr(client, "_bind_operation", lambda *args: None)
+    monkeypatch.setattr(client, "_report_success", lambda: None)
+    client.start_weight_update("v1", "op1")
+    for group_id in range(len(loader.layer_groups)):
+        client.update_weights("v1", group_id)
+    client.finish_weight_update("v1")
+    for index in range(3):
+        prefix = f"model.layers.{index}.self_attn."
+        expected = torch.cat([
+            tensors[prefix + "q_a_proj.weight"],
+            tensors[prefix + "kv_a_proj_with_mqa.weight"],
+        ])
+        assert torch.equal(model.params[prefix + "fused_qkv_a_proj_with_mqa.weight"], expected)
+
+
+@pytest.mark.parametrize("budget", [0, 1 << 20])
+def test_protocol_sharded_tp1_preserves_abi_with_replicated_entries(
+    cpu_storage, monkeypatch, budget
+):
+    import modelexpress_rl.collective.integrations.miles as miles_integration
+    from modelexpress_rl.collective.integrations import miles_protocol
+    from modelexpress_rl.collective.integrations._common import (
+        SHARDED_DESTINATION_ABI,
+        STACK_ABI_SUFFIX,
+    )
+    from modelexpress_rl.collective.integrations.manifest import (
+        manifest_from_wire,
+        manifest_to_wire,
+    )
+    from modelexpress_rl.collective.plan import plan_digest
+
+    monkeypatch.setenv("MX_SERVER_ADDRESS", "mx:50051")
+    monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
+    monkeypatch.setenv("MX_MILES_DST_LAYOUT", "sharded")
+    monkeypatch.setenv("MX_NCCL_REFIT_STACK_BYTES", str(budget))
+    monkeypatch.setattr(miles_protocol, "_model_facts", lambda args: _facts(4))
+    monkeypatch.setattr(miles_integration, "_tensor_signature", common._tensor_signature)
+    protocol = miles_protocol.MilesCollectiveProtocolCore(SimpleNamespace())
+    protocol.connect(
+        [object()],
+        [1],
+        [0],
+        SimpleNamespace(
+            **{
+                name: SimpleNamespace(size=1, rank=0)
+                for name in ("pp", "tp", "ep", "etp", "cp", "intra_dp", "indep_dp")
+            }
+        ),
+        SimpleNamespace(gather_pp=False, gather_tp=True, gather_ep=True),
+        "target",
+    )
+    tensors = {
+        "model.layers.0.input_layernorm.weight": torch.ones(8, dtype=torch.bfloat16),
+        "model.norm.weight": torch.full((8,), 2, dtype=torch.bfloat16),
+    }
+    protocol.begin_sync(1, lambda *, materialize: iter([list(tensors.items())]))
+    expected_abi = SHARDED_DESTINATION_ABI + (STACK_ABI_SUFFIX if budget else "")
+    assert protocol._topology.m2n_abi_version == expected_abi
+    assert bool(protocol._stacks) == bool(budget)
+    assert all(
+        p.kind is PlacementKind.REPLICATE
+        for entry in protocol._plan.bulk
+        for p in entry.dst_placements
+    )
+    wire = protocol._wire_plan if budget else protocol._plan
+    wire_tensors = protocol._stack_storage if budget else protocol._tensors
+    publisher = miles_integration.MilesPublisher(
+        plan=wire, source_partition=0, tensors=wire_tensors
+    )
+    receiver_plan, topology = manifest_from_wire(
+        manifest_to_wire(protocol._plan, protocol._topology)
+    )
+    model = _model(_reproduced_layers(4, 0, 1, VOCAB), kv_heads=4)
+    loader = SglangLoader(plan=receiver_plan, model=model, device="cpu")
+    publisher.validate_topology(topology)
+    loader.validate_topology(topology)
+    assert plan_digest(publisher.capture(), m2n_abi_version=expected_abi) == plan_digest(
+        loader.capture(), m2n_abi_version=expected_abi
+    )
+    _receive(loader, tensors, 0)
+    installed = {name: t for call in model.loaded for name, t in call}
+    assert installed.keys() == tensors.keys()
+    assert all(torch.equal(installed[name], t) for name, t in tensors.items())
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_trainer_and_engine_agree_on_the_wire_plan_and_abi(
+    cpu_storage, monkeypatch, tp
+):
+    import modelexpress_rl.collective.integrations.miles as miles_integration
+    from modelexpress_rl.collective.integrations._common import (
+        REPLICATED_DESTINATION_ABI,
+        SHARDED_DESTINATION_ABI,
+        STACK_ABI_SUFFIX,
+    )
+    from modelexpress_rl.collective.integrations.miles import (
+        CollectiveTopology,
+        MilesPublisher,
+    )
+    from modelexpress_rl.collective.plan import plan_digest
+
+    monkeypatch.setattr(
+        miles_integration, "_tensor_signature", common._tensor_signature
+    )
+    kv_heads, rank = 4, 0
+    tensors = _more_norms(_hf_tensors(kv_heads))
+    plan = _with_stacks(_sharded_plan(tensors, tp=tp, kv_heads=kv_heads))
+    wire, stacks = _derive_wire_plan(plan)
+    local = {name: tensor.clone() for name, tensor in tensors.items()}
+    storage = _stack_trainer_buffers(stacks, local)
+    members = {name for stack in stacks for name in stack.members}
+    wire_tensors = {n: t for n, t in local.items() if n not in members}
+    wire_tensors.update(storage)
+    publisher = MilesPublisher(
+        plan=wire, source_partition=0, tensors=wire_tensors, source_rank=0
+    )
+    layers = _reproduced_layers(kv_heads, rank, tp, VOCAB)
+    loader = _loader_for(plan, _model(layers, kv_heads=kv_heads), tp=tp, rank=rank)
+
+    abi = (SHARDED_DESTINATION_ABI if tp > 1 else REPLICATED_DESTINATION_ABI) + (
+        STACK_ABI_SUFFIX
+    )
+    topology = CollectiveTopology(
+        model_name="m",
+        trainer_slots=("t0",),
+        generator_slots=tuple(f"g{i}" for i in range(tp)),
+        source_partition_count=1,
+        m2n_abi_version=abi,
+    )
+    publisher.validate_topology(topology)
+    loader.validate_topology(topology)
+    assert plan_digest(publisher.capture(), m2n_abi_version=abi) == plan_digest(
+        loader.capture(), m2n_abi_version=abi
+    )
+    # The trainer sends the stacks it keeps; the members are views of them.
+    assert sorted(publisher.parameter_names()) == sorted(loader.parameter_names())
+    for stack in stacks:
+        assert tuple(storage[stack.name].shape)[0] == len(stack.members)

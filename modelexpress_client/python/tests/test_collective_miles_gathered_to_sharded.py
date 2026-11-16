@@ -52,8 +52,8 @@ def _bare_protocol(monkeypatch, tmp_path, tp_rank):
     )
 
     def all_gather(value):
-        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[1], list):
-            return [(rank, value[1]) for rank in range(TP)]
+        if isinstance(value, tuple) and len(value) == 3 and isinstance(value[1], list):
+            return [(rank, value[1], value[2]) for rank in range(TP)]
         return [value] * TP
 
     monkeypatch.setattr(miles_protocol, "_rank_and_world", lambda: (tp_rank, TP))
