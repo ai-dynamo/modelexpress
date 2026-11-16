@@ -192,7 +192,7 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 | MX_MOONCAKE_CONFIG_PATH | unset | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback |
 | MX_MC_* | unset | Artifact-store Mooncake settings promoted temporarily to the corresponding native `MC_*` names |
 | MX_ETCD_* | unset | Artifact-store etcd settings promoted temporarily to the corresponding native `ETCD_*` names |
-| MX_ARTIFACT_READY_URL | framework default | Readiness endpoint checked before publication |
+| MX_ARTIFACT_READY_URL | engine-specific | Explicit HTTP publication gate; when unset or blank, vLLM uses its resolved serving URL and SGLang uses native startup signaling |
 | MX_ARTIFACT_READY_TIMEOUT_SECS | 1800 | Readiness/publication timeout |
 | MX_ARTIFACT_TRANSFER_CHUNK_SIZE | 67108864 bytes | Artifact transfer chunk size; maximum is 4 GiB |
 

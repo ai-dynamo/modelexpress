@@ -75,7 +75,7 @@ def cold_start_expected_workers(vllm_config) -> int:
     ):
         expected *= getattr(parallel, name, 1) or 1
     return expected
-  
+
 def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
     """Identify local state through the attention layer's declared backend."""
     tensors = []
@@ -322,7 +322,7 @@ class VllmAdapter(EngineAdapter):
         self._identity_model_config.model = (
             envs.MX_MODEL_NAME_OVERRIDE or model_config.model
         )
-        self.load_config = vllm_config.load_config
+        self.load_config = _native_load_config(vllm_config.load_config)
         self.target_device = self._resolve_target_device()
         self.accelerator_backend = accelerator_backend_for(self.target_device)
 
@@ -733,6 +733,18 @@ class VllmAdapter(EngineAdapter):
         )
 
 
+def _native_load_config(load_config):
+    """Keep MX discovery metadata out of native loader options without mutating config."""
+    options = getattr(load_config, "model_loader_extra_config", None)
+    if not isinstance(options, dict) or "modelexpress_artifact_ready_url" not in options:
+        return load_config
+    native_config = copy.copy(load_config)
+    options = dict(options)
+    options.pop("modelexpress_artifact_ready_url")
+    _set_load_config_extra_config(native_config, options)
+    return native_config
+
+
 def _set_load_config_extra_config(load_config, extra_config: dict) -> None:
     try:
         load_config.model_loader_extra_config = extra_config
@@ -808,10 +820,12 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
 
     from vllm.distributed import get_world_group
 
+    from . import artifacts
+
     adapter = VllmAdapter(vllm_config, model_config)
     global_rank = adapter.get_global_rank()
     worker_rank = adapter.get_worker_rank()
-    return LoadContext(
+    ctx = LoadContext(
         model_config=model_config,
         load_config=vllm_config.load_config,
         target_device=adapter.get_target_device(),
@@ -827,3 +841,5 @@ def build_vllm_load_context(vllm_config, model_config) -> LoadContext:
         adapter=adapter,
         accelerator_backend=adapter.accelerator_backend,
     )
+    ctx.artifact_ready_fn = lambda: artifacts._vllm_health_ready(ctx)
+    return ctx

@@ -633,6 +633,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TORCH_COMPILE_CACHE,
         model_name="test/model",
     )
+    engine_ready = MagicMock(return_value=False)
     ctx = SimpleNamespace(
         global_rank=0,
         worker_rank=1,
@@ -640,6 +641,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         device_id=0,
         mx_client=object(),
         nixl_manager=object(),
+        artifact_ready_fn=engine_ready,
         accelerator_backend=SimpleNamespace(name="cuda"),
     )
     other_ctx = SimpleNamespace(
@@ -649,6 +651,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         device_id=1,
         mx_client=object(),
         nixl_manager=object(),
+        artifact_ready_fn=engine_ready,
     )
     publisher = MagicMock()
     with patch(
@@ -684,7 +687,8 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
         assert kwargs["worker_rank"] == 1
         assert kwargs["nixl_manager"] is ctx.nixl_manager
         assert kwargs["heartbeat_after_publish"] is False
-        assert kwargs["ready_fn"] is not artifacts._vllm_health_ready
+        assert not kwargs["ready_fn"]()
+        engine_ready.assert_called_once()
         assert kwargs["publish_fn"]() == "source-id"
         publish_one.assert_called_once_with(ctx, transfer, identity)
         publisher.start.assert_called_once()
@@ -697,7 +701,7 @@ def test_schedule_vllm_cache_artifact_publish_starts_readiness_gated_publisher(
     artifacts._scheduled_publishers.clear()
 
 
-def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
+def test_vllm_artifact_ready_fn_waits_for_callback_and_stable_cache(
     monkeypatch,
     tmp_path,
 ):
@@ -707,10 +711,10 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
         ArtifactCacheRoot("primary", cache_root, cache_root),
         ArtifactCacheRoot("autotune", autotune_root, autotune_root, optional=True),
     )
-    ready = artifacts._vllm_artifact_ready_fn(roots)
-    health_check = MagicMock(side_effect=[False, True])
+    engine_ready = MagicMock(side_effect=[False, True])
+    ctx = SimpleNamespace(artifact_ready_fn=engine_ready)
+    ready = artifacts._vllm_artifact_ready_fn(roots, ctx=ctx)
     now = 100.0
-    monkeypatch.setattr(artifacts, "_vllm_health_ready", health_check)
     monkeypatch.setattr(artifact_lifecycle.time, "monotonic", lambda: now)
 
     autotune_root.mkdir()
@@ -740,7 +744,7 @@ def test_vllm_artifact_ready_fn_waits_for_health_and_stable_cache(
 
     cache_file.write_bytes(b"compiled-again")
     assert ready() is False
-    assert health_check.call_count == 2
+    assert engine_ready.call_count == 2
 
 
 def test_vllm_health_url_defaults_to_localhost(monkeypatch):
@@ -1075,6 +1079,47 @@ def test_publish_survives_a_failing_check(compile_cache_root):
         assert artifacts._publish_vllm_cache_artifact(ctx, transfer, identity) is published
 
     check.assert_called_once()
+
+
+def test_context_artifact_callback_keeps_cache_settling(monkeypatch, tmp_path):
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    (cache_root / "kernel.so").write_bytes(b"compiled")
+    roots = (ArtifactCacheRoot("primary", cache_root, cache_root),)
+    gate = [False]
+    ctx = SimpleNamespace(artifact_ready_fn=lambda: gate[0])
+    now = [100.0]
+    monkeypatch.setattr(artifact_lifecycle.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        artifacts,
+        "_vllm_health_ready",
+        lambda *args: pytest.fail("engine callback should own readiness"),
+    )
+    ready = artifacts._vllm_artifact_ready_fn(roots, ctx=ctx)
+    assert not ready()
+    gate[0] = True
+    assert not ready()
+    now[0] += artifacts._CACHE_SETTLE_SECS
+    assert ready()
+
+
+def test_missing_artifact_callback_keeps_publication_closed(monkeypatch, tmp_path):
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    (cache_root / "kernel.so").write_bytes(b"compiled")
+    roots = (ArtifactCacheRoot("primary", cache_root, cache_root),)
+    ctx = SimpleNamespace(artifact_ready_fn=None)
+    now = [100.0]
+    monkeypatch.setattr(artifact_lifecycle.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        artifacts,
+        "_vllm_health_ready",
+        lambda *args: pytest.fail("missing callback must not select HTTP"),
+    )
+    ready = artifacts._vllm_artifact_ready_fn(roots, ctx=ctx)
+    assert not ready()
+    now[0] += 2 * artifacts._CACHE_SETTLE_SECS
+    assert not ready()
 
 
 KERNEL_CACHE_SOURCE_TYPES = [
