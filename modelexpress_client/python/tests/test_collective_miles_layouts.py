@@ -266,8 +266,11 @@ class TestReplicateDestinationPlan:
         protocol, tensors = _protocol(monkeypatch, tp=2)
         monkeypatch.setattr(miles_protocol, "_rank_and_world", lambda: (0, 3))
 
-        with pytest.raises(ValueError, match="must be exactly DP x TP"):
+        with pytest.raises(
+            RuntimeError, match="contract preflight failed: .*must be exactly DP x TP"
+        ) as caught:
             protocol.begin_sync(1, lambda *, materialize: iter([tensors]))
+        assert isinstance(caught.value.__cause__, ValueError)
 
 
 class TestShardedDestinationPlan:

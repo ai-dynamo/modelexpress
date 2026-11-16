@@ -151,6 +151,13 @@ def _install_fakes(miles_protocol, rank, scenario, record):
                 raise RuntimeError("synthetic bind-transfer failure on rank 1")
 
         def publish_group(self, *, version, layer_group_id):
+            failed_version = "2" if scenario == "reuse_publish_fails" else "1"
+            if (
+                scenario in ("publish_fails", "reuse_publish_fails")
+                and rank == 0
+                and version == failed_version
+            ):
+                raise torch.OutOfMemoryError("synthetic publish allocation failure on rank 0")
             specs = self._publisher.local_params()
             record["published"][version] = {
                 name: hashlib.sha256(
@@ -180,11 +187,14 @@ def _install_fakes(miles_protocol, rank, scenario, record):
     miles_protocol.MilesTrainerSession = SessionFactory
 
 
-def _run(rank, scenario, record):
+def _run(rank, scenario, record, world, tp):
     from modelexpress_rl.collective.integrations import miles_protocol
 
     _install_fakes(miles_protocol, rank, scenario, record)
-    dp_rank, tp_rank = divmod(rank, TP)
+    dp_rank, tp_rank = divmod(rank, tp)
+    dp = world // tp
+    if scenario == "world_preflight_fails" and rank == 1:
+        dp, dp_rank = 1, 0
     names = list(_SHAPES)
     if scenario == "diverged_manifest" and rank == 3:
         names.remove("model.norm.weight")
@@ -195,11 +205,11 @@ def _run(rank, scenario, record):
         [0],
         SimpleNamespace(
             pp=_Group(1, 0),
-            tp=_Group(TP, tp_rank),
+            tp=_Group(tp, tp_rank),
             ep=_Group(1, 0),
             etp=_Group(1, 0),
             cp=_Group(1, 0),
-            intra_dp=_Group(DP, dp_rank),
+            intra_dp=_Group(dp, dp_rank),
             indep_dp=_Group(1, 0),
         ),
         SimpleNamespace(gather_pp=False, gather_tp=True, gather_ep=True),
@@ -244,9 +254,29 @@ def _run(rank, scenario, record):
         "validation_fails",
         "shape_fails",
         "reconnect",
+        "publish_fails",
+        "reuse_publish_fails",
+        "world_preflight_fails",
+        "reuse_world_preflight_fails",
+        "mesh_preflight_fails",
+        "reuse_topology_preflight_fails",
     )
     versions = (1, 2, 3, 4) if scenario == "reconnect" else (1, 2)
     for version in versions:
+        if rank == 1 and version == 2 and scenario in (
+            "reuse_world_preflight_fails", "reuse_topology_preflight_fails",
+        ):
+            state = protocol._parallel_state
+            if scenario == "reuse_world_preflight_fails":
+                state.intra_dp = _Group(1, 0)
+            protocol.connect(
+                [SimpleNamespace(name="replacement")],
+                [1] if scenario == "reuse_topology_preflight_fails" else [2],
+                [0],
+                state,
+                SimpleNamespace(gather_pp=False, gather_tp=True, gather_ep=True),
+                "target",
+            )
         if scenario == "reconnect" and version == 3:
             frozen_plan, frozen_topology = protocol._plan, protocol._topology
             frozen_buffers = dict(protocol._tensors)
@@ -279,7 +309,7 @@ def _run(rank, scenario, record):
                     # Model MILES' TP gather BEFORE each yielded bucket.
                     value = torch.tensor([1])
                     torch.distributed.all_reduce(value)
-                    assert value.item() == WORLD
+                    assert value.item() == world
                 record.setdefault("iterator_steps", []).append([version, index])
                 yield [tensor]
 
@@ -300,6 +330,12 @@ def _run(rank, scenario, record):
             if fault:
                 with patch.object(torch.Tensor, method, fail_staging):
                     protocol.begin_sync(version, iter_buckets)
+            elif rank == 1 and scenario == "mesh_preflight_fails":
+                with patch.object(
+                    protocol, "_destination_mesh",
+                    side_effect=ValueError("synthetic destination mesh probe failure"),
+                ):
+                    protocol.begin_sync(version, iter_buckets)
             else:
                 protocol.begin_sync(version, iter_buckets)
         except BaseException:
@@ -319,6 +355,10 @@ def _run(rank, scenario, record):
                 record["closed"] = protocol._closed
                 record["round_begun"] = protocol._round_begun
                 raise
+        # Model the updater's post-stream barrier, before finalize. A peer
+        # must never reach it while another rank is still failing publication.
+        record.setdefault("post_stream_barriers", []).append(version)
+        torch.distributed.barrier()
         protocol.finalize(version)
         record["rounds"] += 1
         if scenario == "reconnect":
@@ -333,7 +373,7 @@ def _run(rank, scenario, record):
         assert not protocol._retired_engine_groups
 
 
-def _rank_main(rank, init_file, scenario, result_dir):
+def _rank_main(rank, init_file, scenario, result_dir, world, tp, timeout_s):
     import torch.distributed as dist
 
     record = {
@@ -348,12 +388,12 @@ def _rank_main(rank, init_file, scenario, result_dir):
             "gloo",
             init_method=f"file://{init_file}",
             rank=rank,
-            world_size=WORLD,
-            timeout=timedelta(seconds=DEADLINE_S / 2),
+            world_size=world,
+            timeout=timedelta(seconds=timeout_s),
         )
         started = time.monotonic()
         try:
-            _run(rank, scenario, record)
+            _run(rank, scenario, record, world, tp)
         except BaseException as error:
             record["failure_elapsed_s"] = time.monotonic() - started
             record["error"] = str(error)
@@ -368,17 +408,17 @@ def _rank_main(rank, init_file, scenario, result_dir):
         json.dump(record, handle, default=str)
 
 
-def _launch(tmp_path, scenario):
+def _launch(tmp_path, scenario, *, world=WORLD, tp=TP, timeout_s=DEADLINE_S / 2):
     os.environ.setdefault("MX_SERVER_ADDRESS", "mx:50051")
     context = multiprocessing.get_context("spawn")
     init_file = tmp_path / "gloo-init"
     processes = [
         context.Process(
             target=_rank_main,
-            args=(rank, str(init_file), scenario, str(tmp_path)),
+            args=(rank, str(init_file), scenario, str(tmp_path), world, tp, timeout_s),
             daemon=True,
         )
-        for rank in range(WORLD)
+        for rank in range(world)
     ]
     deadline = time.monotonic() + DEADLINE_S
     for process in processes:
@@ -394,7 +434,7 @@ def _launch(tmp_path, scenario):
                 process.kill()
                 process.join(timeout=5)
     records = []
-    for rank in range(WORLD):
+    for rank in range(world):
         with open(tmp_path / f"rank-{rank}.json") as handle:
             record = json.load(handle)
         assert "fatal" not in record, record["fatal"]
@@ -624,6 +664,65 @@ def test_preparation_failure_drains_the_collective_iterator_on_every_rank(
         # One successful stage, then OOM; no more clone/copy allocations on
         # that rank while the rest of the iterator is drained.
         assert records[1]["staging_calls"] == 2
+
+
+@pytest.mark.parametrize(
+    "scenario,version", [("publish_fails", 1), ("reuse_publish_fails", 2)]
+)
+def test_publish_failure_stops_every_rank_before_updater_post_stream_barrier(
+    tmp_path, scenario, version
+):
+    records = _launch(tmp_path, scenario, world=2, tp=1, timeout_s=5)
+
+    for record in records:
+        assert record["error_type"] == "RuntimeError", record.get("traceback")
+        assert "publish failed: rank 0: OutOfMemoryError" in record["error"]
+        assert "synthetic publish allocation failure on rank 0" in record["error"]
+        assert record["failure_elapsed_s"] < 3
+        assert record["rounds"] == version - 1
+        assert record.get("post_stream_barriers", []) == list(range(1, version))
+        assert record["closed"] is True
+        assert "session-close" in record["events"]
+        assert "rendezvous-close" in record["events"]
+        assert "channel-close" in record["events"]
+        assert ["report", f"operation-{version}"] in record["events"]
+    assert "synthetic publish allocation failure on rank 0" in records[0]["cause"]
+    assert "cancel-run_round" in records[0]["events"]
+    assert records[0]["generator_actions"][-1] == ["close", None]
+    assert records[1]["generator_actions"] == []
+
+
+@pytest.mark.parametrize(
+    "scenario,version,message",
+    [
+        ("world_preflight_fails", 1, "must be exactly DP x TP (1 x 1)"),
+        ("reuse_world_preflight_fails", 2, "must be exactly DP x TP (1 x 1)"),
+        ("mesh_preflight_fails", 1, "synthetic destination mesh probe failure"),
+        ("reuse_topology_preflight_fails", 2, "topology changed"),
+    ],
+)
+def test_contract_preflight_failure_reaches_every_rank_before_contract_collectives(
+    tmp_path, scenario, version, message
+):
+    records = _launch(tmp_path, scenario, world=2, tp=1, timeout_s=5)
+
+    for record in records:
+        assert record["error_type"] == "RuntimeError", record.get("traceback")
+        assert "contract preflight failed: rank 1:" in record["error"]
+        assert message in record["error"]
+        assert record["failure_elapsed_s"] < 3
+        assert record["rounds"] == version - 1
+        assert record["round_version_after_failure"] is None
+        assert record["buffers_unchanged"] is True
+        assert record.get("post_stream_barriers", []) == list(range(1, version))
+        assert [step for step in record["iterator_steps"] if step[0] == version] == [
+            [version, index] for index in range(len(_SHAPES))
+        ]
+        assert not any(
+            action == ["run_round", f"operation-{version}"]
+            for action in record["generator_actions"]
+        )
+    assert message in records[1]["cause"]
 
 
 def test_a_finish_failure_on_one_rank_fails_finalize_on_every_rank(tmp_path):
