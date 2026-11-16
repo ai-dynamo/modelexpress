@@ -155,7 +155,9 @@ integration test with one trainer GPU and one inference GPU on the same H100
 node. The runtime is `ghcr.io/primeintellect-ai/prime-rl:v0.10.1.dev140`, pinned
 by digest; upstream tests are pinned to its source commit
 `0790ebb5d856860d916b270bda4884184ce9d786`. The image overlays the candidate MX
-client and a server built from the same candidate revision. Dependency syncing
+client and reuses the generator-only server image by digest from the same candidate
+revision. The client install uses `--no-deps` to preserve the qualified upstream
+Torch/vLLM/NIXL dependency set. Dependency syncing
 is disabled at runtime so PrimeRL cannot restore its older MX dependency pin.
 The Prime hosted monitor uses `PRIME_RUNS_MODE=disabled` and W&B runs offline,
 so CI needs no telemetry credentials. Local metrics and training logs remain
@@ -176,13 +178,16 @@ shares the existing RL GPU admission slots and
 uses an owned namespace with a two-GPU quota. The workload has no automatic
 retry. A CPU-only reader retains access to full logs and JUnit results on the
 namespace's shared-model-cache PVC after the GPU job exits. Evidence is copied
-and uploaded before inline namespace cleanup. Model and optimizer checkpoints
+and uploaded before inline cleanup stops the trainer, removes the exact run
+directory from the shared cache through the reader, and deletes the namespace.
+Fallback cleanup performs the same removal. Model and optimizer checkpoints
 use `/checkpoints/reverse-text-modelexpress` inside the GPU pod's emptyDir rather
 than the retained model cache. PrimeRL can clean this subdirectory without
 removing the volume mount; normal and fallback pod cleanup reclaim all
 checkpoints. Collector metadata reads use
 bounded retries for transient Kubernetes API failures. A separate fallback job
-handles failure/cancellation cleanup. Ordinary comments and `/bench` do not start this
+handles failure/cancellation cleanup. GPU test jobs require their own build to
+succeed before requesting admission. Ordinary comments and `/bench` do not start this
 additional workload. GPU qualification of this new lane remains pending.
 
 ## Comment-triggered model benchmark CI

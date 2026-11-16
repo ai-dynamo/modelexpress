@@ -49,6 +49,21 @@ case "$1" in
       "$RESULTS_DIR/run"
     ;;
   cleanup)
+    [[ "$NAMESPACE" == mx-ci-* ]] || exit 1
+    [[ "${GITHUB_RUN_ID:?}" =~ ^[0-9]+$ && "${GITHUB_RUN_ATTEMPT:?}" =~ ^[0-9]+$ ]] || exit 1
+    owner=$(ci_kubectl get namespace "$NAMESPACE" --ignore-not-found \
+      -o go-template='{{ index .metadata.labels "ci.modelexpress.nvidia.com/run-id" }}')
+    if [ -n "$owner" ]; then
+      [ "$owner" = "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ] || exit 1
+      kubectl delete job primerl-refit -n "$NAMESPACE" --ignore-not-found \
+        --cascade=foreground --wait=true --timeout=180s
+      collector=$(ci_kubectl get pod primerl-evidence -n "$NAMESPACE" --ignore-not-found -o name)
+      if [ -n "$collector" ]; then
+        kubectl wait -n "$NAMESPACE" --for=condition=Ready pod/primerl-evidence --timeout=2m
+        kubectl exec -n "$NAMESPACE" primerl-evidence -- \
+          rm -rf -- "/models/mx-primerl-ci/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+      fi
+    fi
     bash .github/scripts/ci-namespace.sh cleanup "$NAMESPACE"
     ;;
   *) exit 2 ;;

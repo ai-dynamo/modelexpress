@@ -21,7 +21,7 @@ def workflow(name):
 def test_rl_build_and_gpu_lifecycle_are_consistent(lane):
     parent = workflow("modelexpress-rl-ci.yml")["jobs"]
     build, call = parent[f"build-{lane}"], parent[f"test-{lane}"]
-    assert build["needs"] == "validate"
+    assert build["needs"] == (["validate", "build-generator-only"] if lane == "primerl" else "validate")
     assert build["runs-on"] == "prod-modelexpress-builder-amd-v1"
     assert build["timeout-minutes"] == 60
     assert "worker_image" in build["outputs"]

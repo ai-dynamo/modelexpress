@@ -243,7 +243,7 @@ jobs:
   test-vime:
     name: GPU
     needs: [validate, build-vime]
-    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' && needs.build-vime.result == 'success' }}
     uses: ./.github/workflows/modelexpress-rl-vime-gpu-ci.yml
     secrets: inherit
     with:
@@ -256,8 +256,8 @@ jobs:
       upload_evidence: ${{ inputs.upload_evidence }}
 
   build-primerl:
-    needs: validate
-    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' }}
+    needs: [validate, build-generator-only]
+    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' && needs.build-generator-only.result == 'success' }}
     name: PrimeRL dev140 build
     runs-on: prod-modelexpress-builder-amd-v1
     timeout-minutes: 60
@@ -295,6 +295,7 @@ jobs:
           bash .github/scripts/build-with-registry-retry.sh --platform linux/amd64 \
             -f ci/rl/primerl/Dockerfile \
             --build-context prime-rl=prime-rl \
+            --build-arg "SERVER_IMAGE=${{ needs.build-generator-only.outputs.server_image }}" \
             --cache-from "type=registry,ref=$image:buildcache-shared" \
             --cache-to "type=registry,ref=$image:buildcache-shared,mode=max,ignore-error=true" \
             --metadata-file primerl-build.json --push -t "$image:$TEST_SHA" candidate
@@ -303,7 +304,7 @@ jobs:
   test-primerl:
     name: GPU
     needs: [validate, build-primerl]
-    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name != 'issue_comment' && needs.validate.result == 'success' && needs.build-primerl.result == 'success' }}
     uses: ./.github/workflows/modelexpress-rl-primerl-gpu-ci.yml
     secrets: inherit
     with:
