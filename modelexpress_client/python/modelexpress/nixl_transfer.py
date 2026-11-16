@@ -585,7 +585,9 @@ class NixlTransferManager:
                 raise ValueError(
                     f"Tensor '{name}' is already registered at a different address"
                 )
-            if not tensor.is_contiguous():
+            if _has_memory_range(
+                tensor.numel() * tensor.element_size(), tensor.data_ptr()
+            ) and not tensor.is_contiguous():
                 raise RuntimeError(
                     f"Tensor '{name}' is not contiguous. "
                     "Non-contiguous tensors cannot be used for RDMA transfers."
@@ -621,7 +623,7 @@ class NixlTransferManager:
             size = tensor.numel() * tensor.element_size()
             start, end = tensor.data_ptr(), tensor.data_ptr() + size
             if (
-                size > 0
+                _has_memory_range(size, start)
                 and not any(
                     base_start <= start and end <= base_end
                     for base_start, base_end in self._base_registration_ranges
@@ -642,7 +644,7 @@ class NixlTransferManager:
         for name, tensor in new_tensors.items():
             size = tensor.numel() * tensor.element_size()
             start, end = tensor.data_ptr(), tensor.data_ptr() + size
-            if size == 0 or any(
+            if not _has_memory_range(size, start) or any(
                 base_start <= start and end <= base_end
                 for base_start, base_end in self._base_registration_ranges
             ):
@@ -1170,7 +1172,9 @@ class NixlTransferManager:
         Raises:
             ManifestMismatchError: On a size/dtype mismatch for a shared tensor,
                 or, when ``require_exact_match`` is set, on any tensor-name
-                mismatch or a zero-match transfer.
+                mismatch, a nonempty source tensor without an address, or a
+                zero-match transfer. A nonempty local tensor without an address
+                is rejected in every mode.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
@@ -1199,6 +1203,7 @@ class NixlTransferManager:
         local_descs: list[tuple[int, int, int]] = []
         total_bytes = 0
         matched_tensors = 0
+        receive_result = "complete"
 
         for src_tensor in source_tensors:
             local_tensor = local_tensors.get(src_tensor.name)
@@ -1221,6 +1226,13 @@ class NixlTransferManager:
             matched_tensors += 1
             if not _has_memory_range(src_tensor.size, src_tensor.addr):
                 if src_tensor.size > 0:
+                    if require_exact_match:
+                        transfer_metrics.record_nixl_receive("rejected")
+                        raise ManifestMismatchError(
+                            f"Tensor '{src_tensor.name}' has {src_tensor.size} "
+                            "bytes but no source memory address"
+                        )
+                    receive_result = "partial"
                     logger.warning(
                         "Skipping %d bytes of tensor '%s': source published "
                         "no memory address, so the local tensor keeps its "
@@ -1229,12 +1241,19 @@ class NixlTransferManager:
                         src_tensor.name,
                     )
                 continue
+            local_addr = local_tensor.data_ptr()
+            if not _has_memory_range(local_size, local_addr):
+                transfer_metrics.record_nixl_receive("rejected")
+                raise ManifestMismatchError(
+                    f"Tensor '{src_tensor.name}' has {local_size} "
+                    "bytes but no local memory address"
+                )
             remote_descs.append(
                 (src_tensor.addr, src_tensor.size, src_tensor.device_id)
             )
             local_descs.append(
                 (
-                    local_tensor.data_ptr(),
+                    local_addr,
                     local_size,
                     self._device_id,
                 )
@@ -1242,10 +1261,6 @@ class NixlTransferManager:
             total_bytes += src_tensor.size
 
         match_time = time.perf_counter() - match_start
-
-        # Downgraded to `partial` by the name-diff check below, which does not
-        # return early.
-        receive_result = "complete"
 
         # Name-set diff between the source manifest and the locally registered
         # tensors.
@@ -1299,7 +1314,7 @@ class NixlTransferManager:
             return 0, 0, 0.0
 
         if not remote_descs:
-            logger.info("All %d matching tensors are empty", matched_tensors)
+            logger.info("No payload to transfer for %d matching tensors", matched_tensors)
             transfer_metrics.record_nixl_receive(receive_result)
             return 0, matched_tensors, 0.0
 
