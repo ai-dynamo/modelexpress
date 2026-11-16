@@ -571,8 +571,8 @@ class _FakeWire:
         self.deposits = {}
         self.calls = defaultdict(int)
 
-    def reshard(self, src, dst, handle, **_kwargs):
-        rank = handle.rank
+    def reshard(self, src, dst, comm, **_kwargs):
+        rank = comm.rank
         side = "src" if dst is None else "dst"
         position = self.calls[(side, rank)]
         self.calls[(side, rank)] += 1
@@ -607,8 +607,8 @@ def fake_wire(monkeypatch):
     holder = {}
     module = ModuleType("nccl.m2n")
     install_fake_m2n_handles(module)
-    module.reshard = lambda src, dst, handle, **kw: holder["wire"].reshard(
-        src, dst, handle, **kw
+    module.reshard = lambda src, dst, comm, **kw: holder["wire"].reshard(
+        src, dst, comm, **kw
     )
     monkeypatch.setitem(sys.modules, "nccl", ModuleType("nccl"))
     monkeypatch.setitem(sys.modules, "nccl.m2n", module)
