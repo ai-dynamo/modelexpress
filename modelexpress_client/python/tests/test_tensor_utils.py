@@ -8,12 +8,14 @@ import types
 import torch
 import torch.nn as nn
 
+from modelexpress import tensor_utils
 from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.tensor_utils import (
     _find_hidden_accel_tensors,
     adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
+    host_resident_parameters,
     safe_checksum,
     storage_view,
 )
@@ -283,6 +285,31 @@ class TestSafeChecksum:
         t2 = torch.tensor([11, 19, 30], dtype=torch.uint8)
         assert safe_checksum(t1) != safe_checksum(t2)
 
+    def test_multi_dim_tensor(self):
+        t = torch.randn(4, 8)
+        assert not safe_checksum(t).startswith("err:")
+
+    def test_shape_independent(self):
+        t = torch.randn(2, 3, 5)
+        expected = safe_checksum(t.reshape(-1))
+        assert safe_checksum(t) == expected
+        assert safe_checksum(t.reshape(6, 5)) == expected
+
+    def test_chunk_size_independent(self, monkeypatch):
+        t = torch.randn(3, 17)
+        expected = safe_checksum(t)
+        monkeypatch.setattr(tensor_utils, "_CHECKSUM_CHUNK_BYTES", 7)
+        assert safe_checksum(t) == expected
+
+    def test_matches_unchunked_definition(self, monkeypatch):
+        monkeypatch.setattr(tensor_utils, "_CHECKSUM_CHUNK_BYTES", 5)
+        t = torch.arange(13, dtype=torch.uint8) * 19
+        expected = sum(
+            (b * ((i * 2654435761 + 1) & 0xFFFFFFFF)) & 0xFFFFFFFF
+            for i, b in enumerate(t.tolist())
+        ) & 0xFFFFFFFF
+        assert safe_checksum(t) == format(expected, "08x")
+
 
 # ---------------------------------------------------------------------------
 # storage_view
@@ -306,6 +333,30 @@ class TestStorageView:
         view = base.T  # non-contiguous
         sv = storage_view(view)
         assert sv.numel() == base.numel() * base.element_size()
+
+
+# ---------------------------------------------------------------------------
+# host_resident_parameters
+# ---------------------------------------------------------------------------
+
+
+class TestHostResidentParameters:
+    def test_lists_non_empty_parameters_outside_accelerator(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_accel = nn.Parameter(torch.empty(4, device="meta"))
+        model.on_host = nn.Parameter(torch.empty(4))
+        model.empty_on_host = nn.Parameter(torch.empty(0))
+        model.register_buffer("host_buffer", torch.empty(4))
+        assert host_resident_parameters(model, backend) == ["on_host"]
+
+    def test_empty_when_all_parameters_on_accelerator(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        assert host_resident_parameters(nn.Linear(4, 4), backend) == []
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ unit-testable off-GPU."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from uuid import UUID, uuid4
 from typing import Any
 
 # One link in a recorded op-chain: (op_name, positional args, frozen kwargs).
@@ -109,5 +110,5 @@ class CaptureResult:
     unsupported_reasons: dict = field(default_factory=dict)
     generator_fingerprint: tuple | None = None
     source_replay: bool = False
-    generation: int | None = None
+    replay_id: UUID = field(default_factory=uuid4)
     destination_layouts: dict[str, tuple[tuple, tuple]] = field(default_factory=dict)

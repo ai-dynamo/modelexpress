@@ -19,7 +19,7 @@ Run: pytest tests/test_reshard_refit_transfer.py
 import torch
 
 from modelexpress_rl.refit.reshard.geometry import capture_geometry
-from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
+from tests.helpers.refit_replay import replay_ops as _replay_ops
 from modelexpress_rl.refit.reshard.slice_plan import Shard
 from modelexpress_rl.refit.reshard.transfer_plan import (
     SourceInfo,

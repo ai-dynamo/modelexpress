@@ -9,12 +9,15 @@ import torch
 import modelexpress_rl.inference.nixl_staged_transfer as module
 from modelexpress_rl.inference.plan import StreamingSettings
 from tests.test_refit_bounded_descriptors import harness
+from tests.helpers.refit_replay import replay_ops
 
 
 @pytest.mark.parametrize("harness", [None, StreamingSettings(512, "cpu", 2)], indirect=True)
 def test_native_conversion_records_generator_device_for_local_replay(harness, monkeypatch):
     h = harness
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     h.transfer._device = torch.device("cpu")
     h.capture.source_replay = True
     h.transfer._convert_native_to_hf = lambda weights: {
@@ -28,7 +31,7 @@ def test_native_conversion_records_generator_device_for_local_replay(harness, mo
     )
     for batch in batches:
         for _, copy, tensor in batch.writes:
-            replayed = module._replay_ops(tensor, copy.op_chain)
+            replayed = replay_ops(tensor, copy.op_chain)
             assert replayed.device == torch.device("cpu")
             expected = h.sources[copy.src_name]
             if copy.src_name == "full":

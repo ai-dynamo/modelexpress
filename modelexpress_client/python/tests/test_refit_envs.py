@@ -14,6 +14,7 @@ def test_defaults_when_unset(monkeypatch):
     for name in envs.environment_variables:
         monkeypatch.delenv(name, raising=False)
 
+    assert envs.MX_MAX_REPLAY_CHAIN_LENGTH == 64
     assert envs.MX_REFIT_METADATA_PORT == 7555
     assert envs.MX_TRAINER_STAGING_MODE == "IN_PLACE"
     assert envs.MX_WEIGHT_PAYLOAD_FORMAT == "FULL_TENSOR"
@@ -36,6 +37,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_RESHARD_PUBLISH_DIGEST is False
     assert envs.MX_S3_MULTIPART_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_UPLOAD_PART_BYTES == 16 * 1024**2
+    assert envs.MX_S3_DOWNLOAD_BACKEND == "transfer_manager"
     assert envs.MX_S3_UPLOAD_WORKERS == 8
     assert envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_DOWNLOAD_RANGE_BYTES == 8 * 1024**2
@@ -50,6 +52,7 @@ def test_defaults_when_unset(monkeypatch):
 
 
 def test_values_are_normalized_and_read_live(monkeypatch):
+    monkeypatch.setenv("MX_MAX_REPLAY_CHAIN_LENGTH", "128")
     monkeypatch.setenv("MX_REFIT_METADATA_PORT", "8000")
     monkeypatch.setenv("MX_TRAINER_STAGING_MODE", " copy_to_device ")
     monkeypatch.setenv("MX_WEIGHT_PAYLOAD_FORMAT", " xor_delta ")
@@ -72,6 +75,7 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     monkeypatch.setenv("MX_S3_MAX_ATTEMPTS", "7")
     monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "off")
 
+    assert envs.MX_MAX_REPLAY_CHAIN_LENGTH == 128
     assert envs.MX_REFIT_METADATA_PORT == 8000
     assert envs.MX_TRAINER_STAGING_MODE == "COPY_TO_DEVICE"
     assert envs.MX_WEIGHT_PAYLOAD_FORMAT == "XOR_DELTA"
@@ -174,6 +178,29 @@ def test_unknown_attribute_raises():
         _ = envs.NOT_A_REAL_ENV_VAR
 
 
+@pytest.mark.parametrize(
+    "neutral,legacy,expected",
+    [(None, None, 8), (None, "3", 3), ("5", "invalid", 5)],
+)
+def test_refit_upload_workers_precedence(monkeypatch, neutral, legacy, expected):
+    for name, value in (
+        ("MX_REFIT_UPLOAD_WORKERS", neutral), ("MX_S3_UPLOAD_WORKERS", legacy),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert envs.MX_REFIT_UPLOAD_WORKERS == expected
+
+
+@pytest.mark.parametrize("value", ["", "0", "invalid"])
+def test_invalid_refit_upload_workers_does_not_fall_back(monkeypatch, value):
+    monkeypatch.setenv("MX_REFIT_UPLOAD_WORKERS", value)
+    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "3")
+    with pytest.raises(ValueError, match="MX_REFIT_UPLOAD_WORKERS"):
+        _ = envs.MX_REFIT_UPLOAD_WORKERS
+
+
 def test_blank_desired_version_is_unset(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "  ")
     assert envs.MX_REFIT_DESIRED_VERSION_UID is None
@@ -206,6 +233,13 @@ def test_s3_tcp_keepalive_rejects_invalid_boolean(monkeypatch):
     monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "sometimes")
     with pytest.raises(ValueError, match="MX_S3_TCP_KEEPALIVE must be a boolean"):
         _ = envs.MX_S3_TCP_KEEPALIVE
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])
+def test_max_replay_chain_length_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("MX_MAX_REPLAY_CHAIN_LENGTH", value)
+    with pytest.raises(ValueError, match="MX_MAX_REPLAY_CHAIN_LENGTH"):
+        _ = envs.MX_MAX_REPLAY_CHAIN_LENGTH
 
 
 def test_streaming_diagnostics_default_off_and_packing_on(monkeypatch) -> None:
@@ -292,3 +326,18 @@ def test_generator_source_order_and_redis_url_keep_raw_defaults(monkeypatch):
     monkeypatch.setenv("MX_REDIS_URL", "redis://redis:6379")
     assert envs.MX_GENERATOR_SOURCE_ORDER == "TRAINER,GENERATOR"
     assert envs.MX_REDIS_URL == "redis://redis:6379"
+
+
+@pytest.mark.parametrize(
+    "value", ["preallocated", " PREALLOCATED ", "transfer_manager"]
+)
+def test_s3_download_backend_selection(monkeypatch, value):
+    monkeypatch.setenv("MX_S3_DOWNLOAD_BACKEND", value)
+    assert envs.MX_S3_DOWNLOAD_BACKEND == value.strip().lower()
+
+
+@pytest.mark.parametrize("value", ["", "auto", "true", "ranged"])
+def test_s3_download_backend_rejects_unknown_values(monkeypatch, value):
+    monkeypatch.setenv("MX_S3_DOWNLOAD_BACKEND", value)
+    with pytest.raises(ValueError, match="MX_S3_DOWNLOAD_BACKEND"):
+        _ = envs.MX_S3_DOWNLOAD_BACKEND

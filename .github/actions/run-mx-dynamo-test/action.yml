@@ -36,6 +36,10 @@ description: |
       we install it inline rather than assuming a pre-installed operator.
 
 inputs:
+  framework:
+    description: 'Dynamo worker backend (vllm or sglang)'
+    required: false
+    default: 'vllm'
   kubeconfig_base64:
     description: 'Base64-encoded kubeconfig for the vCluster'
     required: true
@@ -46,12 +50,12 @@ inputs:
     description: 'Fully-qualified MX server image (ci/k8s/server/Dockerfile.server)'
     required: true
   worker_image:
-    description: 'Fully-qualified dynamo+modelexpress worker image (ci/k8s/client/vllm/dynamo/Dockerfile)'
+    description: 'Fully-qualified Dynamo + ModelExpress worker image for the selected framework'
     required: true
   model:
     description: 'HuggingFace model id — exposed as MX_CI_MODEL for envsubst and pytest'
     required: false
-    default: 'Qwen/Qwen2.5-0.5B'
+    default: 'Qwen/Qwen3.5-0.8B'
   hf_token:
     description: 'HuggingFace token — written as hf-token-secret in the test namespace. Required: the DGD references it via envFromSecret.'
     required: true
@@ -176,6 +180,7 @@ runs:
       shell: bash
       env:
         MODE: ${{ inputs.mode }}
+        FRAMEWORK: ${{ inputs.framework }}
       run: |
         # Aggregated and disaggregated differ in three places:
         #   INITIAL_CR_COUNT — CRs published before the scale patch
@@ -184,15 +189,20 @@ runs:
         # Everything else (pod label selector, transfer assertion shape) is
         # identical, so we just stash the three values in $GITHUB_ENV and
         # let the downstream wait/scale steps read them.
+        case "${FRAMEWORK}" in
+          vllm) WORKER_PREFIX=Vllm ;;
+          sglang) WORKER_PREFIX=Sglang ;;
+          *) echo "ERROR: unknown framework '${FRAMEWORK}'"; exit 1 ;;
+        esac
         case "${MODE}" in
           aggregated)
             echo "INITIAL_CR_COUNT=1" >> "$GITHUB_ENV"
-            echo "SCALE_COMPONENT=VllmWorker" >> "$GITHUB_ENV"
+            echo "SCALE_COMPONENT=${WORKER_PREFIX}Worker" >> "$GITHUB_ENV"
             echo "FINAL_CR_COUNT=2" >> "$GITHUB_ENV"
             ;;
           disaggregated)
             echo "INITIAL_CR_COUNT=2" >> "$GITHUB_ENV"
-            echo "SCALE_COMPONENT=VllmDecodeWorker" >> "$GITHUB_ENV"
+            echo "SCALE_COMPONENT=${WORKER_PREFIX}DecodeWorker" >> "$GITHUB_ENV"
             echo "FINAL_CR_COUNT=3" >> "$GITHUB_ENV"
             ;;
           *)
@@ -243,6 +253,32 @@ runs:
         fi
         echo "::endgroup::"
 
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version: "3.12"
+
+    - name: Install test dependencies
+      shell: bash
+      run: |
+        pip install uv==0.10.9
+        uv pip install --system -r ci/pyproject.toml
+
+    - name: Capture source inference baseline
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        MX_CI_MODEL: ${{ inputs.model }}
+        DGD_NAME: ${{ inputs.dgd_name }}
+        TIMEOUT: ${{ inputs.source_load_timeout_seconds }}
+      run: |
+        source .github/scripts/ci-kubectl.sh
+        WORKER_SELECTOR="nvidia.com/dynamo-graph-deployment-name=${DGD_NAME},nvidia.com/dynamo-component-type=worker"
+        wait_for_worker_liveness "$WORKER_SELECTOR" "$INITIAL_CR_COUNT" "$TIMEOUT"
+        pytest ci/k8s/client/test_dynamo_p2p.py::test_frontend_inference -v \
+          --namespace "$NAMESPACE" --model "$MX_CI_MODEL" \
+          --dgd-name "$DGD_NAME" --capture-source-baseline
+
     - name: Scale DGD to replicas=2
       shell: bash
       env:
@@ -253,6 +289,40 @@ runs:
         kubectl patch dgd "${DGD_NAME}" -n "${NAMESPACE}" --type merge \
           -p "{\"spec\":{\"services\":{\"${SCALE_COMPONENT}\":{\"replicas\":2}}}}"
         echo "::endgroup::"
+
+    - name: Wait for scaled-up worker containers to start
+      shell: bash
+      env:
+        NAMESPACE: ${{ inputs.namespace }}
+        DGD_NAME: ${{ inputs.dgd_name }}
+      run: |
+        source .github/scripts/ci-kubectl.sh
+        deadline=$((SECONDS + 900))
+        WORKER_SELECTOR="nvidia.com/dynamo-graph-deployment-name=${DGD_NAME},nvidia.com/dynamo-component-type=worker"
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          PODS=$(ci_kubectl get pods -n "$NAMESPACE" -l "$WORKER_SELECTOR" -o json)
+          ACTIVE=$(printf '%s\n' "$PODS" | jq '[.items[] | select(.metadata.deletionTimestamp == null)]')
+          if printf '%s\n' "$ACTIVE" | jq -e 'any(.[];
+            .status.phase == "Failed" or
+            any(.status.containerStatuses[]?, .status.initContainerStatuses[]?;
+              ((.state.waiting.reason // .state.terminated.reason // "") |
+                test("Error|CrashLoopBackOff|OOMKilled|ImagePullBackOff|ErrImagePull"))))' >/dev/null; then
+            echo "ERROR: worker failed before container startup" >&2
+            exit 1
+          fi
+          STARTED=$(printf '%s\n' "$ACTIVE" | jq '[.[] | select(
+            .status.phase == "Running" and
+            (.status.containerStatuses | length) == (.spec.containers | length) and
+            all(.status.containerStatuses[]; .state.running != null))] | length')
+          if [ "$STARTED" -ge "$FINAL_CR_COUNT" ]; then
+            echo "All $STARTED worker containers started; beginning the transfer/startup deadline"
+            exit 0
+          fi
+          echo "Worker containers started: $STARTED/$FINAL_CR_COUNT; retrying in 5s"
+          sleep 5
+        done
+        echo "ERROR: worker containers did not start within 900s" >&2
+        exit 1
 
     - name: Wait for scaled-up worker to complete P2P transfer
       shell: bash
@@ -321,15 +391,6 @@ runs:
         wait_for_worker_liveness "$WORKER_SELECTOR" "$EXPECTED" "$TIMEOUT"
         echo "::endgroup::"
 
-    - name: Set up Python
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-      with:
-        python-version: "3.12"
-
-    - name: Install test dependencies
-      shell: bash
-      run: pip install pytest
-
     - name: Run tests
       shell: bash
       env:
@@ -339,6 +400,11 @@ runs:
         DGD_NAME: ${{ inputs.dgd_name }}
         PYTEST_ARGS: ${{ inputs.pytest_args }}
       run: |
+        mkdir -p "inference-artifacts/${NAMESPACE}"
+        kubectl get dynamoworkermetadatas -n "${NAMESPACE}" -o json \
+          > "inference-artifacts/${NAMESPACE}/worker-discovery.json" \
+          || printf '%s\n' '{"error":"dynamoworkermetadatas unavailable"}' \
+          > "inference-artifacts/${NAMESPACE}/worker-discovery.json"
         # Parse PYTEST_ARGS via shlex so values with internal spaces
         # are honored, without eval'ing the string.
         declare -a EXTRA=()
@@ -365,6 +431,8 @@ runs:
         DGD_NAME: ${{ inputs.dgd_name }}
       run: |
         set +eo pipefail
+        LOG_DIR="inference-artifacts/${NAMESPACE}/worker-logs"
+        mkdir -p "$LOG_DIR"
         echo "::group::DGD status"
         kubectl get dgd "${DGD_NAME}" -n "${NAMESPACE}" -o yaml 2>&1 || true
         echo "::endgroup::"
@@ -392,14 +460,24 @@ runs:
               -o jsonpath='{range .status.containerStatuses[*]}{.name}{": restarts="}{.restartCount}{" reason="}{.lastState.terminated.reason}{" exitCode="}{.lastState.terminated.exitCode}{" finishedAt="}{.lastState.terminated.finishedAt}{"\n"}{end}' 2>&1 || true
             while IFS= read -r CONTAINER; do
               echo "--- previous logs ${CONTAINER} ---"
-              kubectl logs -n "${NAMESPACE}" "${POD}" -c "${CONTAINER}" --previous --tail=200 2>&1 || true
+              kubectl logs -n "${NAMESPACE}" "${POD}" -c "${CONTAINER}" --previous --timestamps --tail=-1 2>&1 \
+                | tee "$LOG_DIR/${POD}-${CONTAINER}-previous.log" || true
             done <<< "${RESTARTED_CONTAINERS}"
             echo "::endgroup::"
           fi
-          echo "::group::logs ${POD} (all containers, tail 200)"
-          kubectl logs -n "${NAMESPACE}" "${POD}" --all-containers --tail=200 2>&1 || true
+          echo "::group::logs ${POD} (all containers, full history)"
+          kubectl logs -n "${NAMESPACE}" "${POD}" --all-containers --timestamps --tail=-1 2>&1 \
+            | tee "$LOG_DIR/${POD}.log" || true
           echo "::endgroup::"
         done
+
+    - name: Upload inference comparison artifacts
+      if: always()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: inference-${{ inputs.namespace }}
+        path: inference-artifacts/${{ inputs.namespace }}
+        if-no-files-found: ignore
 
     - name: Cleanup test namespace
       if: always()

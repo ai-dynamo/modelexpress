@@ -88,6 +88,7 @@ def test_weight_transfer_engine_parses_vime_object_storage_init_info(
     monkeypatch, seed_info
 ):
     """Parse VIME object-storage metadata into generator initialization."""
+    monkeypatch.delenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", raising=False)
     client = MagicMock()
     initialize = MagicMock(return_value=client)
     monkeypatch.setattr(
@@ -434,3 +435,20 @@ def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
             "ModelExpressWeightTransferEngine",
         )
     ]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_checkpoint_quota_env_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", value)
+    with pytest.raises(ValueError, match="MX_REFIT_CHECKPOINT_MAX_SIZE_GB"):
+        ModelExpressWeightTransferEngine.init_info_cls()
+
+
+def test_checkpoint_quota_env_default_and_explicit_override(monkeypatch):
+    info = ModelExpressWeightTransferEngine.init_info_cls
+    monkeypatch.delenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", raising=False)
+    assert info().refit_checkpoint_max_size_gb == 2000
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", "3000")
+    assert info().refit_checkpoint_max_size_gb == 3000
+    assert info(refit_checkpoint_max_size_gb=1000).refit_checkpoint_max_size_gb == 1000
+    assert info(refit_checkpoint_max_size_gb=None).refit_checkpoint_max_size_gb is None

@@ -249,11 +249,13 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
         manifests.append(wrap_rendezvous_blob(
             agent.encode(), agent, f"{agent}:19000", [published]
         ))
-    capture = CaptureResult(copies=[RecordedCopy(
+    capture = CaptureResult(source_replay=True, copies=[RecordedCopy(
         "weight", (), "weight", 0, (4, 4), (4, 1), torch.float32
     )])
     layout = {"weight": ((4, 4), torch.float32)}
 
+    harness.layout.clear()
+    harness.layout.update(layout)
     capture_calls = []
 
     def capture_layout(_schema):
@@ -277,7 +279,6 @@ def test_staged_prepare_binds_split_sources_from_reordered_manifests(harness):
     )
     harness.transfer._capture_layout = capture_layout
     request = dict(
-        manifests=manifests,
         trainer_snapshot=snapshot,
     )
     prepared = harness.transfer.prepare(**request)

@@ -19,11 +19,11 @@ also use its full-pull and conversion phases.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from functools import cached_property
 from math import prod
-from types import MappingProxyType
 from typing import Any, Callable
+from uuid import UUID
 
 from modelexpress_rl import envs
 from modelexpress_rl.refit.reshard.slice_plan import (
@@ -106,23 +106,19 @@ class LogicalTransferPlan:
     exact_bytes: int = 0
     verify_full_sources: bool = False
     source_replay: bool = False
-    replay_parameter_names: frozenset[str] = frozenset()
-    replay_last_writes: MappingProxyType = field(default_factory=lambda: MappingProxyType({}))
-    replay_total_copies: int = 0
-    replay_generation: int | None = None
+    replay_id: UUID | None = None
+
+    def _read_groups(self):
+        """Logical reads in the physical execution order, retaining phase groups."""
+        yield "recv", self.segments
+        for pull in self.full_pulls:
+            yield "full", pull.segments
+        for convert in self.converts:
+            yield "convert", convert.segments
 
     def _all_segments(self):
-        """Every planned segment, wherever it lands.
-
-        Segments live in three places - read straight into live params, into
-        dtype-conversion staging, and into full-pull staging - and any question
-        about the plan as a whole has to ask all three.
-        """
-        yield from self.segments
-        for convert in self.converts:
-            yield from convert.segments
-        for full_pull in self.full_pulls:
-            yield from full_pull.segments
+        for _kind, reads in self._read_groups():
+            yield from reads
 
     @cached_property
     def _read_cost(self) -> tuple[int, int]:
@@ -476,9 +472,7 @@ def _plan_source_replay(
         source_buffers=tuple(source_buffers), full_pulls=tuple(full_pulls),
         fallback=tuple(fallback), source_replay=True,
         verify_full_sources=verify_full_sources,
-        replay_parameter_names=frozenset(copy.param_name for copy in capture.copies),
-        replay_last_writes=MappingProxyType({copy.param_name: i for i, copy in enumerate(capture.copies)}),
-        replay_total_copies=len(capture.copies), replay_generation=capture.generation,
+        replay_id=capture.replay_id,
         exact_descriptor_count=sum(p.exact_descriptor_count for p in full_pulls),
         exact_bytes=sum(p.exact_bytes for p in full_pulls),
     )
@@ -627,44 +621,89 @@ class PhysicalTransferPlan:
         )
 
 
+class _TransferBinder:
+    def __init__(self, source_buffers, resolve_source, resolve_destination):
+        self._buffers = source_buffers
+        self._resolve_source = resolve_source
+        self._resolve_destination = resolve_destination
+        self._sources = {}
+        self._destinations = {}
+
+    def descriptor(self, kind, read):
+        index = read.source_buffer
+        if index < 0 or index >= len(self._buffers):
+            raise ValueError(f"source buffer index out of range: {index}")
+        if index not in self._sources:
+            self._sources[index] = self._resolve_source(self._buffers[index])
+        session, address = self._sources[index]
+        target = kind, read.param_name
+        if target not in self._destinations:
+            self._destinations[target] = self._resolve_destination(*target)
+        return ReadDescriptor(
+            session=session,
+            src_addr=address + read.src_byte,
+            dst_addr=self._destinations[target] + read.dst_byte,
+            nbytes=read.nbytes,
+        )
+
+
+class TransferBindingCache:
+    """Bind selected replicas to fixed destinations without recompiling logical reads.
+
+    The owner discards this cache before changing destination storage or registrations.
+    Each logical read retains its position, including duplicate and zero-byte reads.
+    """
+
+    def __init__(self, plan: LogicalTransferPlan):
+        self._buffers = plan.source_buffers
+        self._groups = {}
+        self._count = 0
+        for kind, reads in plan._read_groups():
+            for read in reads:
+                slot = self._buffers[read.source_buffer].source_slot_id
+                self._groups.setdefault(slot, []).append((self._count, kind, read))
+                self._count += 1
+        self._replicas = {}
+        self._last_selection = None
+        self.last_descriptors = ()
+
+    def bind(self, workers, resolve_source, resolve_destination):
+        selection = tuple((slot, workers[slot]) for slot in self._groups)
+        if selection == self._last_selection:
+            return self.last_descriptors, True
+        binder = _TransferBinder(self._buffers, resolve_source, resolve_destination)
+        descriptors = [None] * self._count
+        reused = True
+        for identity in selection:
+            entries = self._groups[identity[0]]
+            if identity not in self._replicas:
+                self._replicas[identity] = tuple(
+                    binder.descriptor(kind, read) for _position, kind, read in entries
+                )
+                reused = False
+            for (position, _kind, _read), descriptor in zip(
+                entries, self._replicas[identity], strict=True
+            ):
+                descriptors[position] = descriptor
+        self._last_selection = selection
+        self.last_descriptors = tuple(descriptors)
+        return self.last_descriptors, reused
+
+
 def bind_transfer(
     plan: LogicalTransferPlan,
     resolve_source: Callable[[SourceBuffer], tuple[str, int]],
     resolve_destination: Callable[[str, str], int],
 ) -> PhysicalTransferPlan:
-    """Resolve each used source buffer and destination once for this execution.
-
-    ``resolve_source(buffer)`` returns ``(session, base_address)``.
-    ``resolve_destination(kind, name)`` returns the destination base address;
-    ``kind`` is ``recv``, ``full`` or ``convert``.
-    """
-    sources = {}
-    destinations = {"recv": {}, "full": {}, "convert": {}}
-
-    def bind(reads, kind):
-        result = []
-        targets = destinations[kind]
-        for read in reads:
-            index = read.source_buffer
-            if index < 0 or index >= len(plan.source_buffers):
-                raise ValueError(f"source buffer index out of range: {index}")
-            if index not in sources:
-                sources[index] = resolve_source(plan.source_buffers[index])
-            session, address = sources[index]
-            target = read.param_name
-            if target not in targets:
-                targets[target] = resolve_destination(kind, target)
-            result.append(ReadDescriptor(
-                session=session, src_addr=address + read.src_byte,
-                dst_addr=targets[target] + read.dst_byte, nbytes=read.nbytes,
-            ))
-        return tuple(result)
-
+    """Resolve each used source buffer and destination once for this execution."""
+    binder = _TransferBinder(plan.source_buffers, resolve_source, resolve_destination)
+    groups = tuple(
+        tuple(binder.descriptor(kind, read) for read in reads)
+        for kind, reads in plan._read_groups()
+    )
+    full_end = 1 + len(plan.full_pulls)
     return PhysicalTransferPlan(
-        bind(plan.segments, "recv"),
-        tuple(bind(p.segments, "full") for p in plan.full_pulls),
-        tuple(bind(p.segments, "convert") for p in plan.converts),
-        plan.fallback,
+        groups[0], groups[1:full_end], groups[full_end:], plan.fallback
     )
 
 

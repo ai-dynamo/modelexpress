@@ -9,7 +9,8 @@ import torch
 
 from modelexpress_rl.refit.reshard.types import IncompleteRefit, UnsupportedReshard
 import modelexpress_rl.inference.nixl_staged_transfer as module
-from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
+import modelexpress_rl.inference.trainer_plan as trainer_plan
+from tests.helpers.refit_replay import replay_ops as _replay_ops
 from modelexpress_rl.inference.plan import StreamingSettings
 from tests.test_refit_bounded_descriptors import harness
 
@@ -18,7 +19,9 @@ from tests.test_refit_bounded_descriptors import harness
 @pytest.mark.parametrize("verify", [False, True])
 def test_ordered_sources_survive_warm_reuse(harness, monkeypatch, verify):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", str(int(verify)))
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     h = harness
     h.transfer._device = torch.device("cpu")
     h.capture.source_replay = True
@@ -52,7 +55,9 @@ def test_replay_digest_verification_rejects_missing_or_stale_digests(
     harness, monkeypatch, missing
 ):
     monkeypatch.setenv("MX_RESHARD_PUBLISH_DIGEST", "1")
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     h = harness
     h.transfer._device = torch.device("cpu")
     h.capture.source_replay = True
@@ -93,11 +98,13 @@ def test_partial_replay_digest_rejection_precedes_native_setup(harness, monkeypa
 def test_replay_scratch_analysis_is_reused_until_generation_changes(harness, monkeypatch):
     from unittest.mock import Mock
 
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     h = harness
     h.capture.source_replay = True
-    analyze = Mock(wraps=module.replay_scratch_bytes)
-    monkeypatch.setattr(module, "replay_scratch_bytes", analyze)
+    analyze = Mock(wraps=trainer_plan.replay_scratch_bytes)
+    monkeypatch.setattr(trainer_plan, "replay_scratch_bytes", analyze)
     for update in range(2):
         prepared = h.prepare()
         list(h.transfer.iter_bounded(prepared, {}))
@@ -113,7 +120,7 @@ def test_replay_scratch_analysis_is_reused_until_generation_changes(harness, mon
 def test_replay_rejects_oversized_write_before_native_setup(harness):
     h = harness
     h.capture.source_replay = True
-    h.transfer._buffer_budget = 255
+    h.transfer._streaming = StreamingSettings(255)
     before = list(h.events)
     with pytest.raises(IncompleteRefit, match="recorded source write requires"):
         h.prepare()
@@ -143,11 +150,12 @@ def test_replay_abandonment_drains_prefetched_read(harness):
 
 
 @pytest.mark.parametrize("harness", [StreamingSettings(2048, "cpu", 2)], indirect=True)
-@pytest.mark.parametrize("replay", [False, True])
-def test_bounded_receive_clears_used_arena_once_per_batch(harness, monkeypatch, replay):
-    monkeypatch.setattr(module, "classic_cuda_alloc", nullcontext)
+def test_bounded_receive_clears_used_arena_once_per_batch(harness, monkeypatch):
+    monkeypatch.setattr(
+        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+    )
     h = harness
-    h.capture.source_replay = replay
+    h.capture.source_replay = True
     prepared = h.prepare()
     zero = torch.Tensor.zero_
     cleared = []
@@ -158,17 +166,11 @@ def test_bounded_receive_clears_used_arena_once_per_batch(harness, monkeypatch, 
 
     monkeypatch.setattr(torch.Tensor, "zero_", clear)
     for batch in h.transfer.iter_bounded(prepared, {}):
-        if replay:
-            for _, copy, source in batch.writes:
-                expected = h.sources[copy.src_name]
-                if copy.src_name == "full":
-                    expected = expected.t()
-                assert torch.equal(_replay_ops(source, copy.op_chain), expected)
-        else:
-            # Copy destinations leave two leading and two trailing values unwritten.
-            for tensor in batch.values():
-                assert torch.equal(tensor[:2], torch.zeros(2, dtype=tensor.dtype))
-                assert torch.equal(tensor[-2:], torch.zeros(2, dtype=tensor.dtype))
+        for _, copy, source in batch.writes:
+            expected = h.sources[copy.src_name]
+            if copy.src_name == "full":
+                expected = expected.t()
+            assert torch.equal(_replay_ops(source, copy.op_chain), expected)
     assert cleared == [batch.nbytes for batch in prepared.batches]
 
 
@@ -194,3 +196,11 @@ def test_coarsening_preserves_warm_replay_and_reports_wire_tradeoff(harness):
                     torch.testing.assert_close(
                         _replay_ops(source, copy.op_chain), h.sources["full"].t()[:2]
                     )
+
+
+def test_trainer_transfer_rejects_non_replay_capture_before_native_setup(harness):
+    harness.capture.source_replay = False
+    before = list(harness.events)
+    with pytest.raises(IncompleteRefit, match="requires ordered source replay"):
+        harness.prepare()
+    assert harness.events == before

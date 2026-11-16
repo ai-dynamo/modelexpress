@@ -70,6 +70,9 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `python3 -m unittest discover -s .github/scripts/tests -v` | CI version-stamping and nightly workflow tests (requires PyYAML, bash and jq) |
 | `./test_grpc_transfer_k8s.sh` | gRPC transfer tests on kind (requires Docker, kubectl and Helm) |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
+| `pytest ci/k8s/client/test_inference_parity.py` | Check inference comparison failures and Dynamo target coverage without GPUs |
+| `pytest ci/k8s/client/test_aiperf_payload.py` | Check payloads against the pinned AIPerf dependency from `ci/pyproject.toml`; runs in CPU CI |
+| `pytest ci/k8s/client/vllm/test_weight_diagnostics.py` | Check the weight-audit wrapper using Torch; runs in Python client CI |
 | `modelexpress_client/python/generate_proto.sh` | Regenerate Python protobuf stubs |
 | `modelexpress_client/go/generate_proto.sh` | Regenerate Go protobuf and gRPC bindings |
 | `(cd modelexpress_client/go && go test ./...)` | Run Go binding compilation tests |
@@ -130,6 +133,7 @@ MX_METADATA_BACKEND=redis REDIS_URL=redis://localhost:6379 cargo run -p modelexp
 |----------|---------|-------------|
 | `MODEL_EXPRESS_ENDPOINT` | `http://localhost:8001` | Server endpoint |
 | `MODEL_EXPRESS_TIMEOUT` | `30` | Request timeout in seconds |
+| `MODEL_EXPRESS_CONNECT_WAIT_SECS` | `10` | Seconds to retry the initial server connection before downloading directly from the provider (0 disables) |
 | `MODEL_EXPRESS_CACHE_DIRECTORY` | (see below) | Cache path override |
 | `MODEL_EXPRESS_NO_SHARED_STORAGE` | `false` | Disable shared storage mode |
 
@@ -141,7 +145,7 @@ Cache directory resolution order: `MODEL_EXPRESS_CACHE_DIRECTORY` -> `HF_HUB_CAC
 |----------|---------|-------------|
 | `MX_SERVER_ADDRESS` | `localhost:8001` | gRPC server address (recommended) |
 | `MODEL_EXPRESS_URL` | `localhost:8001` | Deprecated in favor of `MX_SERVER_ADDRESS`. Still read by all client paths and still takes precedence when both are set, because the TRT-LLM live-transfer integration reads only this name. It is removed once that path reads `MX_SERVER_ADDRESS`; until then set both to the same value. |
-| `MX_POOL_REG` | `0` | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
+| `MX_POOL_REG` | `1` (`0` with `MX_VMM_ARENA=1`) | Allocation-level NIXL registration (registers cudaMalloc blocks instead of individual tensors) |
 | `MX_EXPECTED_WORKERS` | `8` | Number of GPU workers to wait for |
 | `MX_SYNC_PUBLISH` | `1` | Source: wait for all workers before publishing |
 | `MX_SYNC_START` | `1` | Target: wait for all workers before transferring |
@@ -200,6 +204,14 @@ Contributions intended to add significant new functionality must follow a more c
 ## Git Workflow
 
 Feature branches use `<username>/feature-name` format, forked from `main`.
+
+## Python CI prerequisites
+
+The Python protobuf matrix builds and imports `modelexpress.vmm._alloc_ext` before
+running tests. Self-hosted builder images should include `g++`; missing compilers
+use a five-minute, bounded apt setup step with recommended packages disabled.
+An unavailable compiler or failed extension build fails CI rather than silently
+reducing allocator coverage. The complete job retains its 20-minute deadline.
 
 ## Running GitHub Actions Locally
 

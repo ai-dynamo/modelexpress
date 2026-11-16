@@ -851,7 +851,21 @@ jobs:
     name: Trigger GitLab release pipeline
     runs-on:
       group: gitlab_ci_runners
-    needs: [preflight, manual-release-approval, core-tests, stage-containers-ngc, build-wheels, stage-crates, stage-helm-ngc, compliance, notify-slack-start]
+    needs:
+      - preflight
+      - manual-release-approval
+      - core-tests
+      - inference-tests
+      - rl-tests
+      - build-server-image
+      - assemble-server-manifest
+      - package-helm-chart
+      - stage-containers-ngc
+      - build-wheels
+      - stage-crates
+      - stage-helm-ngc
+      - compliance
+      - notify-slack-start
     if: >-
       ${{ !cancelled() &&
           needs.preflight.outputs.release == 'true' &&
@@ -868,6 +882,18 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify release qualification
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          RELEASE: ${{ needs.preflight.outputs.release }}
+          RUN_TESTS: ${{ needs.preflight.outputs.run_tests }}
+        run: bash .github/scripts/check-nightly-results.sh release
+
       - name: Trigger GitLab pipeline
         id: trigger
         env:
@@ -884,30 +910,18 @@ jobs:
           STAGED_CONTAINERS: ${{ needs.stage-containers-ngc.outputs.staged_containers }}
           STAGED_CRATES: ${{ needs.stage-crates.outputs.staged_crates }}
           STAGED_HELM: ${{ needs.stage-helm-ngc.outputs.staged_helm }}
-          CRATES_RESULT: ${{ needs.stage-crates.result }}
-          HELM_RESULT: ${{ needs.stage-helm-ngc.result }}
           SLACK_THREAD_TS: ${{ needs.notify-slack-start.outputs.thread_ts }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_RELEASE_CHANNEL_ID }}
         run: |
           set -euo pipefail
-          if [ -z "${ARTIFACTORY_WHEEL_REPO}" ]; then
-            echo "::error::ARTIFACTORY_PYPI_REPO_NAME is not set; GitLab would receive an empty artifact path"
-            exit 1
-          fi
+          for NAME in ARTIFACTORY_WHEEL_REPO ARTIFACTORY_PATH NGC_STAGING_ORG NIGHTLY_TAG WHEEL_VERSION CRATE_VERSION HELM_CHART_VERSION STAGED_CONTAINERS STAGED_CRATES STAGED_HELM; do
+            if [ -z "${!NAME}" ]; then
+              echo "::error::${NAME} is missing; refusing an incomplete release handoff"
+              exit 1
+            fi
+          done
 
-          ARTIFACTS="wheel,container"
-          if [ "${CRATES_RESULT}" = "success" ]; then
-            ARTIFACTS="${ARTIFACTS},crate"
-          else
-            CRATE_VERSION=""
-            STAGED_CRATES=""
-          fi
-          if [ "${HELM_RESULT}" = "success" ]; then
-            ARTIFACTS="${ARTIFACTS},helm"
-          else
-            HELM_CHART_VERSION=""
-            STAGED_HELM=""
-          fi
+          ARTIFACTS="wheel,container,crate,helm"
           # Mask the derived GitLab host; only the exact secret value is masked automatically.
           AUTHORITY=$(printf '%s' "${GITLAB_TRIGGER_URL}" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^/]+).*#\1#')
           HOST="${AUTHORITY##*@}"
@@ -1035,38 +1049,18 @@ jobs:
       - trigger-gitlab-release
     if: always()
     steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
       - name: Verify results
         env:
           RESULTS: ${{ toJSON(needs) }}
           RELEASE: ${{ needs.preflight.outputs.release }}
           RUN_TESTS: ${{ needs.preflight.outputs.run_tests }}
           SKIP_GITLAB: ${{ inputs.skip_gitlab_pipeline }}
-        run: |
-          set -uo pipefail
-          echo "${RESULTS}" | jq .
-          FAILED=$(echo "${RESULTS}" | jq -r 'to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key')
-          MANDATORY=""
-          [ "${RUN_TESTS}" = "true" ] && MANDATORY="core-tests inference-tests rl-tests"
-          if [ "${RELEASE}" = "true" ]; then
-            MANDATORY="${MANDATORY} build-server-image assemble-server-manifest build-wheels stage-crates package-helm-chart stage-helm-ngc stage-containers-ngc compliance"
-            [ "${SKIP_GITLAB}" != "true" ] && MANDATORY="${MANDATORY} trigger-gitlab-release"
-          fi
-          for JOB in ${MANDATORY}; do
-            RESULT=$(echo "${RESULTS}" | jq -r --arg j "${JOB}" 'if has($j) then .[$j].result else "MISSING" end')
-            if [ "${RESULT}" = "MISSING" ]; then
-              echo "::error::nightly-status references unknown job '${JOB}' — add it to needs: or fix the name."
-              exit 1
-            fi
-            if [ "${RESULT}" != "success" ]; then
-              FAILED="${FAILED}
-          ${JOB} (required, result: ${RESULT})"
-            fi
-          done
-          if [ -n "$(echo "${FAILED}" | tr -d '[:space:]')" ]; then
-            echo "::error::Nightly jobs failed: ${FAILED}"
-            exit 1
-          fi
-          echo "All nightly jobs succeeded (or were intentionally skipped)."
+        run: bash .github/scripts/check-nightly-results.sh final
 
   notify-slack-failure:
     name: Notify Slack — run status

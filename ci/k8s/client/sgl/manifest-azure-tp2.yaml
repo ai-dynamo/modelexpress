@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Azure single-job template for SGLang P2P RDMA weight-transfer CI tests with
-# tensor parallelism = 2, on a DeepSeek MLA + MoE model.
+# tensor parallelism = 2, on a GLM MLA + MoE model.
 #
 # SGLang counterpart of ci/k8s/client/vllm/manifest-azure-tp2.yaml. Same intent
-# (single-node TP=2 on a full-GPU node, DeepSeek-V2-Lite, fixed-small KV so
+# (single-node TP=2 on a full-GPU node, GLM-4.7-Flash, fixed-small KV so
 # source/target VRAM parity stays sensitive to weight residency) with the
 # SGLang launch command from sgl/manifest-azure.yaml.
 #
-# WHY THIS MODEL: deepseek-ai/DeepSeek-V2-Lite is MLA + MoE. Its attention
+# WHY THIS MODEL: zai-org/GLM-4.7-Flash is MLA + MoE. Its attention
 # weight-loader mixin derives w_kc/w_vc and assigns them directly on the module
 # (invisible to named_parameters()). On the P2P target those hidden tensors must
 # be captured, transferred, and match the source, or the target serves garbage
@@ -18,11 +18,11 @@
 # Differences vs sgl/manifest-azure.yaml (TP=1, Qwen):
 #   - nvidia.com/gpu / rdma/ib: 2 each (one IB device per GPU)
 #   - --tp 2
-#   - --context-length 1024 + --max-total-tokens 131072: keep the KV pool small
+#   - --context-length 2048 + --max-total-tokens 131072: keep the KV pool small
 #     and fixed. SGLang has no direct byte cap like vLLM's
 #     --kv-cache-memory-bytes, so the explicit token cap prevents available
 #     memory differences from changing source/target cache capacity.
-#   - --trust-remote-code: DeepSeek-V2 ships custom modeling code.
+#   - --trust-remote-code: allow model-provided configuration code when needed.
 #   - cpu/memory bumped to accommodate 2 GPUs of orchestration.
 #
 # CLUSTER REQUIREMENT — MUST RUN ON NON-MIG GPU NODES (agentpool: a100b).
@@ -114,7 +114,7 @@ spec:
             # Keep KV fixed and small so VRAM parity stays sensitive to weight
             # residency instead of available-memory-dependent cache sizing.
             - --context-length
-            - "1024"
+            - "2048"
             - --max-total-tokens
             - "131072"
             - --mem-fraction-static
@@ -127,6 +127,11 @@ spec:
             - --modelexpress-config
             - '{"transport": "nixl"}'
           env:
+            # SGLang's GLM loader retains borrowed buffers that distributed
+            # ModelStreamer loading reuses, corrupting weights. Disable it
+            # pending the ownership fix; vLLM is unaffected. TP/EP and RDMA stay enabled.
+            - name: MX_MS_DISTRIBUTED
+              value: "0"
             - name: MX_MODEL_URI
               value: "${MX_CI_MODEL}"
             - name: MX_SERVER_ADDRESS

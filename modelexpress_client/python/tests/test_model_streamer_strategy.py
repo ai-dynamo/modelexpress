@@ -207,7 +207,7 @@ class TestModelStreamerLoad:
     def test_uri_from_env_with_hf_model_as_fallback(self):
         model = MagicMock()
         ctx = self._make_ctx_with_uri(
-            model_weights=None, model="Qwen/Qwen2.5-0.5B"
+            model_weights=None, model="Qwen/Qwen3.5-0.8B"
         )
         strategy = self._make_strategy()
 

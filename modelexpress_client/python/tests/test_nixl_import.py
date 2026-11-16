@@ -4,23 +4,42 @@
 import importlib
 from types import ModuleType
 
+import pytest
+import torch
+
 from modelexpress._nixl import load_nixl_api
 
 
-def test_load_nixl_api_prefers_cuda_specific_package(monkeypatch) -> None:
-    api = ModuleType("nixl_cu13._api")
+@pytest.mark.parametrize("cuda", ["12.9", "13.0"])
+def test_load_nixl_api_prefers_matching_cuda_package(monkeypatch, cuda) -> None:
+    monkeypatch.setattr(torch.version, "cuda", cuda)
+    expected = f"nixl_cu{cuda.split('.')[0]}._api"
+    apis = {name: ModuleType(name) for name in ("nixl_cu12._api", "nixl_cu13._api")}
     attempted = []
 
     def import_module(name: str) -> ModuleType:
         attempted.append(name)
-        if name == "nixl_cu13._api":
-            return api
+        if name in apis:
+            return apis[name]
         raise ImportError(name)
 
     monkeypatch.setattr(importlib, "import_module", import_module)
 
-    assert load_nixl_api() is api
-    assert attempted == ["nixl_cu13._api"]
+    assert load_nixl_api() is apis[expected]
+    assert attempted == [expected]
+
+
+def test_load_nixl_api_does_not_try_other_cuda_major(monkeypatch) -> None:
+    monkeypatch.setattr(torch.version, "cuda", "12.9")
+    attempted = []
+
+    def import_module(name):
+        attempted.append(name)
+        raise ModuleNotFoundError(name, name=name)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    assert load_nixl_api() is None
+    assert attempted == ["nixl_cu12._api", "nixl._api"]
 
 
 def test_load_nixl_api_falls_back_to_meta_package(monkeypatch) -> None:

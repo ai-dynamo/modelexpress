@@ -1,0 +1,1103 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Rendezvous behaviour for the NCCL M2N collective path.
+
+Driven against a fake stub rather than a live server. The behaviour worth
+pinning here is what the client does when things go wrong, because every one of
+these cases otherwise presents as a hung collective: a group that never becomes
+READY, an epoch that moves underneath a waiter, and a bootstrap identifier of
+the wrong size.
+"""
+
+import grpc
+import pytest
+from modelexpress_rl import refit_collective_pb2 as pb
+from modelexpress_rl.collective import rendezvous as rz
+from modelexpress_rl.collective.rendezvous import (
+    CollectiveRendezvous,
+    EpochChangedError,
+    GroupNotReadyError,
+    Membership,
+    RendezvousError,
+)
+from modelexpress_rl.collective.types import Role
+
+
+class FakeStub:
+    """Stands in for RefitCollectiveServiceStub."""
+
+    def __init__(self, groups=None, membership=None, get_error=None):
+        self._groups = list(groups or [])
+        self._membership = membership
+        self._get_error = get_error
+        self.joined = []
+        self.registered = []
+        self.published = []
+        self.reported = []
+        self.events = []
+        self.get_calls = 0
+        self.get_timeouts = []
+
+    def JoinCollectiveGroup(self, request, timeout=None):  # noqa: N802 - gRPC naming
+        self.events.append("join")
+        self.joined.append(request)
+        return self._membership
+
+    def RegisterWorker(self, request, timeout=None):  # noqa: N802
+        self.events.append("register")
+        self.registered.append(request)
+        return request.worker
+
+    def GetCollectiveGroup(self, request, timeout=None):  # noqa: N802
+        self.get_calls += 1
+        self.get_timeouts.append(timeout)
+        if self._get_error is not None:
+            raise self._get_error
+        index = min(self.get_calls - 1, len(self._groups) - 1)
+        return self._groups[index]
+
+    def PublishGroupBootstrap(self, request, timeout=None):  # noqa: N802
+        self.published.append(request)
+        return pb.CollectiveGroup()
+
+    def ReportCollectiveTransfer(self, request, timeout=None):  # noqa: N802
+        self.reported.append(request)
+        return pb.CollectiveTransfer(operation_id=request.operation_id)
+
+
+def lanes_for(trainer_slots, generator_slots, *, lane_count=1):
+    """Declare `lane_count` reshard lanes over the trainers, plus a broadcast.
+
+    How the trainers are split is the TEST's choice, exactly as it is the
+    caller's in production. MX is never told what the split means.
+    """
+    per_lane = max(-(-len(trainer_slots) // max(lane_count, 1)), 1)
+    lanes = [
+        rz.LaneDeclaration(
+            index,
+            "RESHARD",
+            tuple(trainer_slots[index * per_lane : (index + 1) * per_lane]),
+            tuple(generator_slots),
+        )
+        for index in range(lane_count)
+    ]
+    lanes.append(
+        rz.LaneDeclaration(
+            lane_count, "BROADCAST", tuple(trainer_slots), tuple(generator_slots)
+        )
+    )
+    return lanes
+
+
+def make_rendezvous(stub, *, start_thread=False):
+    client = CollectiveRendezvous.__new__(CollectiveRendezvous)
+    client._stub = stub
+    client._group_specs = {}
+    client._registration_stub = stub
+    client._rpc_timeout_s = 5.0
+    client._registration_ttl_s = 90
+    client._registration_lock = rz.threading.Lock()
+    client._registration_stop = rz.threading.Event()
+    client._registration_thread = None
+    client._registration = None
+    client._closed = False
+    if not start_thread:
+        client._start_registration_renewal = lambda: None
+    return client
+
+
+def membership(*, epoch=1, assignments=(), leader=False):
+    result = pb.CollectiveGroupMembership(
+        group_id="g1", epoch=epoch, is_bootstrap_leader=leader
+    )
+    for lane_id, kind, rank, world_size in assignments:
+        assignment = result.assignments.add()
+        assignment.lane_id = lane_id
+        assignment.kind = kind
+        assignment.rank_in_lane = rank
+        assignment.world_size = world_size
+    return result
+
+
+def group(
+    *, epoch=1, state=pb.COLLECTIVE_GROUP_STATE_FORMING, admitted=(), lanes_ready=True
+):
+    g = pb.CollectiveGroup(
+        group_id="g1",
+        epoch=epoch,
+        state=state,
+        expected_trainer_slots=["t0", "t1"],
+        expected_generator_slots=["g0"],
+    )
+    lane = g.lanes.add()
+    lane.lane_id = 0
+    lane.kind = pb.LANE_KIND_RESHARD
+    lane.bootstrap_epoch = epoch if lanes_ready else 0
+    broadcast = g.lanes.add()
+    broadcast.lane_id = 1
+    broadcast.kind = pb.LANE_KIND_BROADCAST
+    broadcast.bootstrap_epoch = epoch if lanes_ready else 0
+    for slot in admitted:
+        role = (
+            pb.COLLECTIVE_ROLE_TRAINER
+            if slot.startswith("t")
+            else pb.COLLECTIVE_ROLE_GENERATOR
+        )
+        p = broadcast.participants.add()
+        p.slot_id = slot
+        p.role = role
+    return g
+
+
+class TestCreateTransfer:
+    @staticmethod
+    def joined(stub):
+        client = make_rendezvous(stub)
+        joined = client.join(
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0", "t1"], ["g0"]),
+            slot_id="t0",
+            worker_id="w0",
+            role=Role.TRAINER,
+            index_in_role=0,
+            plan_digest="d",
+        )
+        return client, joined
+
+    @staticmethod
+    def stub(**changes):
+        stub = FakeStub(
+            membership=membership(
+                leader=True,
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 0, 3),
+                    (1, pb.LANE_KIND_BROADCAST, 0, 3),
+                ],
+            ),
+            groups=[group(state=pb.COLLECTIVE_GROUP_STATE_READY)],
+        )
+        stub.created = []
+
+        def create(request, timeout=None):
+            stub.created.append(request)
+            fields = dict(
+                operation_id="845aaea0-f64b-4f2e-b212-5af940b4c169",
+                group_id="g1",
+                epoch=1,
+                model_name="m",
+                version_id=request.version_id,
+                idempotency_key=request.idempotency_key,
+                state=pb.COLLECTIVE_TRANSFER_STATE_PENDING,
+            )
+            fields.update(changes)
+            return pb.CollectiveTransfer(**fields)
+
+        stub.CreateCollectiveTransfer = create
+        return stub
+
+    def test_creation_retains_exact_joined_spec_and_replay_key(self):
+        stub = self.stub()
+        client, joined = self.joined(stub)
+        first = client.create_transfer(joined, "2", key_prefix="test")
+        second = client.create_transfer(joined, "2", key_prefix="test")
+        assert first == second
+        assert first.operation_id == "845aaea0-f64b-4f2e-b212-5af940b4c169"
+        assert stub.created[0].spec == stub.joined[0].spec
+        assert stub.created[0] == stub.created[1]
+        assert stub.created[0].idempotency_key == "test-g1-epoch-1-version-2"
+        assert stub.get_timeouts == [5.0, 5.0]
+
+    def test_creation_names_the_ready_epoch_it_checked(self):
+        # The server admits the create only if the group is still READY at
+        # exactly this epoch, so a group that moved on in between leaves no
+        # operation behind for the client to reject.
+        stub = self.stub()
+        client, joined = self.joined(stub)
+        client.create_transfer(joined, "2", key_prefix="test")
+        assert joined.epoch == 1
+        assert stub.created[0].expected_epoch == joined.epoch
+
+    def test_the_replay_key_carries_the_callers_namespace(self):
+        stub = self.stub()
+        client, joined = self.joined(stub)
+        # The prefix is the caller's own namespace; "acme" stands in for an
+        # arbitrary integration, because the core must never brand the key.
+        client.create_transfer(joined, "2", key_prefix="acme")
+        assert stub.created[0].idempotency_key == "acme-g1-epoch-1-version-2"
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"operation_id": ""},
+            {"group_id": "other"},
+            {"epoch": 2},
+            {"model_name": "other"},
+            {"version_id": "other"},
+            {"idempotency_key": "other"},
+            {"state": pb.COLLECTIVE_TRANSFER_STATE_COMPLETE},
+        ],
+    )
+    def test_wrong_transfer_binding_is_rejected(self, changes):
+        stub = self.stub(**changes)
+        client, joined = self.joined(stub)
+        with pytest.raises(RendezvousError, match="incorrectly bound"):
+            client.create_transfer(joined, "2", key_prefix="test")
+
+    @pytest.mark.parametrize(
+        ("changes", "named"),
+        [
+            ({"operation_id": ""}, "operation_id is empty"),
+            ({"group_id": "other"}, "group_id is 'other', expected 'g1'"),
+            ({"epoch": 2}, "epoch is 2, expected 1"),
+            ({"model_name": "other"}, "model_name is 'other', expected 'm'"),
+            ({"version_id": "other"}, "version_id is 'other', expected '2'"),
+            (
+                {"idempotency_key": "other"},
+                "idempotency_key is 'other', expected 'test-g1-epoch-1-version-2'",
+            ),
+            (
+                {"state": pb.COLLECTIVE_TRANSFER_STATE_RUNNING},
+                "state is COLLECTIVE_TRANSFER_STATE_RUNNING, expected PENDING",
+            ),
+            (
+                {"state": pb.COLLECTIVE_TRANSFER_STATE_COMPLETE},
+                "state is COLLECTIVE_TRANSFER_STATE_COMPLETE, expected PENDING",
+            ),
+        ],
+    )
+    def test_a_wrongly_bound_transfer_names_what_differed(self, changes, named):
+        stub = self.stub(**changes)
+        client, joined = self.joined(stub)
+        with pytest.raises(RendezvousError) as error:
+            client.create_transfer(joined, "2", key_prefix="test")
+        assert named in str(error.value)
+
+    def test_every_mismatch_is_reported_together(self):
+        stub = self.stub(epoch=2, state=pb.COLLECTIVE_TRANSFER_STATE_RUNNING)
+        client, joined = self.joined(stub)
+        with pytest.raises(RendezvousError) as error:
+            client.create_transfer(joined, "2", key_prefix="test")
+        message = str(error.value)
+        assert "epoch is 2, expected 1" in message
+        assert "state is COLLECTIVE_TRANSFER_STATE_RUNNING" in message
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"group_id": "other"},
+            {"epoch": 2},
+            {"state": pb.COLLECTIVE_GROUP_STATE_FORMING},
+        ],
+    )
+    def test_creation_requires_own_ready_epoch(self, changes):
+        stub = self.stub()
+        for name, value in changes.items():
+            setattr(stub._groups[0], name, value)
+        client, joined = self.joined(stub)
+        with pytest.raises(RendezvousError, match="joined READY epoch"):
+            client.create_transfer(joined, "2", key_prefix="test")
+        assert stub.created == []
+
+    def test_a_membership_this_client_never_joined_is_a_rendezvous_error(self):
+        # A bare KeyError out of the spec lookup would present a caller bug
+        # as an internal one.
+        stub = self.stub()
+        client = make_rendezvous(stub)
+        foreign = Membership(
+            group_id="other", epoch=1, lanes=(), is_bootstrap_leader=False
+        )
+        with pytest.raises(RendezvousError, match="never joined group 'other'"):
+            client.create_transfer(foreign, "2", key_prefix="test")
+        assert stub.get_calls == 0
+        assert stub.created == []
+
+    @pytest.mark.parametrize("key_prefix", ["", "   ", "\t\n"])
+    def test_an_empty_replay_namespace_is_rejected_before_any_rpc(self, key_prefix):
+        # Failing after the server created the transfer would already have
+        # admitted the replay collision.
+        stub = self.stub()
+        client, joined = self.joined(stub)
+        with pytest.raises(RendezvousError, match="replay namespace"):
+            client.create_transfer(joined, "2", key_prefix=key_prefix)
+        assert stub.get_calls == 0
+        assert stub.created == []
+
+
+class TestBindTransfer:
+    """start_weight_update binds the round to an operation read back from MX."""
+
+    @staticmethod
+    def stub(**changes):
+        stub = TestCreateTransfer.stub()
+        stub.fetched = []
+
+        def get(request, timeout=None):
+            stub.fetched.append(request.operation_id)
+            fields = dict(
+                operation_id=request.operation_id,
+                group_id="g1",
+                epoch=1,
+                model_name="m",
+                version_id="2",
+                idempotency_key="test-g1-epoch-1-version-2",
+                state=pb.COLLECTIVE_TRANSFER_STATE_PENDING,
+            )
+            fields.update(changes)
+            return pb.CollectiveTransfer(**fields)
+
+        stub.GetCollectiveTransfer = get
+        return stub
+
+    @pytest.mark.parametrize(
+        "state",
+        [pb.COLLECTIVE_TRANSFER_STATE_PENDING, pb.COLLECTIVE_TRANSFER_STATE_RUNNING],
+    )
+    def test_an_open_operation_for_this_round_binds(self, state):
+        stub = self.stub(state=state)
+        client, joined = TestCreateTransfer.joined(stub)
+        transfer = client.bind_transfer(joined, "op", "2")
+        assert transfer.operation_id == "op"
+        assert stub.fetched == ["op"]
+
+    @pytest.mark.parametrize(
+        ("changes", "named"),
+        [
+            ({"operation_id": "other"}, "operation_id"),
+            ({"group_id": "other"}, "group_id"),
+            ({"epoch": 2}, "epoch"),
+            ({"version_id": "1"}, "version_id"),
+            ({"model_name": "other"}, "model_name"),
+            ({"state": pb.COLLECTIVE_TRANSFER_STATE_COMPLETE}, "COMPLETE"),
+            ({"state": pb.COLLECTIVE_TRANSFER_STATE_FAILED}, "FAILED"),
+            ({"state": pb.COLLECTIVE_TRANSFER_STATE_ABORTED}, "ABORTED"),
+        ],
+    )
+    def test_an_operation_for_another_round_is_refused(self, changes, named):
+        from modelexpress_rl.collective import TransferBindingError
+
+        stub = self.stub(**changes)
+        client, joined = TestCreateTransfer.joined(stub)
+        with pytest.raises(TransferBindingError, match=named):
+            client.bind_transfer(joined, "op", "2")
+
+    @pytest.mark.parametrize("operation_id", ["", "  "])
+    def test_an_empty_operation_is_refused_before_any_rpc(self, operation_id):
+        from modelexpress_rl.collective import TransferBindingError
+
+        stub = self.stub()
+        client, joined = TestCreateTransfer.joined(stub)
+        with pytest.raises(TransferBindingError, match="operation_id"):
+            client.bind_transfer(joined, operation_id, "2")
+        assert stub.fetched == []
+
+    def test_a_group_this_client_never_joined_is_refused(self):
+        stub = self.stub()
+        client = make_rendezvous(stub)
+        foreign = Membership(
+            group_id="other", epoch=1, lanes=(), is_bootstrap_leader=False
+        )
+        with pytest.raises(RendezvousError, match="never joined group 'other'"):
+            client.bind_transfer(foreign, "op", "2")
+        assert stub.fetched == []
+
+
+class TestJoin:
+    def test_a_trainer_declares_its_partition_and_takes_the_assigned_rank(self):
+        response = pb.CollectiveGroupMembership(
+            group_id="g1", epoch=3, is_bootstrap_leader=True
+        )
+        a = response.assignments.add()
+        a.lane_id, a.kind, a.rank_in_lane, a.world_size = 0, pb.LANE_KIND_RESHARD, 0, 3
+        b = response.assignments.add()
+        b.lane_id, b.kind, b.rank_in_lane, b.world_size = (
+            1,
+            pb.LANE_KIND_BROADCAST,
+            0,
+            3,
+        )
+
+        stub = FakeStub(membership=response)
+        result = make_rendezvous(stub).join(
+            model_name="m",
+            trainer_slots=["t0", "t1"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0", "t1"], ["g0"]),
+            slot_id="t0",
+            worker_id="w0",
+            role=Role.TRAINER,
+            index_in_role=0,
+            plan_digest="d",
+        )
+
+        assert isinstance(result, Membership)
+        assert result.epoch == 3
+        assert result.is_bootstrap_leader
+        assert result.lane(0).rank_in_lane == 0
+        assert result.broadcast_lane.lane_id == 1
+        assert len(result.reshard_lanes) == 1
+        assert stub.events[:2] == ["register", "join"]
+        registered = stub.registered[0]
+        assert registered.worker.role == rz.refit_pb2.WORKER_ROLE_TRAINER
+        assert registered.ttl_seconds == 90
+        sent = stub.joined[0]
+        assert [lane.lane_id for lane in sent.spec.lanes] == [0, 1]
+        assert sent.role == pb.COLLECTIVE_ROLE_TRAINER
+
+    def test_a_generator_sends_no_partition(self):
+        stub = FakeStub(
+            membership=membership(
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 1, 2),
+                    (1, pb.LANE_KIND_BROADCAST, 1, 2),
+                ]
+            )
+        )
+        make_rendezvous(stub).join(
+            model_name="m",
+            trainer_slots=["t0"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0"], ["g0"]),
+            slot_id="g0",
+            worker_id="w1",
+            role=Role.GENERATOR,
+            index_in_role=0,
+            plan_digest="d",
+        )
+        # A generator is placed by the lanes that declared its slot, so the
+        # request has nowhere to carry a partition and no need of one.
+        assert "source_partition" not in (
+            pb.JoinCollectiveGroupRequest.DESCRIPTOR.fields_by_name
+        )
+        assert stub.registered[0].worker.role == rz.refit_pb2.WORKER_ROLE_GENERATOR
+
+    def test_a_plan_endpoint_is_advertised_with_the_matching_digest(self):
+        stub = FakeStub(
+            membership=membership(
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 0, 2),
+                    (1, pb.LANE_KIND_BROADCAST, 0, 2),
+                ],
+                leader=True,
+            )
+        )
+        make_rendezvous(stub).join(
+            model_name="m",
+            trainer_slots=["t0"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0"], ["g0"]),
+            slot_id="t0",
+            worker_id="w0",
+            role=Role.TRAINER,
+            index_in_role=0,
+            plan_digest="abc",
+            plan_endpoint="host:1234",
+        )
+        source = stub.joined[0].plan_source
+        assert source.endpoint == "host:1234"
+        # Generators verify the fetched plan against the digest MX advertises,
+        # so the two must not be allowed to drift apart at the source.
+        assert source.digest == "abc"
+        # Advertising a plan endpoint does not put one on the worker
+        # registration: registration carries identity and liveness only, and
+        # the wire has no field to put an endpoint in.
+        assert (
+            "endpoint" not in rz.refit_pb2.WorkerRegistration.DESCRIPTOR.fields_by_name
+        )
+
+    def test_a_server_rank_disagreement_is_rejected_before_communicator_init(self):
+        stub = FakeStub(
+            membership=membership(
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 0, 2),
+                    # Generator 0 must be rank 1 on the broadcast lane too.
+                    (1, pb.LANE_KIND_BROADCAST, 0, 2),
+                ]
+            )
+        )
+        with pytest.raises(RendezvousError, match="rank mirror"):
+            make_rendezvous(stub).join(
+                model_name="m",
+                trainer_slots=["t0"],
+                generator_slots=["g0"],
+                lanes=lanes_for(["t0"], ["g0"]),
+                slot_id="g0",
+                worker_id="w1",
+                role=Role.GENERATOR,
+                index_in_role=0,
+                plan_digest="d",
+            )
+
+    def test_only_the_first_trainer_can_advertise_the_plan(self):
+        stub = FakeStub()
+        with pytest.raises(ValueError, match="only trainer index 0"):
+            make_rendezvous(stub).join(
+                model_name="m",
+                trainer_slots=["t0", "t1"],
+                generator_slots=["g0"],
+                lanes=lanes_for(["t0", "t1"], ["g0"]),
+                slot_id="t1",
+                worker_id="w1",
+                role=Role.TRAINER,
+                index_in_role=1,
+                plan_digest="d",
+                plan_endpoint="host:1234",
+            )
+        assert stub.joined == []
+        assert stub.registered == []
+
+    def test_an_ordinal_that_contradicts_the_declared_slot_order_is_rejected(self):
+        # index_in_role IS the slot's position in its role list - the server
+        # rejects two slots claiming one ordinal, but a single slot sending
+        # the wrong one is admitted, and the plan-source guard below trusts
+        # it. Catch it where the caller can still see which value was wrong.
+        stub = FakeStub(membership=membership())
+        with pytest.raises(ValueError, match="does not match the declared position"):
+            make_rendezvous(stub).join(
+                model_name="m",
+                trainer_slots=["t0", "t1"],
+                generator_slots=["g0"],
+                lanes=lanes_for(["t0", "t1"], ["g0"]),
+                slot_id="t1",
+                worker_id="w1",
+                role=Role.TRAINER,
+                index_in_role=0,
+                plan_digest="d",
+            )
+        assert stub.events == [], "nothing may reach the server on a bad ordinal"
+
+    def test_a_generator_ordinal_is_checked_against_its_own_role_list(self):
+        stub = FakeStub(membership=membership())
+        with pytest.raises(ValueError, match="does not match the declared position"):
+            make_rendezvous(stub).join(
+                model_name="m",
+                trainer_slots=["t0"],
+                generator_slots=["g0", "g1"],
+                lanes=lanes_for(["t0"], ["g0", "g1"]),
+                slot_id="g0",
+                worker_id="w0",
+                role=Role.GENERATOR,
+                index_in_role=1,
+                plan_digest="d",
+            )
+
+    def test_one_rendezvous_cannot_register_two_worker_identities(self):
+        stub = FakeStub(
+            membership=membership(
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 1, 2),
+                    (1, pb.LANE_KIND_BROADCAST, 1, 2),
+                ]
+            )
+        )
+        client = make_rendezvous(stub)
+        kwargs = dict(
+            model_name="m",
+            trainer_slots=["t0"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0"], ["g0"]),
+            slot_id="g0",
+            worker_id="w1",
+            role=Role.GENERATOR,
+            index_in_role=0,
+            plan_digest="d",
+        )
+        client.join(**kwargs)
+        client.join(**kwargs)
+        assert [r.worker.worker_id for r in stub.registered] == ["w1", "w1"]
+
+        with pytest.raises(RendezvousError, match="more than one worker identity"):
+            client.join(**{**kwargs, "worker_id": "w2"})
+        assert len(stub.joined) == 2
+
+    def test_close_stops_the_registration_renewal_thread(self, monkeypatch):
+        threads = []
+
+        class FakeThread:
+            def __init__(self, *, target, name, daemon):
+                self.target = target
+                self.name = name
+                self.daemon = daemon
+                self.started = False
+                self.joined = False
+                threads.append(self)
+
+            def start(self):
+                self.started = True
+
+            def join(self):
+                self.joined = True
+
+        monkeypatch.setattr(rz.threading, "Thread", FakeThread)
+        stub = FakeStub(
+            membership=membership(
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 1, 2),
+                    (1, pb.LANE_KIND_BROADCAST, 1, 2),
+                ]
+            )
+        )
+        client = make_rendezvous(stub, start_thread=True)
+        client.join(
+            model_name="m",
+            trainer_slots=["t0"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0"], ["g0"]),
+            slot_id="g0",
+            worker_id="w1",
+            role=Role.GENERATOR,
+            index_in_role=0,
+            plan_digest="d",
+        )
+        assert len(threads) == 1
+        assert threads[0].started and threads[0].daemon
+
+        client.close()
+        assert client._registration_stop.is_set()
+        assert threads[0].joined
+
+    def test_a_closed_rendezvous_refuses_to_join_again(self):
+        # A worker whose communicator bootstrap failed closes its rendezvous;
+        # it must not renew its lease or rejoin the epoch it just aborted.
+        stub = FakeStub(
+            membership=membership(
+                assignments=[
+                    (0, pb.LANE_KIND_RESHARD, 1, 2),
+                    (1, pb.LANE_KIND_BROADCAST, 1, 2),
+                ]
+            )
+        )
+        client = make_rendezvous(stub)
+        kwargs = dict(
+            model_name="m",
+            trainer_slots=["t0"],
+            generator_slots=["g0"],
+            lanes=lanes_for(["t0"], ["g0"]),
+            slot_id="g0",
+            worker_id="w1",
+            role=Role.GENERATOR,
+            index_in_role=0,
+            plan_digest="d",
+        )
+        client.join(**kwargs)
+        client.close()
+        with pytest.raises(RendezvousError, match="closed"):
+            client.join(**kwargs)
+        assert stub.events == ["register", "join"]
+
+
+class TestAwaitReady:
+    def test_it_returns_once_the_group_is_ready(self):
+        stub = FakeStub(
+            groups=[
+                group(state=pb.COLLECTIVE_GROUP_STATE_FORMING),
+                group(state=pb.COLLECTIVE_GROUP_STATE_READY),
+            ]
+        )
+        result = make_rendezvous(stub).await_ready(
+            group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+        )
+        assert result.state == pb.COLLECTIVE_GROUP_STATE_READY
+        assert stub.get_calls == 2
+
+    def test_an_epoch_move_is_not_retryable(self):
+        # The caller's plan and communicator are stale, so waiting longer would
+        # never help; it has to rebuild.
+        stub = FakeStub(groups=[group(epoch=4, state=pb.COLLECTIVE_GROUP_STATE_READY)])
+        with pytest.raises(EpochChangedError) as caught:
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+            )
+        assert caught.value.expected == 1
+        assert caught.value.actual == 4
+        assert caught.value.disagreeing == []
+
+    def test_an_epoch_move_names_a_plan_digest_disagreement(self):
+        # Every join with a different digest bumps the epoch, so a cohort that
+        # truly disagrees surfaces here and never reaches the timeout path.
+        moved = group(epoch=3)
+        moved.disagreeing_slots.append("g0")
+        stub = FakeStub(groups=[moved])
+        with pytest.raises(EpochChangedError) as caught:
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+            )
+        assert caught.value.disagreeing == ["g0"]
+        assert "g0" in str(caught.value)
+
+    def test_the_timeout_names_the_slots_that_never_joined(self):
+        # "The collective hung" is not actionable; "t1 never joined" is.
+        stub = FakeStub(groups=[group(admitted=["t0", "g0"])])
+        with pytest.raises(GroupNotReadyError) as caught:
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=0.05, poll_interval_s=0.001
+            )
+        assert caught.value.missing == ["trainer slot t1"]
+        assert "t1" in str(caught.value)
+
+    def test_a_fully_admitted_group_blames_the_unbootstrapped_lane(self):
+        stub = FakeStub(groups=[group(admitted=["t0", "t1", "g0"], lanes_ready=False)])
+        with pytest.raises(GroupNotReadyError) as caught:
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=0.05, poll_interval_s=0.001
+            )
+        assert caught.value.missing == ["lane 0 bootstrap", "lane 1 bootstrap"]
+
+    def test_each_poll_rpc_is_bounded_by_the_remaining_group_deadline(self):
+        stub = FakeStub(groups=[group(state=pb.COLLECTIVE_GROUP_STATE_READY)])
+        make_rendezvous(stub).await_ready(
+            group_id="g1", epoch=1, timeout_s=0.05, poll_interval_s=0.001
+        )
+        assert 0 < stub.get_timeouts[0] <= 0.05
+
+    @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+    def test_invalid_direct_deadlines_are_rejected(self, value):
+        with pytest.raises(ValueError, match="positive finite"):
+            make_rendezvous(FakeStub()).await_ready(
+                group_id="g1", epoch=1, timeout_s=value, poll_interval_s=0.01
+            )
+
+    def test_an_rpc_deadline_at_the_group_deadline_becomes_not_ready(self, monkeypatch):
+        class DeadlineExceeded(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.DEADLINE_EXCEEDED
+
+        clock = iter([0.0, 0.0, 1.0])
+        monkeypatch.setattr(rz.time, "monotonic", lambda: next(clock))
+        stub = FakeStub(get_error=DeadlineExceeded())
+        with pytest.raises(GroupNotReadyError):
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=0.5, poll_interval_s=0.01
+            )
+
+    def test_missing_slots_are_role_qualified_when_names_overlap(self):
+        g = pb.CollectiveGroup(
+            group_id="g1",
+            epoch=1,
+            state=pb.COLLECTIVE_GROUP_STATE_FORMING,
+            expected_trainer_slots=["rank0"],
+            expected_generator_slots=["rank0"],
+        )
+        lane = g.lanes.add()
+        lane.kind = pb.LANE_KIND_BROADCAST
+        participant = lane.participants.add()
+        participant.slot_id = "rank0"
+        participant.role = pb.COLLECTIVE_ROLE_TRAINER
+        assert rz._missing_slots(g) == ["generator slot rank0"]
+
+    def test_a_slot_admitted_at_an_older_epoch_is_reported_as_awaiting_rejoin(self):
+        # t0 restarted and rejoined, which bumped the group to epoch 2; g0 is
+        # still on its epoch 1 record and has to rejoin before readiness.
+        g = pb.CollectiveGroup(
+            group_id="g1",
+            epoch=2,
+            state=pb.COLLECTIVE_GROUP_STATE_FORMING,
+            expected_trainer_slots=["t0"],
+            expected_generator_slots=["g0"],
+        )
+        lane = g.lanes.add()
+        lane.kind = pb.LANE_KIND_BROADCAST
+        lane.bootstrap_epoch = 1
+        lane.participants.add(
+            slot_id="t0", role=pb.COLLECTIVE_ROLE_TRAINER, joined_epoch=2
+        )
+        lane.participants.add(
+            slot_id="g0", role=pb.COLLECTIVE_ROLE_GENERATOR, joined_epoch=1
+        )
+        assert rz._missing_slots(g) == [
+            "generator slot g0 awaiting rejoin (joined at epoch 1)"
+        ]
+
+
+class _FlakyStub(FakeStub):
+    """Fails the first `failures` polls with `error`, then behaves."""
+
+    def __init__(self, *, error, failures, groups):
+        super().__init__(groups=groups)
+        self._error = error
+        self._failures = failures
+
+    def GetCollectiveGroup(self, request, timeout=None):  # noqa: N802
+        self.get_calls += 1
+        self.get_timeouts.append(timeout)
+        if self.get_calls <= self._failures:
+            raise self._error
+        return self._groups[min(self.get_calls - 1, len(self._groups) - 1)]
+
+
+def _rpc_error(status):
+    class _Error(grpc.RpcError):
+        def code(self):
+            return status
+
+    return _Error()
+
+
+class TestAwaitReadyRetries:
+    """A poll failure is not a verdict on whether the group will form.
+
+    Each poll is bounded by rpc_timeout_s, which is much shorter than the
+    group timeout, so failing the whole rendezvous on one slow or restarted
+    control-plane call throws away most of the deadline the caller asked for.
+    """
+
+    def test_a_slow_poll_does_not_end_a_wait_that_has_time_left(self):
+        stub = _FlakyStub(
+            error=_rpc_error(grpc.StatusCode.DEADLINE_EXCEEDED),
+            failures=2,
+            groups=[group(state=pb.COLLECTIVE_GROUP_STATE_READY)],
+        )
+        result = make_rendezvous(stub).await_ready(
+            group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+        )
+        assert result.state == pb.COLLECTIVE_GROUP_STATE_READY
+        assert stub.get_calls == 3
+
+    def test_a_control_plane_restart_does_not_end_it_either(self):
+        stub = _FlakyStub(
+            error=_rpc_error(grpc.StatusCode.UNAVAILABLE),
+            failures=1,
+            groups=[group(state=pb.COLLECTIVE_GROUP_STATE_READY)],
+        )
+        result = make_rendezvous(stub).await_ready(
+            group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+        )
+        assert result.state == pb.COLLECTIVE_GROUP_STATE_READY
+
+    def test_a_non_retryable_code_still_fails_at_once(self):
+        # The retry must not swallow a real refusal and sit there until the
+        # group deadline reporting missing slots instead of the cause.
+        stub = FakeStub(get_error=_rpc_error(grpc.StatusCode.PERMISSION_DENIED))
+        with pytest.raises(grpc.RpcError):
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=5, poll_interval_s=0.001
+            )
+        assert stub.get_calls == 1
+
+    def test_a_retryable_code_past_the_deadline_names_the_missing_slots(self):
+        stub = FakeStub(get_error=_rpc_error(grpc.StatusCode.UNAVAILABLE))
+        with pytest.raises(GroupNotReadyError):
+            make_rendezvous(stub).await_ready(
+                group_id="g1", epoch=1, timeout_s=0.05, poll_interval_s=0.001
+            )
+
+
+class TestRegistrationRenewal:
+    def test_the_loop_outlives_a_failure_that_is_not_an_rpc_error(self):
+        # grpcio raises ValueError on a closed channel in several versions.
+        # Letting that escape ends the thread while _registration_thread stays
+        # set, so nothing restarts it and the lease expires with no error
+        # naming the cause.
+        client = make_rendezvous(FakeStub())
+        client._registration = object()
+        client._registration_ttl_s = 0.003
+        attempts = []
+
+        def register(_registration):
+            attempts.append(len(attempts))
+            if len(attempts) == 1:
+                raise ValueError("channel closed")
+            if len(attempts) >= 3:
+                client._registration_stop.set()
+
+        client._register_worker = register
+        client._renew_worker_registration()
+
+        assert len(attempts) >= 3, (
+            "the renewal loop stopped at the first non-RpcError failure"
+        )
+
+
+class _RejectingPublishStub(FakeStub):
+    """A stub whose PublishGroupBootstrap always fails the precondition."""
+
+    def PublishGroupBootstrap(self, request, timeout=None):  # noqa: N802
+        class FailedPrecondition(grpc.RpcError):
+            def code(self):
+                return grpc.StatusCode.FAILED_PRECONDITION
+
+        raise FailedPrecondition()
+
+
+class TestPublishBootstrap:
+    def test_a_correctly_sized_identifier_is_published_with_its_epoch(self):
+        stub = FakeStub()
+        make_rendezvous(stub).publish_bootstrap(
+            group_id="g1",
+            epoch=2,
+            lane_id=0,
+            worker_id="w0",
+            nccl_unique_id=b"\x01" * rz.NCCL_UNIQUE_ID_BYTES,
+        )
+        assert stub.published[0].epoch == 2
+        assert len(stub.published[0].nccl_unique_id) == rz.NCCL_UNIQUE_ID_BYTES
+
+    def test_a_stale_epoch_rejection_names_the_epoch_it_moved_to(self):
+        # "moved from epoch 2 to -1" tells the caller nothing, so the epoch is
+        # read back from the group MX rejected the publication against.
+        stub = _RejectingPublishStub(groups=[group(epoch=5)])
+        with pytest.raises(EpochChangedError) as caught:
+            make_rendezvous(stub).publish_bootstrap(
+                group_id="g1",
+                epoch=2,
+                lane_id=0,
+                worker_id="w0",
+                nccl_unique_id=b"\x01" * rz.NCCL_UNIQUE_ID_BYTES,
+            )
+        assert caught.value.actual == 5
+
+    def test_a_rejection_that_is_not_an_epoch_move_keeps_the_server_error(self):
+        # MX also rejects a publisher that is not the lane's live rank 0. That
+        # is not a stale epoch, and telling the caller to rebuild would hide the
+        # reason it was actually turned away.
+        stub = _RejectingPublishStub(groups=[group(epoch=2)])
+        with pytest.raises(grpc.RpcError):
+            make_rendezvous(stub).publish_bootstrap(
+                group_id="g1",
+                epoch=2,
+                lane_id=0,
+                worker_id="w0",
+                nccl_unique_id=b"\x01" * rz.NCCL_UNIQUE_ID_BYTES,
+            )
+
+    @pytest.mark.parametrize("size", [0, 1, 127, 129])
+    def test_a_wrong_sized_identifier_is_rejected_before_the_rpc(self, size):
+        # A truncated identifier surfaces at Communicator.init as every rank of
+        # the lane blocking, so it is caught here instead.
+        stub = FakeStub()
+        with pytest.raises(ValueError, match="must be 128 bytes"):
+            make_rendezvous(stub).publish_bootstrap(
+                group_id="g1",
+                epoch=1,
+                lane_id=0,
+                worker_id="w0",
+                nccl_unique_id=b"\x01" * size,
+            )
+        assert stub.published == []
+
+
+class TestCheckCurrent:
+    def test_a_ready_group_at_the_same_epoch_passes(self):
+        stub = FakeStub(groups=[group(epoch=2, state=pb.COLLECTIVE_GROUP_STATE_READY)])
+        make_rendezvous(stub).check_current(group_id="g1", epoch=2)
+        assert stub.get_calls == 1
+
+    def test_a_moved_epoch_is_reported_as_such(self):
+        stub = FakeStub(groups=[group(epoch=3, state=pb.COLLECTIVE_GROUP_STATE_READY)])
+        with pytest.raises(EpochChangedError) as caught:
+            make_rendezvous(stub).check_current(group_id="g1", epoch=2)
+        assert (caught.value.expected, caught.value.actual) == (2, 3)
+
+    def test_a_group_no_longer_ready_is_refused(self):
+        stub = FakeStub(groups=[group(epoch=2, state=pb.COLLECTIVE_GROUP_STATE_FORMING)])
+        with pytest.raises(RendezvousError, match="no longer READY"):
+            make_rendezvous(stub).check_current(group_id="g1", epoch=2)
+
+
+class TestReport:
+    def test_a_successful_report_needs_no_message(self):
+        stub = FakeStub()
+        make_rendezvous(stub).report(
+            operation_id="op", group_id="g1", epoch=1, worker_id="w0", succeeded=True
+        )
+        assert stub.reported[0].succeeded
+
+    def test_a_failed_report_must_explain_itself(self):
+        stub = FakeStub()
+        with pytest.raises(ValueError, match="must carry a message"):
+            make_rendezvous(stub).report(
+                operation_id="op",
+                group_id="g1",
+                epoch=1,
+                worker_id="w0",
+                succeeded=False,
+            )
+        assert stub.reported == []
+
+    def test_a_failure_carries_the_epoch_it_was_admitted_against(self):
+        stub = FakeStub()
+        make_rendezvous(stub).report(
+            operation_id="op",
+            group_id="g1",
+            epoch=7,
+            worker_id="w0",
+            succeeded=False,
+            message="nccl abort",
+        )
+        assert stub.reported[0].epoch == 7
+        assert stub.reported[0].message == "nccl abort"
+
+
+class TestMembershipLookup:
+    def test_asking_for_a_lane_this_worker_is_not_in_is_an_error(self):
+        m = Membership(group_id="g1", epoch=1, lanes=(), is_bootstrap_leader=False)
+        with pytest.raises(KeyError):
+            m.lane(0)
+        with pytest.raises(KeyError):
+            _ = m.broadcast_lane
+
+
+class TestMissingSlotDiagnostics:
+    """v8 printed eight of seventeen missing slots, which read as the other
+    nine generators having joined when no generator had joined at all."""
+
+    def _v8_group(self):
+        trainers = [f"trainer-{i}" for i in range(16)]
+        gens = [f"gen-{i}" for i in range(16)]
+        g = pb.CollectiveGroup(
+            group_id="a0fd",
+            epoch=1,
+            state=pb.COLLECTIVE_GROUP_STATE_FORMING,
+            expected_trainer_slots=trainers,
+            expected_generator_slots=gens,
+        )
+        broadcast = g.lanes.add()
+        broadcast.lane_id = 8
+        broadcast.kind = pb.LANE_KIND_BROADCAST
+        for slot in trainers[1:]:
+            p = broadcast.participants.add()
+            p.slot_id = slot
+            p.role = pb.COLLECTIVE_ROLE_TRAINER
+        return g
+
+    def test_the_timeout_names_every_missing_slot_with_a_count(self):
+        stub = FakeStub(groups=[self._v8_group()])
+        with pytest.raises(GroupNotReadyError) as caught:
+            make_rendezvous(stub).await_ready(
+                group_id="a0fd", epoch=1, timeout_s=0.05, poll_interval_s=0.001
+            )
+        message = str(caught.value)
+        assert "17 missing:" in message
+        assert "trainer slot trainer-0" in message
+        for i in range(16):
+            assert f"generator slot gen-{i}," in message + ","
+        assert "more not shown" not in message
+        assert len(caught.value.missing) == 17
+
+    def test_a_large_missing_set_is_summarized_never_silently_cut(self):
+        missing = [f"generator slot gen-{i}" for i in range(40)]
+        error = GroupNotReadyError("g", missing, 600)
+        assert "40 missing:" in str(error)
+        assert "gen-31" in str(error) and "gen-32" not in str(error)
+        assert "(+8 more not shown)" in str(error)
+
+    def test_a_stalled_wait_logs_who_is_missing_before_the_deadline(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(rz, "_AWAIT_PROGRESS_LOG_INTERVAL_S", 0.0)
+        stub = FakeStub(groups=[self._v8_group()])
+        with caplog.at_level("WARNING", logger="modelexpress_rl.collective.rendezvous"):
+            with pytest.raises(GroupNotReadyError):
+                make_rendezvous(stub).await_ready(
+                    group_id="a0fd", epoch=1, timeout_s=0.05, poll_interval_s=0.01
+                )
+        stalls = [
+            r.getMessage()
+            for r in caplog.records
+            if "not READY after" in r.getMessage()
+        ]
+        assert stalls
+        assert "COLLECTIVE_GROUP_STATE_FORMING" in stalls[0]
+        assert "17 missing: trainer slot trainer-0, generator slot gen-0" in stalls[0]

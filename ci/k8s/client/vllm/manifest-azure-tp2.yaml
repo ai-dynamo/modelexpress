@@ -92,7 +92,7 @@ spec:
             # Keep KV fixed and small so VRAM parity stays sensitive to
             # weight residency instead of vLLM auto-sizing cache around leaks.
             - --max-model-len
-            - "1024"
+            - "2048"
             - --kv-cache-memory-bytes
             - "1073741824"
             - --compilation-config

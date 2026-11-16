@@ -8,7 +8,7 @@ import torch
 from modelexpress_rl.refit.reshard.slice_plan import Shard
 from modelexpress_rl.refit.reshard.transfer_plan import SourceInfo, plan_transfer
 from modelexpress_rl.refit.reshard.types import CaptureResult, RecordedCopy, UnsupportedReshard
-from modelexpress_rl.inference.nixl_staged_transfer import _replay_ops
+from tests.helpers.refit_replay import replay_ops as _replay_ops
 
 
 def test_digest_mode_does_not_replace_partial_replay_reads_with_full_sources():

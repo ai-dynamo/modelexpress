@@ -155,12 +155,16 @@ def _trainer(
     seed_tensors=None,
     process_group=None,
     prepare_base=True,
+    storage_type=ObjectStorageType.S3,
+    storage=None,
 ):
     launch = tmp_path / "model.safetensors"
     seed_tensors = seed_tensors or {"weight": torch.tensor([1.0, 2.0])}
     _write_safetensors(launch, seed_tensors)
-    storage = _MemoryS3()
-    monkeypatch.setattr(trainer_runtime_module, "S3Client", lambda **_kwargs: storage)
+    storage = _MemoryS3() if storage is None else storage
+    factory = "AzureBlobClient" if storage_type is ObjectStorageType.AZURE else "S3Client"
+    scheme = "az" if storage_type is ObjectStorageType.AZURE else "s3"
+    monkeypatch.setattr(trainer_runtime_module, factory, lambda **_kwargs: storage)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda _group=None: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda _group=None: 1)
     monkeypatch.setattr(
@@ -190,8 +194,8 @@ def _trainer(
             registration_ttl_seconds=60,
             process_group=process_group,
             object_storage=ObjectStorageConfig(
-                storage_type=ObjectStorageType.S3,
-                uri_prefix="s3://weights/tests",
+                storage_type=storage_type,
+                uri_prefix=f"{scheme}://weights/tests",
                 initial_base_version_id="base-a",
                 seed_checkpoint_path=launch,
             ),
@@ -649,7 +653,8 @@ def test_s3_full_hf_checkpoint_uploads_batches_concurrently(
     service.target.payload_format = refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT
     service.target.ClearField("base_version_id")
     monkeypatch.setenv("MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES", "4")
-    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "2")
+    monkeypatch.setenv("MX_REFIT_UPLOAD_WORKERS", "2")
+    monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "1")
     tensors = {"a": torch.tensor([1.0]), "b": torch.tensor([2.0])}
     trainer, storage = _trainer(monkeypatch, tmp_path, server_url, tensors)
     upload = storage.put
@@ -809,13 +814,15 @@ def test_s3_remote_index_failure_prevents_non_root_state_transition(
         trainer.close()
 
 
-def test_s3_client_closes_when_publication_method_initialization_fails(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize("provider", [ObjectStorageType.S3, ObjectStorageType.AZURE])
+def test_storage_client_closes_when_publication_method_initialization_fails(
+    monkeypatch, tmp_path, provider
 ):
     storage = _MemoryS3()
+    scheme = "az" if provider is ObjectStorageType.AZURE else "s3"
     config = ObjectStorageConfig(
-        storage_type=ObjectStorageType.S3,
-        uri_prefix="s3://weights/tests",
+        storage_type=provider,
+        uri_prefix=f"{scheme}://weights/tests",
         initial_base_version_id="base-a",
         seed_checkpoint_path=tmp_path / "launch",
     )
@@ -824,7 +831,8 @@ def test_s3_client_closes_when_publication_method_initialization_fails(
         "make_tensor_reader",
         lambda _path: (lambda _name: None, None),
     )
-    monkeypatch.setattr(trainer_runtime_module, "S3Client", lambda **_kwargs: storage)
+    factory = "AzureBlobClient" if provider is ObjectStorageType.AZURE else "S3Client"
+    monkeypatch.setattr(trainer_runtime_module, factory, lambda **_kwargs: storage)
     monkeypatch.setattr(
         trainer_runtime_module,
         "CanonicalDeltaPublicationMethod",
@@ -1179,7 +1187,7 @@ def test_object_storage_config_rejects_unsupported_provider(tmp_path):
     launch = tmp_path / "model.safetensors"
     _write_safetensors(launch, {"weight": torch.tensor([1.0])})
 
-    with pytest.raises(ValueError, match="only S3 object storage"):
+    with pytest.raises(ValueError, match="only S3 and Azure object storage"):
         ModelExpressTrainerClient.initialize(
             ModelExpressTrainerConfig(
                 model_name="test/model",

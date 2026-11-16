@@ -39,17 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         TestMode::Concurrent // Default to concurrent testing
     };
 
-    // Get model name from args or use default
-    let model_name = if let Some(model_index) = args.iter().position(|arg| arg == "--test-model") {
-        if let Some(next_arg) = args.get(model_index.saturating_add(1)) {
-            next_arg.clone()
-        } else {
-            error!("Error: --test-model requires a model name");
-            return Err("Missing model name".into());
-        }
-    } else {
-        "Qwen/Qwen2.5-3B-Instruct".to_string() // Default model name - big enough for testing
-    };
+    let model_name = model_name_from_args(&args)?;
 
     info!("Test mode: {:?}", test_mode);
     info!("Testing with model: {}", model_name);
@@ -81,6 +71,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_fallback_test(&model_name).await?;
 
     Ok(())
+}
+
+fn model_name_from_args(args: &[String]) -> Result<String, &'static str> {
+    if let Some(model_index) = args.iter().position(|arg| arg == "--test-model") {
+        args.get(model_index.saturating_add(1))
+            .cloned()
+            .ok_or_else(|| {
+                error!("Error: --test-model requires a model name");
+                "Missing model name"
+            })
+    } else {
+        Ok("Qwen/Qwen3.5-0.8B".to_string())
+    }
 }
 
 /// Run the concurrent model download test with two clients
@@ -225,4 +228,23 @@ async fn run_fallback_test(model_name: &str) -> Result<(), Box<dyn std::error::E
 
     info!("FALLBACK TEST PASSED: Server, direct download, and smart fallback paths all work");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_name_from_args;
+
+    #[test]
+    fn model_selection_defaults_overrides_and_rejects_missing_value() {
+        let args = vec!["test_client".to_string()];
+        assert_eq!(
+            model_name_from_args(&args),
+            Ok("Qwen/Qwen3.5-0.8B".to_string())
+        );
+        let mut args = args;
+        args.push("--test-model".to_string());
+        assert_eq!(model_name_from_args(&args), Err("Missing model name"));
+        args.push("custom/model".to_string());
+        assert_eq!(model_name_from_args(&args), Ok("custom/model".to_string()));
+    }
 }

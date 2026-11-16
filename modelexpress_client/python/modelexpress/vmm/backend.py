@@ -84,6 +84,24 @@ class CudaVmmBackend:
         # None = not yet probed; True/False = FABRIC export usable on this host.
         self._fabric_supported = None
         self._ensure_context()
+        fabric_attr = getattr(
+            self._cu.CUdevice_attribute,
+            "CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED",
+            None,
+        )
+        if fabric_attr is not None:
+            supported = self._call(
+                "cuDeviceGetAttribute",
+                self._cu.cuDeviceGetAttribute(fabric_attr, self._device),
+            )
+            if not supported:
+                self._fabric_supported = False
+                logger.warning(
+                    "VMM arena: device %d does not support FABRIC handles; "
+                    "using non-exportable allocations -- "
+                    "MNNVL cuda_ipc peer-to-peer will NOT be available",
+                    self._device,
+                )
         self._granularity = self._compute_granularity()
         logger.debug(
             "CudaVmmBackend initialized device=%d granularity=%d",
