@@ -850,6 +850,109 @@ def test_each_stream_gets_its_own_receive_scratch(cpu_storage, monkeypatch):
     assert tuple(second.shape) == tuple(first.shape)
 
 
+class _FusedAProjectionModel:
+    """Reproduce the BF16 fused-loading branch in SGLang v0.5.6.post2.
+
+    deepseek_v2.py:3648-3652,3788-3851 keeps this cache local to load_weights;
+    neither half writes the fused parameter without its partner in that call.
+    """
+
+    def __init__(self, q_rows):
+        self.params = {
+            f"model.layers.{index}.self_attn.fused_qkv_a_proj_with_mqa.weight": nn.Parameter(
+                torch.zeros(rows + 2, 8, dtype=torch.bfloat16), requires_grad=False
+            )
+            for index, rows in enumerate(q_rows)
+        }
+        self.quant_config = None
+        self.loaded = []
+
+    def load_weights(self, weights):
+        weights = list(weights)
+        self.loaded.append(weights)
+        cached_a_proj = {}
+        for name, loaded_weight in weights:
+            cached_a_proj[name] = loaded_weight
+            q_name = name.replace("kv_a_proj_with_mqa", "q_a_proj")
+            kv_name = name if "kv_a_proj_with_mqa" in name else name.replace(
+                "q_a_proj", "kv_a_proj_with_mqa"
+            )
+            if q_name in cached_a_proj and kv_name in cached_a_proj:
+                fused = torch.cat([cached_a_proj[q_name], cached_a_proj[kv_name]], dim=0)
+                param_name = q_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
+                self.params[param_name].copy_(fused)
+                cached_a_proj.pop(q_name)
+                cached_a_proj.pop(kv_name)
+
+
+@pytest.mark.parametrize("q_rows", [(4, 4), (4, 6)], ids=["two-stacks", "plain-leftovers"])
+@pytest.mark.parametrize("budget", [0, 4096], ids=["disabled", "stacked"])
+def test_protocol_stacking_preserves_fused_loader_atomicity(
+    cpu_storage, monkeypatch, q_rows, budget
+):
+    from modelexpress_rl.collective.integrations import miles_protocol
+    from modelexpress_rl.collective.integrations.sglang import build_generator_loader
+
+    monkeypatch.setenv("MX_SERVER_ADDRESS", "mx:50051")
+    monkeypatch.delenv("MODEL_EXPRESS_URL", raising=False)
+    monkeypatch.setenv("MX_MILES_DST_LAYOUT", "replicate")
+    monkeypatch.setenv("MX_NCCL_REFIT_STACK_BYTES", str(budget))
+    protocol = miles_protocol.MilesCollectiveProtocolCore(SimpleNamespace())
+    protocol.connect(
+        [object()],
+        [1],
+        [0],
+        SimpleNamespace(
+            **{
+                name: SimpleNamespace(size=1, rank=0)
+                for name in ("pp", "tp", "ep", "etp", "cp", "intra_dp", "indep_dp")
+            }
+        ),
+        SimpleNamespace(gather_pp=False, gather_tp=True, gather_ep=True),
+        "target",
+    )
+    model = _FusedAProjectionModel(q_rows)
+    loader = None
+    addresses = None
+    for version in (1, 2):
+        tensors = {}
+        for index, rows in enumerate(q_rows):
+            prefix = f"model.layers.{index}.self_attn."
+            tensors[prefix + "q_a_proj.weight"] = torch.full(
+                (rows, 8), version * 10 + index + 1, dtype=torch.bfloat16
+            )
+            tensors[prefix + "kv_a_proj_with_mqa.weight"] = torch.full(
+                (2, 8), version * 20 + index + 1, dtype=torch.bfloat16
+            )
+        protocol.begin_sync(version, lambda *, materialize: iter([list(tensors.items())]))
+        if loader is None:
+            assert bool(protocol._stacks) is bool(budget)
+            loader = build_generator_loader(
+                plan=protocol._plan,
+                topology=protocol._topology,
+                model=model,
+                device="cpu",
+                generator_slot_offset=0,
+                tp_rank=0,
+                tp_size=1,
+            ).loader
+            addresses = {name: t.data_ptr() for name, t in loader._buffers.items()}
+        model.loaded.clear()
+        _receive(loader, tensors, 0)
+        for index in range(len(q_rows)):
+            prefix = f"model.layers.{index}.self_attn."
+            expected = torch.cat([
+                tensors[prefix + "q_a_proj.weight"],
+                tensors[prefix + "kv_a_proj_with_mqa.weight"],
+            ])
+            actual = model.params[prefix + "fused_qkv_a_proj_with_mqa.weight"]
+            assert torch.equal(actual, expected), (budget, version, index, actual.sum())
+        assert len(model.loaded) == 1
+        assert [name for name, _tensor in model.loaded[0]] == protocol._plan.parameter_names()
+        assert {name: t.data_ptr() for name, t in loader._buffers.items()} == addresses
+        protocol._disarm_round()
+
+
 @pytest.mark.parametrize("budget", [0, 1 << 20])
 def test_protocol_sharded_tp1_preserves_abi_with_replicated_entries(
     cpu_storage, monkeypatch, budget
