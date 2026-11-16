@@ -138,7 +138,7 @@ class TestSglangLoader:
         assert all(buffer.shape == (4, 4) for buffer in fake_buffers)
         assert loader.device == "cuda:0"
 
-    def test_install_hands_each_group_to_the_model_loader_in_plan_order(
+    def test_install_combines_completed_groups_in_original_plan_order(
         self, fake_buffers
     ):
         model = FakeModel()
@@ -146,13 +146,11 @@ class TestSglangLoader:
 
         loader.start_new_round("v1")
         loader.install(0)
+        assert model.loaded == []
         loader.install(1)
         loader.finish()
 
-        assert model.loaded == [
-            [(_NAMES[0], fake_buffers[0])],
-            [(_NAMES[1], fake_buffers[1])],
-        ]
+        assert model.loaded == [list(zip(_NAMES, fake_buffers, strict=True))]
 
     def test_default_grouping_installs_the_whole_plan_at_once(self, fake_buffers):
         model = FakeModel()
@@ -173,12 +171,37 @@ class TestSglangLoader:
         with pytest.raises(RuntimeError, match="already in flight"):
             loader.start_new_round("v2")
 
+    def test_install_requires_every_wire_group_once_in_order(self, fake_buffers):
+        model = FakeModel()
+        loader = _loader(model)
+        loader.start_new_round("v1")
+        with pytest.raises(RuntimeError, match="expected 0, got 1"):
+            loader.install(1)
+        with pytest.raises(RuntimeError, match="every layer group"):
+            loader.finish()
+        assert model.loaded == []
+        loader.install(0)
+        with pytest.raises(RuntimeError, match="expected 1, got 0"):
+            loader.install(0)
+        assert model.loaded == []
+        loader.install(1)
+        with pytest.raises(RuntimeError, match="expected 2, got 1"):
+            loader.install(1)
+        assert len(model.loaded) == 1
+        loader.finish()
+        loader.start_new_round("v2")
+        loader.install(0)
+        loader.install(1)
+        loader.finish()
+        assert len(model.loaded) == 2
+
     def test_a_failed_install_poisons_every_later_round(self, fake_buffers):
         loader = _loader(FakeModel(error=RuntimeError("bad weights")))
         loader.start_new_round("v1")
+        loader.install(0)
 
         with pytest.raises(RuntimeError, match="bad weights"):
-            loader.install(0)
+            loader.install(1)
 
         assert loader.poisoned
         loader.fail_round(possibly_mutated=False)
@@ -267,7 +290,7 @@ class TestStackedLoader:
         assert loader._buffers[_STACK_NAMES[1]].address == stacks[0].address + 4 * 4 * 2
         assert loader._buffers[_STACK_NAMES[3]].address == stacks[1].address + 4 * 4 * 2
 
-    def test_each_stack_is_one_load_weights_call_over_its_member_views(
+    def test_stacks_share_one_atomic_load_weights_call_over_their_member_views(
         self, fake_buffers
     ):
         model = FakeModel()
@@ -288,15 +311,11 @@ class TestStackedLoader:
         loader.finish()
 
         assert [[name for name, _ in call] for call in model.loaded] == [
-            list(_STACK_NAMES[:2]),
-            list(_STACK_NAMES[2:]),
+            list(_STACK_NAMES)
         ]
-        for call, members in zip(
-            model.loaded, (_STACK_NAMES[:2], _STACK_NAMES[2:]), strict=True
-        ):
-            assert [tensor.address for _, tensor in call] == [
-                loader._buffers[name].address for name in members
-            ]
+        assert [tensor.address for _, tensor in model.loaded[0]] == [
+            loader._buffers[name].address for name in _STACK_NAMES
+        ]
 
     def test_the_loader_digests_the_same_wire_plan_as_the_trainer(self, fake_buffers):
         from modelexpress_rl.collective.integrations._common import _derive_wire_plan

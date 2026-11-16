@@ -69,7 +69,12 @@ checks that every stack fits the largest `NCCL_RESHARD_PACK_BUFFSIZES` bucket
 (2 GiB when unset). Stacks are submitted ungrouped, one call per publish
 group. A sharded destination receives into one reusable scratch per lane
 stream and copies each member into SGLang's live storage; a replicated one
-reads each stack's members in place.
+reads each stack's members in place. Wire groups are transfer boundaries, not
+SGLang installation boundaries: after all groups complete, the loader passes
+all staged tensors in original plan order to one `load_weights` call. This
+preserves call-local fusion dependencies between differently shaped tensors,
+including plain leftovers. It reuses the existing persistent buffers without
+allocating another model-sized staging copy.
 
 Engines (SGLang with the SG-1 hook, unmerged as of this writing): install
 this package in the engine image and allowlist the factory on the engine

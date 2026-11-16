@@ -269,10 +269,11 @@ def _check_disjoint(stack: str, views: list[Any]) -> None:
 class SglangLoader:
     """``Loader`` over a live SGLang model.
 
-    Replicated entries land in persistent scratch buffers installed through
-    the model's own ``load_weights``; sharded entries go straight into this
-    rank's live-storage slice that ``_engine_view`` proves. A failed install
-    poisons the loader: later rounds are refused.
+    Replicated entries land in persistent buffers installed together through
+    the model's own ``load_weights`` after every wire group completes; sharded
+    entries go straight into this rank's live-storage slice that
+    ``_engine_view`` proves. A failed install poisons the loader: later rounds
+    are refused.
     """
 
     def __init__(
@@ -431,6 +432,7 @@ class SglangLoader:
                 expected_dtype="bfloat16",
             )
         self._round_version: str | None = None
+        self._next_install_group = 0
         self._poisoned = False
 
     def _scratch_for_current_stream(self) -> Any:
@@ -623,10 +625,11 @@ class SglangLoader:
                 f"a round for version {self._round_version!r} is already in flight"
             )
         self._validate_stable()
+        self._next_install_group = 0
         self._round_version = version
 
     def install(self, layer_group_id: int) -> None:
-        """Hand one layer group's received tensors to SGLang's own loader."""
+        """Complete a wire group; install staged weights together after the last."""
         self._require_healthy()
         if self._round_version is None:
             raise RuntimeError("start_new_round must run before install")
@@ -635,7 +638,18 @@ class SglangLoader:
                 f"layer_group_id {layer_group_id} is outside the "
                 f"{len(self._groups)} declared layer groups"
             )
-        names = self._staged_members(layer_group_id)
+        if layer_group_id != self._next_install_group:
+            raise RuntimeError(
+                "layer groups must install in plan order: "
+                f"expected {self._next_install_group}, got {layer_group_id}"
+            )
+        self._next_install_group += 1
+        if self._next_install_group != len(self._groups):
+            return
+        # wait_weights has completed every group's receive and post hooks.
+        # SGLang may fuse differently shaped tensors using a call-local cache,
+        # so transport groups must not split its load_weights invocation.
+        names = [name for name in self._plan.names() if name not in self._views]
         if not names:
             return
         try:
@@ -648,16 +662,21 @@ class SglangLoader:
         self._require_healthy()
         if self._round_version is None:
             raise RuntimeError("start_new_round must run before finish")
+        if self._next_install_group != len(self._groups):
+            raise RuntimeError("every layer group must complete before finish")
         self._round_version = None
+        self._next_install_group = 0
 
     def fail_round(self, *, possibly_mutated: bool) -> None:
         """Retire a failed round; a round that may have written the model poisons."""
         if possibly_mutated:
             self._poisoned = True
         self._round_version = None
+        self._next_install_group = 0
 
     def cleanup(self) -> None:
         self._round_version = None
+        self._next_install_group = 0
         self._buffers.clear()
         self._stack_buffers.clear()
         self._scratch.clear()

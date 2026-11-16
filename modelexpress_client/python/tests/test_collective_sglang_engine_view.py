@@ -682,11 +682,9 @@ def test_a_stacked_receive_installs_exactly_what_a_per_tensor_receive_does(
         for name, tensor in loaded.items():
             assert torch.equal(tensor, reference[name]), name
             assert torch.equal(tensor, tensors[name]), name
-        # The staged members of a stack go through one load_weights call.
-        norm_calls = [
-            [name for name, _ in call] for call in model.loaded if "norm" in call[0][0]
-        ]
-        assert [len(call) for call in norm_calls] == [3]
+        # All staged weights share one call, independently of wire stacking.
+        assert len(model.loaded) == 1
+        assert sum("norm" in name for name, _tensor in model.loaded[0]) == 3
         # TP1 keeps every entry whole, so every stack is staged; at TP>1 the
         # sharded stacks are received through the scratch instead.
         assert (loader._scratch_elements > 0) == (tp > 1)
@@ -951,6 +949,86 @@ def test_protocol_stacking_preserves_fused_loader_atomicity(
         assert [name for name, _tensor in model.loaded[0]] == protocol._plan.parameter_names()
         assert {name: t.data_ptr() for name, t in loader._buffers.items()} == addresses
         protocol._disarm_round()
+
+
+@pytest.mark.parametrize("depth", [1, 2, 4])
+def test_fused_install_waits_for_every_pipelined_receive(cpu_storage, monkeypatch, depth):
+    from modelexpress_rl.collective.backend import _check_storage
+    from modelexpress_rl.collective.client import RefitClientGenerator
+
+    monkeypatch.setenv("MX_NCCL_REFIT_PIPELINE_DEPTH", str(depth))
+    model = _FusedAProjectionModel((4, 4, 6))
+    tensors = {}
+    for index, rows in enumerate((4, 4, 6)):
+        prefix = f"model.layers.{index}.self_attn."
+        tensors[prefix + "q_a_proj.weight"] = torch.full(
+            (rows, 8), index + 1, dtype=torch.bfloat16
+        )
+        tensors[prefix + "kv_a_proj_with_mqa.weight"] = torch.full(
+            (2, 8), index + 11, dtype=torch.bfloat16
+        )
+    plan = _with_stacks(_sharded_plan(tensors, tp=1, kv_heads=4))
+    loader = _loader_for(plan, model, tp=1, rank=0)
+    wire, stacks = _derive_wire_plan(plan)
+    entries = {entry.name: entry for entry in wire.bulk}
+    full = dict(tensors)
+    full.update({stack.name: torch.stack([tensors[m] for m in stack.members]) for stack in stacks})
+    specs = loader.local_params()
+    waited = []
+    pending = {}
+    original_load = model.load_weights
+
+    def coherent_load(weights):
+        assert waited == list(range(len(loader.layer_groups)))
+        original_load(weights)
+
+    monkeypatch.setattr(model, "load_weights", coherent_load)
+
+    class Half:
+        def start_weight_update(self, version):
+            pass
+
+        def issue_weights(self, group_id):
+            regions = []
+            pending[group_id] = []
+            for name in loader.layer_groups[group_id]:
+                ctx = specs[name].enter()
+                _check_storage(regions, entries[name], None, ctx.buf)
+                pending[group_id].append((name, ctx))
+
+        def wait_weights(self, group_id):
+            # Deliberately leave issued transfers unwritten until their wait.
+            assert model.loaded == []
+            for name, ctx in pending.pop(group_id):
+                ctx.buf.copy_(full[name])
+                specs[name].leave(ctx)
+            waited.append(group_id)
+
+        def finish_weight_update(self, broadcast_lane_id):
+            assert not pending
+            assert len(model.loaded) == 1
+
+    client = RefitClientGenerator(
+        rendezvous=object(), model_name="m", trainer_slots=["t0"],
+        generator_slots=["g0"], source_partition_count=1, slot_id="g0",
+        worker_id="w0", index_in_role=0,
+    )
+    client.initialize(loader)
+    client._half = Half()
+    client._membership = SimpleNamespace(broadcast_lane=SimpleNamespace(lane_id=0))
+    monkeypatch.setattr(client, "_bind_operation", lambda *args: None)
+    monkeypatch.setattr(client, "_report_success", lambda: None)
+    client.start_weight_update("v1", "op1")
+    for group_id in range(len(loader.layer_groups)):
+        client.update_weights("v1", group_id)
+    client.finish_weight_update("v1")
+    for index in range(3):
+        prefix = f"model.layers.{index}.self_attn."
+        expected = torch.cat([
+            tensors[prefix + "q_a_proj.weight"],
+            tensors[prefix + "kv_a_proj_with_mqa.weight"],
+        ])
+        assert torch.equal(model.params[prefix + "fused_qkv_a_proj_with_mqa.weight"], expected)
 
 
 @pytest.mark.parametrize("budget", [0, 1 << 20])
