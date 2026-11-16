@@ -592,23 +592,116 @@ class MilesCollectiveProtocolCore:
     def _build_frozen_contract(
         self, facts: SglangModelFacts | None, layouts: dict[str, TensorLayout]
     ) -> None:
-        """Build or re-check the frozen topology/plan without committing state.
-
-        Everything the collectives need (``layouts`` for the manifest) comes
-        in as an argument; ``self._run_id`` runs through a local so a failed
-        build leaves no protocol state behind.
-        """
+        """Vote local contract checks before agreeing identity and manifests."""
         _rank, trainer_world = _rank_and_world()
+        local_exception: BaseException | None = None
+        local_error = ""
+        run_id = self._run_id
+        reuse = self._plan is not None
+        try:
+            if reuse and run_id is None:
+                raise RuntimeError("the frozen plan has no run identity")
+            run_id = run_id or uuid4().hex
+            local_manifest = sorted(
+                (name, layout.global_shape, layout.shard_dim)
+                for name, layout in layouts.items()
+            )
+            topology, plan = self._local_frozen_contract(
+                facts, local_manifest, trainer_world, run_id
+            )
+        except BaseException as error:
+            local_exception = error
+            local_error = repr(error)
+        # This vote runs on EVERY round, including reuse. Carry the branch
+        # state too, so no trainer skips a manifest collective its peers enter.
+        configuration = (
+            self._dp_size,
+            self._tp_size,
+            self._engine_gpu_counts,
+            self._engine_gpu_offsets,
+            self._dst_layout,
+            self._connection_generation,
+        )
+        preflights = _all_gather((local_error, reuse, run_id, configuration))
+        failures = [
+            f"rank {rank}: {error}"
+            for rank, (error, _reuse, _run_id, _configuration) in enumerate(preflights)
+            if error
+        ]
+        if failures:
+            if trainer_world == 1 and local_exception is not None:
+                raise local_exception
+            error = RuntimeError(
+                "MILES NCCL M2N contract preflight failed: " + "; ".join(failures[:4])
+            )
+            if local_exception is not None:
+                raise error from local_exception
+            raise error
+        if any(state[1] != reuse for state in preflights):
+            raise RuntimeError(
+                "MILES NCCL M2N contract preflight failed: trainer ranks disagree "
+                "whether the frozen plan is reusable"
+            )
+        if any(state[3] != configuration for state in preflights):
+            raise RuntimeError(
+                "MILES NCCL M2N contract preflight failed: trainer configurations differ"
+            )
+        if reuse:
+            if any(state[2] != run_id for state in preflights):
+                raise RuntimeError(
+                    "MILES NCCL M2N contract preflight failed: trainer run identities differ"
+                )
+            return
+        manifests = _all_gather((self._lane_rank, local_manifest))
+        lane_ranks = sorted(lane_rank for lane_rank, _manifest in manifests)
+        if lane_ranks != list(range(trainer_world)):
+            raise ValueError(
+                "trainer ranks must cover every (DP, TP) coordinate exactly once; "
+                f"got lane ranks {lane_ranks}"
+            )
+        reference = manifests[0][1]
+        diverged = [
+            rank
+            for rank, (_lane_rank, manifest) in enumerate(manifests)
+            if manifest != reference
+        ]
+        if diverged:
+            raise ValueError(
+                "every trainer rank must report the same HF names, global shapes, "
+                f"and shard dims; ranks {diverged[:5]} differ from rank 0"
+            )
+        # Preflight validated every local configuration probe using a proposed
+        # identity. Only its slot prefixes change when rank 0's proposal wins.
+        agreed_run_id = preflights[0][2]
+        topology = replace(
+            topology,
+            trainer_slots=tuple(
+                agreed_run_id + slot[len(run_id):] for slot in topology.trainer_slots
+            ),
+            generator_slots=tuple(
+                agreed_run_id + slot[len(run_id):] for slot in topology.generator_slots
+            ),
+        )
+        group = tuple(entry.name for entry in plan.bulk)
+        self._run_id = agreed_run_id
+        self._topology = topology
+        self._plan = plan
+        self._publish_groups = (group,)
+        self._group_of = dict.fromkeys(group, 0)
+
+    def _local_frozen_contract(
+        self,
+        facts: SglangModelFacts | None,
+        local_manifest: list[tuple[str, tuple[int, ...], int | None]],
+        trainer_world: int,
+        run_id: str,
+    ) -> tuple[CollectiveTopology, ReshardPlan]:
+        """Prepare all fallible local inputs without entering collectives."""
         if trainer_world != self._dp_size * self._tp_size:
             raise ValueError(
                 f"the trainer world ({trainer_world}) must be exactly DP x TP "
                 f"({self._dp_size} x {self._tp_size})"
             )
-        run_id = self._run_id
-        if run_id is None:
-            # Every rank proposes a fresh id and rank 0's wins, so every rank
-            # names the same slots without any configuration.
-            run_id = _all_gather(uuid4().hex)[0]
         slot_prefix = f"{run_id}:"
         generator_slots = tuple(
             f"{slot_prefix}generator-{slot}"
@@ -633,41 +726,6 @@ class MilesCollectiveProtocolCore:
             source_partition_count=1,
             m2n_abi_version=_DST_LAYOUT_ABI[self._dst_layout],
         )
-        if self._plan is not None:
-            # Later rounds reuse the round-one plan: the wire buffers and
-            # canonical shapes are pinned (begin_sync only copy_()s into them
-            # after revalidating names and shapes), and the publish groups are
-            # likewise derived only on round one -- re-deriving them per round
-            # against the settled session risks collapsing the group set the
-            # engines prepared for. The topology is still rebuilt and compared
-            # every round: a reconnect that heals into a reshaped engine GPU
-            # topology must fail closed. The skip is uniform because _plan is
-            # set on every rank or on none.
-            if topology != self._topology:
-                raise RuntimeError("MILES tensor names, shapes, or topology changed")
-            return
-        local_manifest = sorted(
-            (name, layout.global_shape, layout.shard_dim)
-            for name, layout in layouts.items()
-        )
-        manifests = _all_gather((self._lane_rank, local_manifest))
-        lane_ranks = sorted(lane_rank for lane_rank, _manifest in manifests)
-        if lane_ranks != list(range(trainer_world)):
-            raise ValueError(
-                "trainer ranks must cover every (DP, TP) coordinate exactly once; "
-                f"got lane ranks {lane_ranks}"
-            )
-        reference = manifests[0][1]
-        diverged = [
-            rank
-            for rank, (_lane_rank, manifest) in enumerate(manifests)
-            if manifest != reference
-        ]
-        if diverged:
-            raise ValueError(
-                "every trainer rank must report the same HF names, global shapes, "
-                f"and shard dims; ranks {diverged[:5]} differ from rank 0"
-            )
         src_mesh = (
             MeshSpec((self._tp_size,))
             if self._dp_size == 1
@@ -676,8 +734,17 @@ class MilesCollectiveProtocolCore:
         dst_mesh, engine_tp = self._destination_mesh(
             len(generator_slots), src_mesh.size
         )
+        if self._plan is not None:
+            # Reuse the pinned plan/buffers, but revalidate physical topology
+            # and local mesh configuration before the all-rank preflight vote.
+            if topology != self._topology or any(
+                entry.src_mesh != src_mesh or entry.dst_mesh != dst_mesh
+                for entry in self._plan.bulk
+            ):
+                raise RuntimeError("MILES tensor names, shapes, or topology changed")
+            return topology, self._plan
         entries = []
-        for name, global_shape, shard_dim in reference:
+        for name, global_shape, shard_dim in local_manifest:
             inner = (
                 Placement.replicate()
                 if shard_dim is None
@@ -713,13 +780,7 @@ class MilesCollectiveProtocolCore:
         # Canonical order is the wire contract: the receiver canonical-sorts
         # too, so both sides post the same per-lane tensor sequence.
         entries.sort(key=lambda entry: entry.canonical())
-        group = tuple(entry.name for entry in entries)
-        # Commit only here: every check above passed.
-        self._run_id = run_id
-        self._topology = topology
-        self._plan = ReshardPlan(bulk=entries, source_partition_count=1)
-        self._publish_groups = (group,)
-        self._group_of = dict.fromkeys(group, 0)
+        return topology, ReshardPlan(bulk=entries, source_partition_count=1)
 
     def _destination_mesh(
         self, generator_count: int, trainer_count: int
@@ -814,14 +875,31 @@ class MilesCollectiveProtocolCore:
             except BaseException as error:
                 self._close_preserving(error, phase="begin_round")
                 raise
+        publish_exception: BaseException | None = None
+        publish_error = ""
         try:
             for name in names:
                 self._round_seen.add(name)
                 self._pending[self._group_of[name]].discard(name)
             self._drain_ready_groups(version)
         except BaseException as error:
+            publish_exception = error
+            publish_error = repr(error)
+        # Vote before returning to the next iterator collective or the
+        # updater's post-stream barrier, even when no group was ready locally.
+        publish_failures = _gathered_failures(publish_error)
+        if publish_failures:
+            _rank, world = _rank_and_world()
+            if world == 1 and publish_exception is not None:
+                self._close_preserving(publish_exception, phase="publish_groups")
+                raise publish_exception
+            error = RuntimeError(
+                "MILES NCCL M2N publish failed: " + "; ".join(publish_failures[:4])
+            )
             self._close_preserving(error, phase="publish_groups")
-            raise
+            if publish_exception is not None:
+                raise error from publish_exception
+            raise error
 
     def _begin_round(self, version: str) -> None:
         session = self._session
