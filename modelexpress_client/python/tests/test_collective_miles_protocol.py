@@ -1781,6 +1781,80 @@ def _frozen_protocol(monkeypatch):
     return protocol
 
 
+def test_reconnect_bootstraps_a_fresh_group_before_replacement_engines_join(monkeypatch):
+    from modelexpress_rl.collective.integrations.manifest import manifest_from_wire
+
+    _install_fake_miles_async(monkeypatch, [])
+    published = set()
+    sessions = []
+
+    class Session:
+        def __init__(self, topology):
+            self.topology = topology
+            self.closed = False
+
+        def prepare(self):
+            # Redis retains READY membership and lane IDs until registrations
+            # expire. The trainer wins the race against replacement joins.
+            identity = (
+                self.topology.model_name,
+                self.topology.trainer_slots,
+                self.topology.generator_slots,
+            )
+            if identity in published:
+                raise RuntimeError("ALREADY_EXISTS: lane bootstrap already published")
+            published.add(identity)
+
+        def close(self):
+            self.closed = True
+
+    def create(**kwargs):
+        session = Session(kwargs["topology"])
+        sessions.append(session)
+        return session
+
+    channels = _prepare_harness(monkeypatch, create)
+    protocol = _frozen_protocol(monkeypatch)
+    # Exercise real prepare/destroy payloads rather than the harness fan-out.
+    monkeypatch.delattr(protocol, "_generator_futures")
+    monkeypatch.delattr(protocol, "_wait_generator_futures")
+    monkeypatch.setattr(protocol, "_drives_destroy_fan_out", lambda: True)
+    old_engine = _RecordingEngine([])
+    protocol.rollout_engines = (old_engine,)
+    frozen_topology = protocol._topology
+    frozen_plan = protocol._plan
+    wire_buffer = protocol._tensors["model.weight"]
+    protocol._prepare_sessions()
+    old_group = protocol._engine_group_name
+
+    replacement = _RecordingEngine([])
+    protocol.connect(
+        [replacement], [1], [0], _parallel_state(), _placement(), "target"
+    )
+    protocol.begin_sync(
+        2, lambda *, materialize: iter([[('model.weight', wire_buffer)]])
+    )
+    protocol._prepare_sessions()
+
+    assert len(published) == 2
+    assert sessions[0].closed and channels[0].closed
+    assert protocol._plan is frozen_plan
+    assert protocol._topology == frozen_topology
+    assert protocol._tensors["model.weight"] is wire_buffer
+    assert old_engine.payloads[-1] == (
+        "destroy_weights_update_group", {"group_name": old_group}
+    )
+    assert protocol._engine_group_name != old_group
+    _, payload = replacement.payloads[0]
+    _, receiver_topology = manifest_from_wire(payload["receiver_init_payload"])
+    assert receiver_topology == sessions[1].topology
+    protocol.close()
+    assert replacement.payloads[-1] == (
+        "destroy_weights_update_group", {"group_name": payload["group_name"]}
+    )
+    assert sessions[1].closed and channels[1].closed
+
+
 def test_prepare_sessions_rebuilds_after_an_epoch_move(monkeypatch):
     """The soak's round 2 found the group at a newer epoch; the seam treated
     EpochChangedError as fatal. Prepare must tear down and re-prepare at the
@@ -2104,6 +2178,46 @@ def test_a_round_failure_is_named_at_once_and_close_bounds_the_busy_destroy(
     # The destroy never settled, so the group name survives for a later retry.
     assert protocol._engine_group_name == "mx-m2n-group"
     assert protocol._closed
+
+
+@pytest.mark.parametrize("destroy_error", [TimeoutError("busy"), RuntimeError("offline")])
+def test_failing_close_retains_an_explicit_retry_for_the_original_group(
+    monkeypatch, destroy_error
+):
+    executions, waits = [], []
+    protocol, _tensors = _failure_close_protocol(monkeypatch, executions, waits)
+    group_name = protocol._engine_group_name
+    calls = []
+
+    async def destroy(endpoint, payload=None):
+        calls.append((endpoint, dict(payload)))
+        if len(calls) == 1:
+            raise destroy_error
+        return {"success": True}
+
+    monkeypatch.setattr(protocol.rollout_engines[0], "_make_request", destroy)
+    resources = []
+
+    class Resource:
+        def close(self):
+            resources.append(self)
+
+    rendezvous, channel = Resource(), Resource()
+    protocol._rendezvous, protocol._channel = rendezvous, channel
+    protocol.close(failing=True)
+
+    assert protocol._closed
+    assert protocol._engine_group_name == group_name
+    assert resources == [rendezvous, channel]
+    assert protocol._session is protocol._rendezvous is protocol._channel is None
+    protocol.close()
+
+    assert calls == [("destroy_weights_update_group", {"group_name": group_name})] * 2
+    assert protocol._engine_group_name is None
+    assert not protocol._close_pending
+    assert executions.count("session-close") == 1
+    protocol.close()
+    assert len(calls) == 2
 
 
 def test_a_normal_close_bounds_the_destroy_wait_by_the_transfer_timeout(

@@ -126,6 +126,66 @@ def _round(version="3", operation_id="op-3"):
 
 
 @pytest.mark.usefixtures("fake_buffers")
+@pytest.mark.parametrize("receiver_build", ["1.0", "2.0"])
+def test_session_admission_digests_observe_each_local_native_build(
+    monkeypatch, receiver_build
+):
+    from importlib import metadata
+    from pathlib import PurePosixPath
+
+    from modelexpress_rl.collective.integrations import miles, sglang
+    from modelexpress_rl.collective.integrations.miles import MilesPublisher
+
+    # Use the existing metadata-only probe, with no native imports. The
+    # receiver receives the trainer manifest unchanged, not its local build.
+    local_build = "1.0"
+    monkeypatch.setattr(metadata, "packages_distributions", lambda: {"nccl": ["m2n"]})
+    monkeypatch.setattr(
+        metadata,
+        "distribution",
+        lambda name: SimpleNamespace(
+            files=[PurePosixPath("nccl/m2n/__init__.py")],
+            metadata={"Name": "nccl-extensions"},
+            version=local_build,
+        ),
+    )
+    for module in (miles, sglang):
+        monkeypatch.setattr(module, "_collective_streams", lambda *a, **kw: [None])
+    plan, topology = _plan(), _topology()
+    publisher = MilesPublisher(
+        plan=plan,
+        source_partition=0,
+        tensors={name: FakeTensor((4, 4), address=0x1000 + index * 0x100)
+                 for index, name in enumerate(plan.parameter_names())},
+    )
+    trainer = miles.MilesTrainerSession.create(
+        rendezvous=FakeRendezvous(), topology=topology, publisher=publisher,
+        source_partition=0, slot_id=topology.trainer_slots[0],
+        worker_id="trainer", index_in_role=0,
+    )
+    trainer._client.initialize(publisher, source_partition=0)
+    trainer_digest = trainer._client._digest
+    local_build = receiver_build
+    monkeypatch.setattr(receiver_module.grpc, "insecure_channel", FakeChannel)
+    monkeypatch.setattr(receiver_module.auth, "with_auth", lambda channel: channel)
+    monkeypatch.setattr(receiver_module, "CollectiveRendezvous", lambda channel: FakeRendezvous())
+    # Capture the real client admission digest, stopping before NCCL bootstrap.
+    monkeypatch.setattr(
+        sglang.SglangGeneratorSession, "prepare",
+        lambda self: self._client.initialize(self._loader),
+    )
+    receiver = create_receiver(_context(init_payload=manifest_to_wire(plan, topology)))
+    receiver_digest = receiver._session._client._digest
+
+    assert (trainer_digest == receiver_digest) is (receiver_build == "1.0")
+    assert "nccl-extensions==1.0" in trainer._client._m2n_abi_version
+    assert f"nccl-extensions=={receiver_build}" in receiver._session._client._m2n_abi_version
+    assert topology.m2n_abi_version in trainer._client._m2n_abi_version
+    receiver.destroy()
+    trainer.close()
+
+
+@pytest.mark.usefixtures("fake_buffers")
 class TestFactory:
     def test_the_receiver_path_names_the_factory(self):
         module, _, name = RECEIVER_PATH.rpartition(".")
