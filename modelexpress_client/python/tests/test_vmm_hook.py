@@ -210,6 +210,40 @@ class TestUseArenaWithMemPool:
         # No assertion about arena state; just that the allocation works.
         assert t.numel() == 1024
 
+    def test_idle_segments_return_to_arena_on_exit(self):
+        """A buffer freed inside the scope must not stay mapped after it.
+
+        Regression test for #1033: a process-lifetime MemPool kept freed
+        loading buffers cached as idle arena memory, and empty_cache()
+        does not release a private pool that is still referenced.
+        """
+        import torch
+
+        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.backend import CudaVmmBackend
+        from modelexpress.vmm.hook import use_arena
+
+        backend = CudaVmmBackend(device=0)
+        gran = backend.allocation_granularity()
+        arena = VmmArena(total_bytes=gran * 64, backend=backend)
+        keep = None
+        try:
+            with use_arena(arena, device=0):
+                keep = torch.empty(gran * 4, dtype=torch.uint8, device="cuda:0")
+                scratch = torch.empty(gran * 8, dtype=torch.uint8, device="cuda:0")
+                del scratch
+                torch.cuda.synchronize()
+            mapped_after_exit = arena.mapped_bytes
+            torch.cuda.empty_cache()
+            assert keep.numel() == gran * 4
+            assert mapped_after_exit < gran * 8, (
+                f"freed scratch buffer still mapped: {mapped_after_exit} bytes"
+            )
+            assert arena.mapped_bytes == mapped_after_exit
+        finally:
+            del keep
+            arena.close()
+
     def test_nesting_raises(self):
         from modelexpress.vmm.arena import VmmArena
         from modelexpress.vmm.backend import CudaVmmBackend
@@ -227,6 +261,68 @@ class TestUseArenaWithMemPool:
         finally:
             a1.close()
             a2.close()
+
+
+class TestUseArenaPoolLifetime:
+    """use_arena gives each scope its own MemPool and drops it while the
+    arena is still active (#1033). Mocks PyTorch, so no CUDA needed."""
+
+    def test_pool_released_before_arena_deactivates(self, monkeypatch):
+        from contextlib import contextmanager
+
+        torch = pytest.importorskip("torch")
+        import torch.cuda.memory as torch_cuda_memory
+
+        from modelexpress.vmm import hook as vmm_hook
+
+        events = []
+
+        class FakePool:
+            def __init__(self, allocator=None):
+                events.append("pool_created")
+
+            def __del__(self):
+                events.append(
+                    "pool_released_while_active"
+                    if vmm_hook._active_arena is not None
+                    else "pool_released_after_deactivate"
+                )
+
+        @contextmanager
+        def fake_use_mem_pool(pool, device=None):
+            events.append("pool_entered")
+            yield
+
+        class FakeExt:
+            @staticmethod
+            def set_active_arena(capsule):
+                events.append("activate" if capsule is not None else "deactivate")
+
+        class FakeAlloc:
+            def allocator(self):
+                return object()
+
+        class FakeArena:
+            capsule = object()
+
+        monkeypatch.setattr(vmm_hook, "_callbacks_initialized", True)
+        monkeypatch.setattr(vmm_hook, "_pluggable_alloc", FakeAlloc())
+        monkeypatch.setattr(vmm_hook, "_vmm_alloc_ext", FakeExt)
+        monkeypatch.setattr(torch_cuda_memory, "MemPool", FakePool)
+        monkeypatch.setattr(torch.cuda, "use_mem_pool", fake_use_mem_pool)
+
+        for _ in range(2):
+            with vmm_hook.use_arena(FakeArena(), device=0):
+                pass
+
+        one_scope = [
+            "pool_created",
+            "activate",
+            "pool_entered",
+            "pool_released_while_active",
+            "deactivate",
+        ]
+        assert events == one_scope * 2
 
 
 # ---------------------------------------------------------------------------
