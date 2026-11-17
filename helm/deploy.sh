@@ -7,7 +7,7 @@
 
 set -e
 
-CHART_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+CHART_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # Colors for output
 RED='\033[0;31m'
