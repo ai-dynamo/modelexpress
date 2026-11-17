@@ -6,24 +6,86 @@
 //! Computes a 16-char hex `mx_source_id` from a `SourceIdentity` proto by
 //! normalizing all fields and taking the first 16 chars of SHA256.
 
+use modelexpress_common::digest::{DigestError, sha256_hex};
 use modelexpress_common::grpc::p2p::SourceIdentity;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 /// Compute the `mx_source_id` for a `SourceIdentity`.
 ///
 /// Normalizes the identity (lowercased strings, sorted map keys) then hashes
 /// with SHA256. Returns the first 16 hex characters of the digest.
-pub fn compute_mx_source_id(identity: &SourceIdentity) -> String {
+pub fn compute_mx_source_id(identity: &SourceIdentity) -> Result<String, DigestError> {
     let canonical = canonical_json(identity);
-    let digest = Sha256::digest(canonical.as_bytes());
-    format!("{:x}", digest)[..16].to_string()
+    Ok(sha256_hex(canonical.as_bytes())?[..16].to_string())
 }
 
 /// Validate that a `SourceIdentity` has required fields set.
 pub fn validate_identity(identity: &SourceIdentity) -> Result<(), String> {
     if identity.model_name.is_empty() {
         return Err("identity.model_name is required".to_string());
+    }
+    Ok(())
+}
+
+/// Maximum accepted length of a `worker_id`, in bytes.
+///
+/// A `worker_id` reaches Kubernetes on two paths with different limits: it is
+/// interpolated into the `mx-source-{source_id}-{worker_id}` object name, which
+/// is a DNS-1123 subdomain capped at 253, and it is written verbatim as the
+/// `modelexpress.nvidia.com/mx-worker-id` label value, which is capped at 63.
+/// The label value is the binding constraint.
+const WORKER_ID_MAX_LEN: usize = 63;
+
+/// Validate a client-supplied `worker_id` before it reaches a backend.
+///
+/// The value is interpolated into a Kubernetes object name and written as a
+/// label value, so it is constrained to the intersection of what both accept:
+/// lowercase alphanumerics, `-` and `.`, with alphanumeric boundaries on every
+/// dot-separated segment. Object names are DNS-1123 and reject uppercase,
+/// which is why the lowercase rule is not merely stylistic. The documented
+/// producer is a UUID, which satisfies it.
+///
+/// This rejects rather than sanitizes, unlike the model-name path. Rewriting
+/// the value would change which object name a previously-published worker maps
+/// to, and the CR name is reconstructed from `worker_id` on later operations,
+/// so a lossy transform here would strand records rather than protect them.
+///
+/// The length check is on bytes rather than characters on purpose: Kubernetes
+/// counts bytes, and non-ASCII input is rejected by the charset check anyway.
+pub fn validate_worker_id(worker_id: &str) -> Result<(), String> {
+    if worker_id.is_empty() {
+        return Err("worker_id is required".to_string());
+    }
+    if worker_id.len() > WORKER_ID_MAX_LEN {
+        return Err(format!(
+            "worker_id must be at most {} bytes, got {}",
+            WORKER_ID_MAX_LEN,
+            worker_id.len()
+        ));
+    }
+    if let Some(bad) = worker_id
+        .chars()
+        .find(|c| !(c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-' || *c == '.'))
+    {
+        return Err(format!(
+            "worker_id may only contain lowercase alphanumerics, '-' and '.', found {bad:?}"
+        ));
+    }
+    // Checked per dot-separated segment, not just on the whole value: the object
+    // name is a DNS-1123 subdomain, whose labels must each be non-empty and
+    // alphanumeric at both ends, so "a..b" and "a.-b" are as unusable as "-ab".
+    // An undotted value is one segment, which is the label-value rule.
+    let boundary_ok =
+        |b: Option<&u8>| matches!(b, Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit());
+    if worker_id.split('.').any(|segment| {
+        let bytes = segment.as_bytes();
+        !boundary_ok(bytes.first()) || !boundary_ok(bytes.last())
+    }) {
+        return Err(
+            "each dot-separated worker_id segment must start and end with a lowercase \
+             alphanumeric character"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -122,15 +184,15 @@ mod tests {
 
     #[test]
     fn test_id_is_16_chars() {
-        let id = compute_mx_source_id(&base_identity());
+        let id = compute_mx_source_id(&base_identity()).expect("source id");
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn test_deterministic() {
-        let id1 = compute_mx_source_id(&base_identity());
-        let id2 = compute_mx_source_id(&base_identity());
+        let id1 = compute_mx_source_id(&base_identity()).expect("source id");
+        let id2 = compute_mx_source_id(&base_identity()).expect("source id");
         assert_eq!(id1, id2);
     }
 
@@ -140,8 +202,8 @@ mod tests {
         upper.model_name = "DEEPSEEK-AI/DEEPSEEK-V3".to_string();
         upper.dtype = "BFLOAT16".to_string();
         assert_eq!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&upper)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&upper).expect("source id")
         );
     }
 
@@ -150,8 +212,8 @@ mod tests {
         let mut tp4 = base_identity();
         tp4.tensor_parallel_size = 4;
         assert_ne!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&tp4)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&tp4).expect("source id")
         );
     }
 
@@ -160,8 +222,8 @@ mod tests {
         let mut fp8 = base_identity();
         fp8.dtype = "float8_e4m3fn".to_string();
         assert_ne!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&fp8)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&fp8).expect("source id")
         );
     }
 
@@ -170,14 +232,17 @@ mod tests {
         let mut lora = base_identity();
         lora.mx_source_type = 1; // LoRA
         assert_ne!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&lora)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&lora).expect("source id")
         );
     }
 
     #[test]
     fn test_empty_artifact_fields_preserve_existing_id() {
-        assert_eq!(compute_mx_source_id(&base_identity()), "e0d1bc7459cb4cde");
+        assert_eq!(
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            "e0d1bc7459cb4cde"
+        );
     }
 
     #[test]
@@ -196,8 +261,8 @@ mod tests {
         different_torch.torch_version = "2.9.0+cu128".to_string();
 
         assert_ne!(
-            compute_mx_source_id(&artifact),
-            compute_mx_source_id(&different_torch)
+            compute_mx_source_id(&artifact).expect("source id"),
+            compute_mx_source_id(&different_torch).expect("source id")
         );
     }
 
@@ -215,7 +280,10 @@ mod tests {
         lower.backend_framework_version = "vllm-0.10.0".to_string();
         lower.gpu_arch = "sm90".to_string();
 
-        assert_eq!(compute_mx_source_id(&upper), compute_mx_source_id(&lower));
+        assert_eq!(
+            compute_mx_source_id(&upper).expect("source id"),
+            compute_mx_source_id(&lower).expect("source id")
+        );
     }
 
     #[test]
@@ -232,7 +300,10 @@ mod tests {
         b.extra_parameters
             .insert("z_key".to_string(), "val".to_string());
 
-        assert_eq!(compute_mx_source_id(&a), compute_mx_source_id(&b));
+        assert_eq!(
+            compute_mx_source_id(&a).expect("source id"),
+            compute_mx_source_id(&b).expect("source id")
+        );
     }
 
     #[test]
@@ -240,8 +311,8 @@ mod tests {
         let mut pinned = base_identity();
         pinned.revision = "abc123def4567890".to_string();
         assert_ne!(
-            compute_mx_source_id(&base_identity()),
-            compute_mx_source_id(&pinned)
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&pinned).expect("source id")
         );
     }
 
@@ -251,7 +322,10 @@ mod tests {
         upper.revision = "ABC123DEF4567890".to_string();
         let mut lower = base_identity();
         lower.revision = "abc123def4567890".to_string();
-        assert_eq!(compute_mx_source_id(&upper), compute_mx_source_id(&lower));
+        assert_eq!(
+            compute_mx_source_id(&upper).expect("source id"),
+            compute_mx_source_id(&lower).expect("source id")
+        );
     }
 
     // Cross-checked against modelexpress_client/python/tests/test_source_id.py.
@@ -260,14 +334,20 @@ mod tests {
     // the mismatch is caught in CI.
     #[test]
     fn test_python_cross_check_base_identity() {
-        assert_eq!(compute_mx_source_id(&base_identity()), "e0d1bc7459cb4cde");
+        assert_eq!(
+            compute_mx_source_id(&base_identity()).expect("source id"),
+            "e0d1bc7459cb4cde"
+        );
     }
 
     #[test]
     fn test_python_cross_check_with_revision() {
         let mut pinned = base_identity();
         pinned.revision = "abc123def4567890".to_string();
-        assert_eq!(compute_mx_source_id(&pinned), "96db7e109daf9e53");
+        assert_eq!(
+            compute_mx_source_id(&pinned).expect("source id"),
+            "96db7e109daf9e53"
+        );
     }
 
     #[test]
@@ -283,7 +363,10 @@ mod tests {
             .insert("Foo".to_string(), "a".to_string());
         id.extra_parameters
             .insert("foo".to_string(), "b".to_string());
-        assert_eq!(compute_mx_source_id(&id), "f4eeab03e859b088");
+        assert_eq!(
+            compute_mx_source_id(&id).expect("source id"),
+            "f4eeab03e859b088"
+        );
     }
 
     #[test]
@@ -296,5 +379,86 @@ mod tests {
     #[test]
     fn test_validate_passes() {
         assert!(validate_identity(&base_identity()).is_ok());
+    }
+
+    #[test]
+    fn worker_id_accepts_a_uuid() {
+        // The shape the proto documents as the producer.
+        assert!(validate_worker_id("3f2504e0-4f89-41d3-9a0c-0305e82c3301").is_ok());
+    }
+
+    #[test]
+    fn worker_id_accepts_dotted_and_numeric_forms() {
+        assert!(validate_worker_id("worker-0").is_ok());
+        assert!(validate_worker_id("rank0.replica1").is_ok());
+        assert!(validate_worker_id("0").is_ok());
+    }
+
+    #[test]
+    fn worker_id_rejects_empty() {
+        assert!(validate_worker_id("").is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_over_label_value_budget() {
+        // 63 bytes is the Kubernetes label-value cap and is accepted; 64 is not.
+        let at_cap = "a".repeat(WORKER_ID_MAX_LEN);
+        assert!(validate_worker_id(&at_cap).is_ok());
+        let over_cap = "a".repeat(WORKER_ID_MAX_LEN + 1);
+        assert!(validate_worker_id(&over_cap).is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_k8s_name_injection() {
+        // Shapes that would corrupt the object name or label value if a
+        // worker_id were interpolated without validation: '/' would escape the
+        // name component entirely, and the rest are invalid in either.
+        for bad in [
+            "a/../b", "a/b", "a b", "a\nb", "a:b", "a=b", "a,b", "a%2Fb", "a\"b", "a$b",
+        ] {
+            assert!(
+                validate_worker_id(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_id_rejects_uppercase() {
+        // Valid as a label value, invalid as a DNS-1123 object name, so the CR
+        // create would fail at the API server rather than here.
+        assert!(validate_worker_id("Worker-0").is_err());
+        assert!(validate_worker_id("ABC").is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_non_alphanumeric_boundaries() {
+        assert!(validate_worker_id("-abc").is_err());
+        assert!(validate_worker_id("abc-").is_err());
+        assert!(validate_worker_id(".abc").is_err());
+        assert!(validate_worker_id("abc.").is_err());
+        assert!(validate_worker_id("-").is_err());
+    }
+
+    #[test]
+    fn worker_id_rejects_malformed_dot_segments() {
+        // The object name is a DNS-1123 subdomain: every dot-separated label
+        // must be non-empty and start and end alphanumeric, not just the whole
+        // value. These pass a whole-value boundary check and then fail at the
+        // API server as a backend error instead of an invalid argument.
+        for bad in ["a..b", "a.-b", "a-.b", "a.b-.c"] {
+            assert!(
+                validate_worker_id(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        assert!(validate_worker_id("a.b").is_ok());
+        assert!(validate_worker_id("a-b.c-d").is_ok());
+    }
+
+    #[test]
+    fn worker_id_rejects_non_ascii() {
+        assert!(validate_worker_id("wörker").is_err());
+        assert!(validate_worker_id("worker\u{200b}0").is_err());
     }
 }

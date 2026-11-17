@@ -198,13 +198,16 @@ class MxClient(MxClientBase):
         self,
         identity: "p2p_pb2.SourceIdentity | None" = None,
         status_filter: "p2p_pb2.SourceStatus | None" = None,
+        strict: bool = False,
+        timeout: float = 30,
     ) -> "p2p_pb2.ListSourcesResponse":
         """List available source workers, optionally filtered by identity and status."""
         request = p2p_pb2.ListSourcesRequest(
             identity=identity,
             status_filter=status_filter,
+            strict=strict,
         )
-        return self.stub.ListSources(request, timeout=30)
+        return self.stub.ListSources(request, timeout=timeout)
 
     def get_metadata(
         self,
@@ -240,4 +243,24 @@ class MxClient(MxClientBase):
         response = self.stub.UpdateStatus(request, timeout=30)
         if not response.success:
             logger.error("UpdateStatus failed: %s", response.message)
+        return response.success
+
+    def donor_lease(
+        self,
+        identity: "p2p_pb2.SourceIdentity",
+        owner_token: str,
+        action: int,
+        ttl_seconds: int,
+        timeout: float = 10,
+    ) -> bool:
+        """Atomically acquire, renew or release a donor lease."""
+        response = self.stub.DonorLease(
+            p2p_pb2.DonorLeaseRequest(
+                identity=identity,
+                owner_token=owner_token,
+                action=action,
+                ttl_seconds=ttl_seconds,
+            ),
+            timeout=timeout,
+        )
         return response.success

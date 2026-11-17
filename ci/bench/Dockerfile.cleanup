@@ -5,10 +5,22 @@ COPY modelexpress_client/python/uv.lock /tmp/client-uv.lock
 RUN python3 - <<'PYTHON'
 import subprocess
 import sys
+import time
 import tomllib
 
 with open("/tmp/client-uv.lock", "rb") as source:
     packages = tomllib.load(source)["package"]
 version = next(package["version"] for package in packages if package["name"] == "boto3")
-subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", f"boto3=={version}"])
+command = [sys.executable, "-m", "pip", "install", "--no-cache-dir",
+           "--timeout", "60", "--retries", "3", f"boto3=={version}"]
+# This base image's pip does not retry interrupted response-body downloads.
+for attempt in range(3):
+    try:
+        subprocess.check_call(command, timeout=300)
+        break
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        if attempt == 2:
+            raise
+        print("Cleanup dependency install failed; retrying in 5s", flush=True)
+        time.sleep(5)
 PYTHON

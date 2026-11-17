@@ -15,13 +15,14 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Any, cast
 
 import torch
 from modelexpress import envs
+from modelexpress.accelerators import AcceleratorBackend, accelerator_backend_for
 from modelexpress_rl import envs as rl_envs
 from modelexpress.nixl_transfer import (
     NIXL_DRAM_MEM_TYPE,
@@ -29,7 +30,7 @@ from modelexpress.nixl_transfer import (
     NixlTransferManager,
 )
 from modelexpress_rl.refit.reshard import throughput
-from modelexpress_rl.refit.reshard.cuda_pool import classic_cuda_alloc
+from modelexpress_rl.refit.reshard.alloc_scope import registered_buffer_alloc_scope
 from modelexpress_rl.refit.reshard.rendezvous import (
     build_sources,
     merge_shard_tables,
@@ -234,8 +235,14 @@ class _NixlStagedTransfer:
         timeout_seconds: float | None = None,
         streaming: StreamingSettings | None = None,
     ) -> None:
-        if streaming is not None and device.type != "cuda":
-            raise ValueError("bounded NIXL staging requires a CUDA device")
+        if streaming is not None:
+            if device.type == "cpu":
+                raise ValueError("bounded NIXL staging requires an accelerator device")
+            if streaming.staging_device not in (None, "cpu", device.type):
+                raise ValueError(
+                    f"staging_device {streaming.staging_device!r} does not match "
+                    f"the engine device {device}"
+                )
         if not callable(capture_layout):
             raise TypeError("capture_layout must be callable")
         if not callable(generator_fingerprint):
@@ -252,6 +259,7 @@ class _NixlStagedTransfer:
             agent_name=agent_name,
             device_id=device_id,
             listen_port=listen_port,
+            accelerator_backend=self._backend,
         )
         try:
             self._manager.initialize()
@@ -263,7 +271,7 @@ class _NixlStagedTransfer:
         self._active: _PreparedNixlTransfer | _PreparedBoundedTransfer | None = None
         self._loaded_agent_metadata: dict[str, bytes] = {}
         self._closed = False
-        # Bounded staging: one or two byte arenas on CUDA or pinned host memory.
+        # Bounded staging: one or two byte arenas on the accelerator or pinned host memory.
         # Host arenas are registered as NIXL DRAM and tracked here so they can be
         # deregistered before the agent shuts down.
         self._staging_arenas: list[torch.Tensor] = []
@@ -284,6 +292,24 @@ class _NixlStagedTransfer:
     def bounded_staging(self) -> bool:
         return self._streaming is not None
 
+    @property
+    def _backend(self) -> AcceleratorBackend | None:
+        """Return the backend owning the engine device; host memory has none."""
+        if self._device.type == "cpu":
+            return None
+        return accelerator_backend_for(self._device)
+
+    def _synchronize(self) -> None:
+        backend = self._backend
+        if backend is not None:
+            backend.synchronize(self._device.index)
+
+    def _registered_alloc_scope(self) -> AbstractContextManager[None]:
+        backend = self._backend
+        if backend is None:
+            return nullcontext()
+        return registered_buffer_alloc_scope(backend)
+
     def _invalidate_descriptors(self) -> None:
         self._descriptor_caches = None
         self._binding = None
@@ -303,16 +329,15 @@ class _NixlStagedTransfer:
         if self._staging_device.type == "cpu":
             # Pinned so the NIC can register it and the H2D commit is a DMA.
             return torch.empty(
-                nbytes, dtype=torch.uint8, pin_memory=torch.cuda.is_available()
+                nbytes, dtype=torch.uint8, pin_memory=torch.accelerator.is_available()
             )
-        with classic_cuda_alloc():
+        with self._registered_alloc_scope():
             return torch.empty(nbytes, dtype=torch.uint8, device=self._device)
 
     def reset_workspace(self) -> None:
         """Discard released or failed preparation after disconnecting its agent."""
         self._invalidate_cached_transfer()
-        if self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
+        self._synchronize()
         self._release_staging_registrations()
         self._manager.shutdown()
         self._active = None
@@ -630,7 +655,9 @@ class _NixlStagedTransfer:
         staging_device = streaming.staging_device
         staging_buffers = streaming.staging_buffers
         if not self._staging_arenas:
-            self._staging_device = torch.device(staging_device)
+            self._staging_device = (
+                torch.device("cpu") if staging_device == "cpu" else self._device
+            )
             for index in range(staging_buffers):
                 arena = self._allocate_arena(arena_bytes)
                 # Retain storage before registration so failed setup can be cleaned up.
@@ -662,8 +689,8 @@ class _NixlStagedTransfer:
         # Captured loaders may leave padding untouched. Reused arenas must
         # reproduce the zero-filled load layout before the NIC writes it.
         arenas[index % len(arenas)][:batch.nbytes].zero_()
-        if arenas[index % len(arenas)].device.type == "cuda":
-            torch.cuda.synchronize(self._device)
+        if arenas[index % len(arenas)].device.type != "cpu":
+            self._synchronize()
         chunk = _PreparedNixlTransfer(
             batch.transfer_plan,
             prepared.sources,
@@ -783,7 +810,7 @@ class _NixlStagedTransfer:
                     f"{label} layout changed; restart the generator engine"
                 )
             return
-        with classic_cuda_alloc():
+        with self._registered_alloc_scope():
             current.update(
                 {
                     name: torch.empty(shape, dtype=dtype, device=self._device)
@@ -814,8 +841,7 @@ class _NixlStagedTransfer:
         try:
             for tensor in self._full_buffers.values():
                 tensor.zero_()
-            if self._device.type == "cuda":
-                torch.cuda.synchronize(self._device)
+            self._synchronize()
             posted = prepared.transport.post_reads(list(prepared.descriptors))
             return self._complete_stage(prepared, posted, started)
         except BaseException:
