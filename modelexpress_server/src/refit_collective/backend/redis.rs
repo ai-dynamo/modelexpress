@@ -15,6 +15,7 @@ use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use modelexpress_common::digest::sha256;
 use modelexpress_common::envs;
 use modelexpress_common::grpc::refit_collective::{
     CollectiveGroup, CollectiveGroupMembership, CollectiveGroupSpec, CollectiveGroupState,
@@ -25,7 +26,6 @@ use modelexpress_common::grpc::refit_collective::{
 };
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{CollectiveBackend, CollectiveBackendError, CollectiveResult};
@@ -111,7 +111,7 @@ fn worker_key(worker_id: &str) -> String {
 /// that declares a different membership resolves a *different* group, which
 /// then never reaches its expected count -- a bounded timeout naming the
 /// missing slots, rather than one group with inconsistent geometry.
-fn group_id_for(spec: &CollectiveGroupSpec) -> String {
+fn group_id_for(spec: &CollectiveGroupSpec) -> CollectiveResult<String> {
     let mut trainers: Vec<&String> = spec.expected_trainer_slots.iter().collect();
     let mut generators: Vec<&String> = spec.expected_generator_slots.iter().collect();
     trainers.sort();
@@ -124,35 +124,32 @@ fn group_id_for(spec: &CollectiveGroupSpec) -> String {
     let mut lanes: Vec<&_> = spec.lanes.iter().collect();
     lanes.sort_by_key(|lane| (lane.lane_id, lane.kind));
 
-    let mut hasher = Sha256::new();
-    hasher.update(spec.model_name.as_bytes());
-    hasher.update([0]);
+    let mut canonical = Vec::new();
+    canonical.extend_from_slice(spec.model_name.as_bytes());
+    canonical.push(0);
     for lane in lanes {
-        hasher.update(lane.lane_id.to_le_bytes());
-        hasher.update(lane.kind.to_le_bytes());
+        canonical.extend_from_slice(&lane.lane_id.to_le_bytes());
+        canonical.extend_from_slice(&lane.kind.to_le_bytes());
         for slot in lane.trainer_slots.iter().chain(lane.generator_slots.iter()) {
-            hasher.update(slot.as_bytes());
-            hasher.update([0]);
+            canonical.extend_from_slice(slot.as_bytes());
+            canonical.push(0);
         }
-        hasher.update([2]);
+        canonical.push(2);
     }
-    hasher.update([0]);
+    canonical.push(0);
     for slot in &trainers {
-        hasher.update(slot.as_bytes());
-        hasher.update([0]);
+        canonical.extend_from_slice(slot.as_bytes());
+        canonical.push(0);
     }
-    hasher.update([1]);
+    canonical.push(1);
     for slot in &generators {
-        hasher.update(slot.as_bytes());
-        hasher.update([0]);
+        canonical.extend_from_slice(slot.as_bytes());
+        canonical.push(0);
     }
 
-    let digest = hasher.finalize();
-    let mut id = String::with_capacity(32);
-    for byte in &digest[..16] {
-        let _ = write!(id, "{byte:02x}");
-    }
-    id
+    let digest =
+        sha256(&canonical).map_err(|error| CollectiveBackendError::Internal(error.to_string()))?;
+    Ok(hex_encode(&digest[..16]))
 }
 
 fn now_unix_ms() -> CollectiveResult<u64> {
@@ -625,7 +622,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
             .assign(&request.slot_id)
             .map_err(|error| CollectiveBackendError::InvalidArgument(error.to_string()))?;
 
-        let group_id = group_id_for(spec);
+        let group_id = group_id_for(spec)?;
         let mut keys = vec![
             group_key(&group_id),
             participants_key(&group_id),
@@ -849,7 +846,7 @@ impl CollectiveBackend for RedisCollectiveBackend {
                 "expected_epoch is required: name the READY group epoch to transfer at".to_string(),
             ));
         }
-        let group_id = group_id_for(spec);
+        let group_id = group_id_for(spec)?;
         let operation_id = Uuid::new_v4().simple().to_string();
 
         match self.refresh_group_state(&group_id).await {
@@ -1142,7 +1139,10 @@ mod tests {
         let mut b = spec("m", &["t0", "t1"], &["g0", "g1"], 1);
         a.expected_trainer_slots.reverse();
         b.expected_generator_slots.reverse();
-        assert_eq!(group_id_for(&a), group_id_for(&b));
+        assert_eq!(
+            group_id_for(&a).expect("group id"),
+            group_id_for(&b).expect("group id")
+        );
     }
 
     #[test]
@@ -1155,7 +1155,10 @@ mod tests {
         for lane in &mut b.lanes {
             lane.trainer_slots.reverse();
         }
-        assert_ne!(group_id_for(&a), group_id_for(&b));
+        assert_ne!(
+            group_id_for(&a).expect("group id"),
+            group_id_for(&b).expect("group id")
+        );
     }
 
     #[test]
@@ -1167,14 +1170,17 @@ mod tests {
         let a = spec("m", &["t0", "t1"], &["g0"], 2);
         let mut b = spec("m", &["t0", "t1"], &["g0"], 2);
         b.lanes.reverse();
-        assert_eq!(group_id_for(&a), group_id_for(&b));
+        assert_eq!(
+            group_id_for(&a).expect("group id"),
+            group_id_for(&b).expect("group id")
+        );
     }
 
     #[test]
     fn group_id_separates_different_lane_counts() {
         assert_ne!(
-            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 1)),
-            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 2))
+            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 1)).expect("group id"),
+            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 2)).expect("group id")
         );
     }
 
@@ -1182,17 +1188,17 @@ mod tests {
     fn group_id_separates_distinct_memberships() {
         let base = spec("m", &["t0", "t1"], &["g0"], 1);
         assert_ne!(
-            group_id_for(&base),
-            group_id_for(&spec("other", &["t0", "t1"], &["g0"], 1))
+            group_id_for(&base).expect("group id"),
+            group_id_for(&spec("other", &["t0", "t1"], &["g0"], 1)).expect("group id")
         );
         // A different admitted generator subset is a different communicator.
         assert_ne!(
-            group_id_for(&base),
-            group_id_for(&spec("m", &["t0", "t1"], &["g0", "g1"], 1))
+            group_id_for(&base).expect("group id"),
+            group_id_for(&spec("m", &["t0", "t1"], &["g0", "g1"], 1)).expect("group id")
         );
         assert_ne!(
-            group_id_for(&base),
-            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 2))
+            group_id_for(&base).expect("group id"),
+            group_id_for(&spec("m", &["t0", "t1"], &["g0"], 2)).expect("group id")
         );
     }
 
@@ -1201,8 +1207,8 @@ mod tests {
         // Without a separator between the two slot lists, moving a name from
         // one role to the other would hash identically.
         assert_ne!(
-            group_id_for(&spec("m", &["a", "b"], &["c"], 1)),
-            group_id_for(&spec("m", &["a"], &["b", "c"], 1))
+            group_id_for(&spec("m", &["a", "b"], &["c"], 1)).expect("group id"),
+            group_id_for(&spec("m", &["a"], &["b", "c"], 1)).expect("group id")
         );
     }
 
@@ -1340,7 +1346,7 @@ mod tests {
 
         // A FORMING group refuses a create, so seed the in-flight operation
         // the way an epoch-1 create on a since-demoted group would leave it.
-        let group_id = group_id_for(&group_spec);
+        let group_id = group_id_for(&group_spec).expect("group id");
         let operation_id = Uuid::new_v4().simple().to_string();
         let () = connection
             .hset_multiple(
@@ -1391,7 +1397,7 @@ mod tests {
         )
         .await;
 
-        let group_id = group_id_for(&group_spec);
+        let group_id = group_id_for(&group_spec).expect("group id");
         let operation_id = Uuid::new_v4().simple().to_string();
         let mut connection = backend.connection.clone();
         let () = connection
@@ -1538,7 +1544,7 @@ mod tests {
         .await;
 
         let group = backend
-            .get_group(&group_id_for(&group_spec))
+            .get_group(&group_id_for(&group_spec).expect("group id"))
             .await
             .expect("get group");
         assert_eq!(group.epoch, 2);
@@ -1604,7 +1610,7 @@ mod tests {
             "d",
         )
         .await;
-        let group_id = group_id_for(&group_spec);
+        let group_id = group_id_for(&group_spec).expect("group id");
         for (lane_id, fill) in [(0, 1u8), (1, 2u8)] {
             backend
                 .publish_bootstrap(&PublishGroupBootstrapRequest {
@@ -1631,7 +1637,7 @@ mod tests {
     ) {
         let mut connection = backend.connection.clone();
         let active: u64 = connection
-            .scard(active_ops_key(&group_id_for(group_spec)))
+            .scard(active_ops_key(&group_id_for(group_spec).expect("group id")))
             .await
             .expect("scard");
         assert_eq!(active, 0, "a refused create must not leave an operation");

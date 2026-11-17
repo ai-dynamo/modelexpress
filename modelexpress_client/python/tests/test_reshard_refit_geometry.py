@@ -121,6 +121,30 @@ def test_capture_op_chains_and_dest_offsets():
     assert result.unsupported == [] and result.unattributed == 0
 
 
+def test_view_as_in_a_sharded_loader_is_captured_as_a_view():
+    """vLLM's mamba v2 sharded loader assigns ``loaded[a:b].view_as(param.data[a:b])``."""
+
+    class ConvModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv = torch.nn.Parameter(torch.empty(4, 1, 3))
+
+        def load_weights(self, weights):
+            for _, loaded in weights:
+                target = self.conv.data[0:4, ...]
+                self.conv.data[0:4, ...] = loaded[4:8].view_as(target)
+
+    with torch.device("meta"):
+        model = ConvModel()
+
+    result = capture_geometry(model, [("conv", torch.float32, [8, 3])])
+
+    assert result.unsupported == []
+    assert [(c.src_name, c.param_name, c.op_chain, c.dest_shape) for c in result.copies] == [
+        ("conv", "conv", (("__getitem__", (slice(4, 8, None),), ()), ("view", ((4, 1, 3),), ())), (4, 1, 3)),
+    ]
+
+
 def test_unsupported_op_falls_back_per_source():
     """An unsupported-op loader knocks out ONLY that source; others still captured."""
     with torch.device("meta"):

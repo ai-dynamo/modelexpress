@@ -394,21 +394,21 @@ def publish_artifact(
 
 def artifact_ready_fn(
     source_roots: tuple[ArtifactCacheRoot, ...],
-    health_ready_fn: Callable[[], bool],
+    ready_fn: Callable[[], bool],
 ) -> Callable[[], bool]:
-    """Return a readiness check for a stable, healthy artifact source."""
-    server_ready = False
+    """Wait for engine readiness and stable artifact cache files."""
+    engine_ready = False
     stable_since: float | None = None
     last_signature: tuple[int, int, int] | None = None
 
     def ready() -> bool:
-        nonlocal server_ready, stable_since, last_signature
-        if not server_ready:
-            if not health_ready_fn():
+        nonlocal engine_ready, stable_since, last_signature
+        if not engine_ready:
+            if not ready_fn():
                 stable_since = None
                 last_signature = None
                 return False
-            server_ready = True
+            engine_ready = True
 
         signature = cache_signature(source_roots)
         if signature is None:

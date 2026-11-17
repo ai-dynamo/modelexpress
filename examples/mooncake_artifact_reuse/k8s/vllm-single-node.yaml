@@ -1,0 +1,118 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Replace the image, model PVC, and namespace before applying. The image must
+# include vLLM, ModelExpress, and a Mooncake Python package with mooncake.store.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mx-mooncake-vllm
+spec:
+  selector:
+    app: mx-mooncake-vllm
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mx-mooncake-vllm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: mx-mooncake-vllm
+  template:
+    metadata:
+      labels:
+        app: mx-mooncake-vllm
+    spec:
+      containers:
+        - name: vllm
+          image: your-registry/vllm-modelexpress-mooncake:latest
+          command: [vllm, serve]
+          args:
+            - /models/model
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8000"
+            - --tensor-parallel-size
+            - "1"
+            - --load-format
+            - modelexpress
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            timeoutSeconds: 10
+          securityContext:
+            capabilities:
+              add: [IPC_LOCK]
+          env:
+            - name: MX_ARTIFACT_TRANSFER
+              value: "1"
+            - name: MX_ARTIFACT_BACKEND
+              value: mooncake
+            - name: MX_P2P_METADATA
+              value: "0"
+            - name: MX_ARTIFACT_MOONCAKE_NAMESPACE
+              value: modelexpress/examples/change-me/
+            - name: MX_MOONCAKE_CONFIG_PATH
+              value: /etc/mooncake/config.json
+            - name: MX_ARTIFACT_READY_URL
+              value: http://127.0.0.1:8000/health
+            - name: MX_ARTIFACT_BUNDLE_ROOT
+              value: /cache/artifact-bundles
+            - name: VLLM_CACHE_ROOT
+              value: /cache/vllm
+            - name: DG_JIT_CACHE_DIR
+              value: /cache/vllm/deep_gemm
+            - name: VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR
+              value: /cache/vllm/flashinfer_autotune_cache
+            - name: TRITON_CACHE_DIR
+              value: /cache/triton
+            - name: TILELANG_CACHE_DIR
+              value: /cache/tilelang
+            - name: CUTE_DSL_CACHE_DIR
+              value: /cache/cute_dsl
+            - name: FLASHINFER_WORKSPACE_BASE
+              value: /cache/flashinfer_workspace
+            - name: CUDA_CACHE_PATH
+              value: /cache/cuda
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: model
+              mountPath: /models
+              readOnly: true
+            - name: cache
+              mountPath: /cache
+            - name: mooncake-config
+              mountPath: /etc/mooncake
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: model
+          persistentVolumeClaim:
+            claimName: model-cache
+        - name: cache
+          emptyDir: {}
+        - name: mooncake-config
+          secret:
+            secretName: mooncake-config
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi

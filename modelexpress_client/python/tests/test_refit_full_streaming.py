@@ -3,6 +3,7 @@
 
 import json
 import threading
+from concurrent import futures
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -22,7 +23,7 @@ from tests.test_refit_s3_receiver import (
 )
 
 
-def build(monkeypatch, tmp_path, *, checksums=False):
+def build(monkeypatch, tmp_path, *, checksums=False, background_seed_copy=False):
     objects = _full_artifact(torch.tensor([7.0, 8.0]))
     uri = "s3://weights/test/v2/model.safetensors.index.json"
     if not checksums:
@@ -32,7 +33,7 @@ def build(monkeypatch, tmp_path, *, checksums=False):
     storage = _MemoryS3(objects)
     monkeypatch.setattr(canonical_delta, "S3Client", lambda **kwargs: storage)
     launch = tmp_path / "launch"
-    launch.mkdir()
+    launch.mkdir(exist_ok=True)
     save_file({"weight": torch.tensor([1.0, 2.0])}, launch / "model.safetensors")
     adapter = _Adapter(
         model_name="test/model",
@@ -43,6 +44,7 @@ def build(monkeypatch, tmp_path, *, checksums=False):
             refit_checkpoint_dir=tmp_path / "cache",
         ),
         stream_full_checkpoints=True,
+        background_seed_copy=background_seed_copy,
     )
     return adapter, storage
 
@@ -145,6 +147,61 @@ def test_cache_uses_stream_bytes_and_next_delta_never_downloads_full(
             "s3://weights/test/v2/model-00001-of-00001.safetensors" not in storage.calls
         )
         adapter.release_staged_weight(delta)
+    finally:
+        adapter.close()
+
+
+def test_cache_waits_for_the_seed_copy_then_drops_it(monkeypatch, tmp_path):
+    adapter, _storage = build(monkeypatch, tmp_path, background_seed_copy=True)
+    store = adapter._checkpoint.store
+    try:
+        adapter._method._seed_copy.join()
+        assert store.has_artifact_record(store.materialized_path("base-a"))
+        full = adapter.stage_weight(_full_inputs())
+        # The background seed copy holds the preparation lock while it copies.
+        with store.preparation_locked():
+            with adapter._method.installation_context(adapter._active):
+                consume(full)
+            with pytest.raises(futures.TimeoutError):
+                full.streaming._writer._future.result(timeout=0.2)
+            # The copy records itself under the store lock, so the writer must
+            # not hold that lock, or the installation lock, while it waits.
+            for path in (store.install_lock_path, store.lock_path):
+                with store._locked(path, shared=False, blocking=False) as acquired:
+                    assert acquired
+        full.streaming.wait_cache()
+        assert store.state().version == "full-a"
+        # The streamed full replaces the head, so the head's working copy is unused.
+        assert not store.materialized_path("base-a").exists()
+        adapter.release_staged_weight(full)
+    finally:
+        adapter.close()
+
+
+def test_cached_stream_drops_the_working_copy_of_a_reseeded_head(
+    monkeypatch, tmp_path
+):
+    adapter, _storage = build(monkeypatch, tmp_path)
+    full = adapter.stage_weight(_full_inputs())
+    with adapter._method.installation_context(adapter._active):
+        consume(full)
+    full.streaming.wait_cache()
+    adapter.release_staged_weight(full)
+    adapter.close()
+
+    # A restart reseeds the cache head and copies it; the full stays cached.
+    adapter, _storage = build(monkeypatch, tmp_path, background_seed_copy=True)
+    store = adapter._checkpoint.store
+    try:
+        adapter._method._seed_copy.join()
+        assert store.has_artifact_record(store.materialized_path("base-a"))
+        full = adapter.stage_weight(_full_inputs())
+        with adapter._method.installation_context(adapter._active):
+            consume(full)
+        full.streaming.wait_cache()
+        assert store.state().version == "full-a"
+        assert not store.materialized_path("base-a").exists()
+        adapter.release_staged_weight(full)
     finally:
         adapter.close()
 

@@ -6,6 +6,11 @@ set -euo pipefail
 
 : "${NIGHTLY_TAG:?NIGHTLY_TAG is required}"
 : "${CHART_VERSION:?CHART_VERSION is required}"
+# Nightly defaults: chart modelexpress-nightly pointing at <repo>-nightly:<NIGHTLY_TAG>.
+# The RC stager overrides both (CHART_NAME=modelexpress, IMAGE_REPO_SUFFIX="") so the
+# chart references the plain modelexpress-server image at the staged rc tag.
+CHART_NAME="${CHART_NAME:-modelexpress-nightly}"
+IMAGE_REPO_SUFFIX="${IMAGE_REPO_SUFFIX--nightly}"
 
 BASE_REPO=$(sed -n 's/^[[:space:]]*repository:[[:space:]]*//p' helm/values.yaml | head -1 | tr -d "\"'")
 case "${BASE_REPO}" in
@@ -15,8 +20,7 @@ case "${BASE_REPO}" in
     exit 1
     ;;
 esac
-NIGHTLY_REPO="${BASE_REPO}-nightly"
-CHART_NAME="modelexpress-nightly"
+NIGHTLY_REPO="${BASE_REPO}${IMAGE_REPO_SUFFIX}"
 
 python3 - "$NIGHTLY_REPO" "$NIGHTLY_TAG" <<'PY'
 import re, sys

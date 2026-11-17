@@ -13,10 +13,11 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and S3 replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
-| `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither P2P nor S3 can load it |
+| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and object-storage replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
+| `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither P2P nor object storage can load it |
 | `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. Desired-version cold start defaults to `GENERATOR,OBJECT_STORAGE`; `OBJECT_STORAGE` disables P2P for both cold start and active refit. `TRAINER` applies only to active refit and is rejected for desired-version cold start. |
-| `MX_REFIT_CHECKPOINT_DIR` | (unset) | Host-local cache for RL S3 full checkpoints, deltas, and materialized checkpoints; the S3 strategy skips when it is unset |
+| `MX_MAX_REPLAY_CHAIN_LENGTH` | `64` | Positive cold-start object-storage replay limit, including the full checkpoint root; align with the running engine's `max_replay_chain_length` when accepting longer chains |
+| `MX_REFIT_CHECKPOINT_DIR` | (unset) | Host-local cache for RL full checkpoints, deltas, and materialized checkpoints from S3 or Azure; the object-storage startup strategy skips when it is unset |
 | `MX_REFIT_CHECKPOINT_MAX_SIZE_GB` | `2000` | Positive decimal GB cache quota used by default in vLLM weight-transfer initialization. An explicit `refit_checkpoint_max_size_gb`, including `null`, overrides this setting. |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL metadata-listener port for RL generator refit; each rank adds its local device ID. Kept separate from `MX_METADATA_PORT`, which may remain owned by the boot-time loader |
 | `MX_RESHARD_MAX_SEGMENTS_PER_COPY` | `64` | Maximum exact descriptors for one no-gather refit copy before a compatible dim-0-sharded source is pulled once into contiguous staging and sliced locally |
@@ -30,7 +31,8 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 | `MX_S3_DOWNLOAD_BACKEND` | `transfer_manager` | Canonical S3 artifact downloader: `transfer_manager` or opt-in `preallocated`. See [transfer tuning](../../modelexpress_client/python/README.md#canonical-s3-transfer-tuning) for compatibility and memory requirements. |
 | `MX_REFIT_DOWNLOAD_WORKERS` | `MX_S3_DOWNLOAD_WORKERS`, then `16` | Concurrent shard downloads for S3 and Azure; also sets the per-client S3 data GET concurrency for either backend. |
 | `MX_S3_DOWNLOAD_WORKERS` | `16` | Legacy fallback when `MX_REFIT_DOWNLOAD_WORKERS` is unset. |
-| `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum format written by canonical S3 trainers. |
+| `MX_REFIT_UPLOAD_WORKERS` | `MX_S3_UPLOAD_WORKERS`, then `8` | Concurrent full-checkpoint shard uploads for S3 and Azure. S3 multipart concurrency still uses `MX_S3_UPLOAD_WORKERS`. |
+| `MX_REFIT_CHECKSUM_FORMAT` | `adler32` | Checksum format written by canonical S3 and Azure trainers. |
 | `MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES` | `4294967296` (4 GiB) | Maximum tensor bytes grouped into one full-checkpoint safetensors object; oversized tensors occupy a separate object. |
 | `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the destination modules touched by the delta chain instead of the whole prepared checkpoint. Falls back to a full reload when lineage or the live version is unknown, or when a fed module is incomplete. See the [S3 delta refit guide](S3_DELTA_WEIGHT_REFIT.md). |
 | `MX_REFIT_DEBUG_VALIDATE_PLAN` | `0` | Recheck cached whole-model and owning-module transfer coverage. |
@@ -42,6 +44,8 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 
 The selected download worker count must be a positive integer. An invalid
 `MX_REFIT_DOWNLOAD_WORKERS` value fails validation without falling back.
+`MX_REFIT_UPLOAD_WORKERS` also requires a positive integer and does not fall back
+when explicitly set to an invalid value.
 `MX_S3_MAX_POOL_CONNECTIONS` separately controls the Botocore HTTP connection pool.
 Azure's per-blob concurrency and connection pool remain controlled by
 `MX_AZURE_DOWNLOAD_CONCURRENCY` and `MX_AZURE_MAX_POOL_CONNECTIONS`.
@@ -80,14 +84,38 @@ the field is omitted. For S3, `object_storage_endpoint_url` and
 to use the S3 default. Miles uses `object_storage_uri_prefix` for trainer
 publication. See the [backend setup examples](S3_DELTA_WEIGHT_REFIT.md).
 
-Azure generator reads require the Python `azure` extra and `az://container/blob`
+Azure reads and trainer writes require the Python `azure` extra and `az://container/blob`
 sources. Authentication uses `AZURE_STORAGE_CONNECTION_STRING` first. Otherwise,
 set `AZURE_STORAGE_ACCOUNT_URL` or `AZURE_STORAGE_ACCOUNT_NAME` and use
 `DefaultAzureCredential`, including managed identity or AKS workload identity.
 Azure rejects `object_storage_endpoint_url` and `object_storage_region_name`.
-The generator supports full checkpoints and XOR delta replay. The server still
-rejects Azure publications, and exact desired-version startup remains S3-only.
-Azure generator configuration does not yet provide a complete publication workflow.
+The server accepts Azure publications, and generators support full checkpoints
+and XOR delta replay during live updates and exact desired-version startup.
+For trainer publication, set `ObjectStorageConfig.storage_type=ObjectStorageType.AZURE`
+and an `az://container/prefix` in `uri_prefix`. Keep `WRITE_TO_STORAGE` and
+`XOR_DELTA` in the trainer configuration; individual registered versions can be
+full checkpoints or XOR deltas. The SDK rejects S3 `endpoint_url` and `region_name`
+fields for Azure. The orchestrator marks a version `READY` only after all trainer
+ranks complete publication. See the shared retry limits in the
+[trainer publication lifecycle](ARCHITECTURE.md).
+
+Upgrade every serving ModelExpress server replica before publishing Azure
+versions. Older replicas read only the S3 mirror and cannot consume Azure sources.
+Existing records without a provider remain S3. This change does not repair
+Azure records that were stored with the wrong provider.
+
+Exact-version startup selects the reader from the registered version's storage
+provider. The server permits S3 and Azure versions within the same run, including
+delta-base relationships across providers. Generators cannot replay these mixed
+chains: all versions in one replay chain must use the same provider, S3 or Azure.
+Set `MX_REFIT_CHECKPOINT_DIR` for local reconstruction. The generator verifies
+cached artifacts before reuse and downloads missing or damaged artifacts before
+engine loading. Only successful loading on all ranks permits activation.
+
+The startup strategy name in telemetry is now `desired_version_object_storage`
+(previously `desired_version_s3`). Its collective phase labels now use the
+`object_storage_` prefix. Use the same client build on all ranks; mixed old and
+new labels cause a startup phase disagreement.
 
 ## Staging, streaming, and verification
 
@@ -104,8 +132,10 @@ Other initialization paths retain their existing 2000 GB default.
 
 Streamed full replacement may need space for the protected old full checkpoint,
 a materialized checkpoint with deltas applied, and the incoming full checkpoint
-at the same time. Size the quota and backing volume for this peak plus retained
-delta artifacts and headroom; increasing the quota does not add disk capacity.
+at the same time. A downloaded, not streamed, full checkpoint adds a
+[working copy](S3_DELTA_WEIGHT_REFIT.md#working-copies) of itself when there is
+room for both copies. Size the quota and backing volume for this peak plus retained delta artifacts and
+headroom; increasing the quota does not add disk capacity.
 
 At initialization, the generator caps this quota at existing cache bytes plus
 free disk space and

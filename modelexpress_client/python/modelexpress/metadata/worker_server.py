@@ -20,6 +20,7 @@ import time
 import uuid
 from concurrent import futures
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from threading import Condition, Lock
 from typing import Any
@@ -786,15 +787,32 @@ def fetch_tensor_manifest(
     return list(response.tensors), response_bytes
 
 
+@contextmanager
+def _worker_channel(endpoint: str, channel: grpc.Channel | None):
+    """Yield ``channel`` when the caller owns one, else a fresh channel.
+
+    The artifact helpers below are called once per chunk during a transfer;
+    opening a new channel per call means one TCP connection per RPC to the
+    same endpoint. Callers that loop pass their own channel so the whole
+    transfer shares one connection.
+    """
+    if channel is not None:
+        yield channel
+    else:
+        with grpc.insecure_channel(endpoint) as owned:
+            yield owned
+
+
 def fetch_artifact_manifest_header(
     endpoint: str,
     mx_source_id: str,
     artifact_id: str = "",
     timeout: float = 5.0,
+    channel: grpc.Channel | None = None,
 ) -> tuple[p2p_pb2.GetArtifactManifestHeaderResponse, int]:
     """Fetch a sealed artifact manifest header directly from a source worker."""
-    with grpc.insecure_channel(endpoint) as channel:
-        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+    with _worker_channel(endpoint, channel) as chan:
+        stub = p2p_pb2_grpc.WorkerServiceStub(chan)
         request = p2p_pb2.GetArtifactManifestHeaderRequest(
             mx_source_id=mx_source_id,
             artifact_id=artifact_id,
@@ -815,10 +833,11 @@ def fetch_artifact_manifest_chunks(
     start_chunk_index: int = 0,
     max_chunks: int = 0,
     timeout: float = 5.0,
+    channel: grpc.Channel | None = None,
 ) -> tuple[p2p_pb2.GetArtifactManifestChunksResponse, int]:
     """Fetch one sealed artifact manifest chunk page from a source worker."""
-    with grpc.insecure_channel(endpoint) as channel:
-        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+    with _worker_channel(endpoint, channel) as chan:
+        stub = p2p_pb2_grpc.WorkerServiceStub(chan)
         request = p2p_pb2.GetArtifactManifestChunksRequest(
             mx_source_id=mx_source_id,
             artifact_id=artifact_id,
@@ -841,10 +860,11 @@ def prepare_artifact_chunk(
     artifact_id: str,
     chunk_index: int,
     timeout: float = 5.0,
+    channel: grpc.Channel | None = None,
 ) -> tuple[p2p_pb2.PrepareArtifactChunkResponse, int]:
     """Prepare one artifact chunk for NIXL transfer on a source worker."""
-    with grpc.insecure_channel(endpoint) as channel:
-        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+    with _worker_channel(endpoint, channel) as chan:
+        stub = p2p_pb2_grpc.WorkerServiceStub(chan)
         request = p2p_pb2.PrepareArtifactChunkRequest(
             mx_source_id=mx_source_id,
             artifact_id=artifact_id,
@@ -865,10 +885,11 @@ def release_artifact_chunk(
     artifact_id: str,
     lease_id: str,
     timeout: float = 5.0,
+    channel: grpc.Channel | None = None,
 ) -> tuple[p2p_pb2.ReleaseArtifactChunkResponse, int]:
     """Release a prepared artifact chunk lease on a source worker."""
-    with grpc.insecure_channel(endpoint) as channel:
-        stub = p2p_pb2_grpc.WorkerServiceStub(channel)
+    with _worker_channel(endpoint, channel) as chan:
+        stub = p2p_pb2_grpc.WorkerServiceStub(chan)
         request = p2p_pb2.ReleaseArtifactChunkRequest(
             mx_source_id=mx_source_id,
             artifact_id=artifact_id,

@@ -7,8 +7,8 @@ Ranks the compatible READY source workers returned by the metadata backend
 before transfer attempts. The flow is:
 
     metadata backend -> ListSources(identity, READY) -> filter by worker_rank
-      -> SourceSelector.order(candidates, ctx) -> slice to MAX_SOURCE_RETRIES
-      -> NIXL/RDMA transfer
+      -> SourceSelector.order(candidates, ctx) -> bounded metadata lookups
+      -> bounded NIXL/RDMA transfer attempts
 
 Selectors order candidates using the live ``LoadContext`` (the same object the
 load strategies already pass around): only a few fields are read

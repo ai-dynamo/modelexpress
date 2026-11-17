@@ -204,6 +204,7 @@ def test_object_storage_runtime_preserves_source_order(
     canonical = _Method({WeightSource.OBJECT_STORAGE})
     canonical.requires_full_root = True
     resolve_chain = Mock(return_value=())
+    seed_copies = []
     monkeypatch.setattr(
         runtime_module,
         "RuntimeTensorNixlUpdateMethod",
@@ -212,7 +213,8 @@ def test_object_storage_runtime_preserves_source_order(
     monkeypatch.setattr(
         runtime_module,
         "CanonicalDeltaUpdateMethod",
-        lambda **_kwargs: canonical,
+        lambda **kwargs: seed_copies.append(kwargs["background_seed_copy"])
+        or canonical,
     )
     storage = ObjectStorageGeneratorConfig(
         storage_type=ObjectStorageType.S3,
@@ -241,6 +243,8 @@ def test_object_storage_runtime_preserves_source_order(
         resolve_chain.assert_called_once_with("target", True)
 
     assert runtime.methods == (canonical, full_tensor)
+    # Object-storage updates replay from the full root, not the cache head.
+    assert seed_copies == [False]
     assert runtime.session.source_order == expected_source_order
     assert runtime.initial_version_id == "base-a"
     assert [resolver.kind for resolver in runtime.session._resolvers] == list(
@@ -297,10 +301,12 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
     canonical = _Method({WeightSource.OBJECT_STORAGE})
     canonical.requires_full_root = requires_full_root
     resolve_chain = Mock(return_value=())
+    seed_copies = []
     monkeypatch.setattr(
         runtime_module,
         "CanonicalDeltaUpdateMethod",
-        lambda **_kwargs: canonical,
+        lambda **kwargs: seed_copies.append(kwargs["background_seed_copy"])
+        or canonical,
     )
     storage = ObjectStorageGeneratorConfig(
         storage_type=ObjectStorageType.S3,
@@ -324,6 +330,7 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
 
     assert runtime.session.source_order == (WeightSource.OBJECT_STORAGE,)
     assert runtime.methods == (canonical,)
+    assert seed_copies == [True]
     runtime.session._resolve_replay_chain(SimpleNamespace(version_id="target"))
     resolve_chain.assert_called_once_with("target", requires_full_root)
 

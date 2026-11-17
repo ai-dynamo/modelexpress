@@ -42,11 +42,20 @@ from .base import (
     clear_exception_tracebacks,
     register_tensors,
 )
-from .context import LoadResult, is_draft_tensor_name
+from .context import DRAFT_TENSOR_PREFIX, LoadResult, is_draft_tensor_name
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
 MAX_SOURCE_RETRIES = 3
+MAX_DRAFT_SOURCE_METADATA_LOOKUPS = 10
+
+
+def _matches_draft_namespace(ctx: LoadContext, name: str) -> bool:
+    namespace = ctx.draft_tensor_namespace
+    if not name.startswith(namespace):
+        return False
+    return namespace != DRAFT_TENSOR_PREFIX or "::" not in name[len(namespace):]
+
 
 # Fallback when MX_TRANSFER_TIMEOUT is unset or unusable. Matches the value this
 # path used when the timeout was hard-coded, so behaviour is unchanged by default.
@@ -187,7 +196,7 @@ class RdmaStrategy(LoadStrategy):
         ctx.nixl_manager = None
 
     def is_available(self, ctx: LoadContext) -> bool:
-        if not ctx.p2p_enabled:
+        if not ctx.p2p_enabled or getattr(ctx, "skip_rdma", False) is True:
             return False
         if not super().is_available(ctx):
             return False
@@ -252,7 +261,10 @@ class RdmaStrategy(LoadStrategy):
             )
             raise StrategyFailed("No RDMA source available", mutated=False)
 
-        attempts = candidates[:MAX_SOURCE_RETRIES]
+        is_draft = _is_draft_pass(ctx)
+        max_lookups = MAX_DRAFT_SOURCE_METADATA_LOOKUPS if is_draft else MAX_SOURCE_RETRIES
+        attempts = candidates[:max_lookups]
+        transfer_attempts = 0
         policy = configured_policy_label()
         for attempt_index, instance in enumerate(attempts):
             mx_source_id = instance.mx_source_id
@@ -286,7 +298,7 @@ class RdmaStrategy(LoadStrategy):
             if not self._accelerator_compatible(ctx, source_worker, worker_id):
                 continue
 
-            if _is_draft_pass(ctx) and not self._may_serve_draft(ctx, source_worker):
+            if is_draft and not self._may_serve_draft(ctx, source_worker):
                 logger.info(
                     f"[Worker {ctx.global_rank}] Skipping source worker "
                     f"{worker_id}: its manifest has no speculative draft tensors"
@@ -303,6 +315,7 @@ class RdmaStrategy(LoadStrategy):
             # MX_METRICS_SOURCE_ID_LABEL=1, so the cardinality decision lives in
             # one place rather than being duplicated at every call site.
             selection_metrics.record_selection(policy, worker_id)
+            transfer_attempts += 1
             transfer_start = time.perf_counter()
             try:
                 out = self._load_as_target(
@@ -313,7 +326,10 @@ class RdmaStrategy(LoadStrategy):
                     worker_id,
                 )
             except StrategyFailed as e:
-                has_next_candidate = attempt_index + 1 < len(attempts)
+                has_next_candidate = (
+                    transfer_attempts < MAX_SOURCE_RETRIES
+                    and attempt_index + 1 < len(attempts)
+                )
                 selection_metrics.observe_transfer_seconds(
                     policy,
                     "retry" if has_next_candidate else "fallback",
@@ -369,10 +385,10 @@ class RdmaStrategy(LoadStrategy):
             selection_metrics.record_attempt(policy, "success")
             return out
 
-        tried = min(len(candidates), MAX_SOURCE_RETRIES)
         logger.warning(
-            f"[Worker {ctx.global_rank}] Tried {tried} of {len(candidates)} source workers "
-            f"(max retries={MAX_SOURCE_RETRIES}), falling through"
+            f"[Worker {ctx.global_rank}] Checked {len(attempts)} of {len(candidates)} "
+            f"source workers and attempted {transfer_attempts} transfers "
+            f"(max transfers={MAX_SOURCE_RETRIES}), falling through"
         )
         raise StrategyFailed(
             "No RDMA source succeeded",
@@ -387,8 +403,8 @@ class RdmaStrategy(LoadStrategy):
 
         Filters listed instances to the target's worker_rank, then delegates
         ordering to the policy named by MX_P2P_SOURCE_SELECTOR (default
-        ``random``). The retry slice (MAX_SOURCE_RETRIES) is applied by the
-        caller in load(), so the selector controls ordering only.
+        ``random``). The caller in load() applies the lookup and transfer
+        limits, so the selector controls ordering only.
         """
         policy = configured_policy_label()
         topology_policy = resolve_policy()
@@ -401,7 +417,7 @@ class RdmaStrategy(LoadStrategy):
             return []
         try:
             list_resp = ctx.mx_client.list_sources(
-                identity=ctx.identity,
+                identity=ctx.p2p_source_identity or ctx.identity,
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
             if not list_resp.instances:
@@ -547,9 +563,7 @@ class RdmaStrategy(LoadStrategy):
         descriptors = worker_tensor_descriptors(source_worker)
         if not descriptors:
             return True
-        return any(
-            t.name.startswith(ctx.draft_tensor_namespace) for t in descriptors
-        )
+        return any(_matches_draft_namespace(ctx, t.name) for t in descriptors)
 
     @staticmethod
     def _scope_source_tensors(
@@ -567,7 +581,7 @@ class RdmaStrategy(LoadStrategy):
             return [t for t in source_tensors if not is_draft_tensor_name(t.name)]
         scoped = [
             t for t in source_tensors
-            if t.name.startswith(ctx.draft_tensor_namespace)
+            if _matches_draft_namespace(ctx, t.name)
         ]
         missing = set(ctx.tensors) - {t.name for t in scoped}
         if missing:

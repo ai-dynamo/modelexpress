@@ -4,10 +4,10 @@
 //! Redis implementation of the Refit control-plane backend.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use modelexpress_common::digest::sha256_hex;
 use modelexpress_common::grpc::refit::{
     CreateTrainerMeshRequest, CreateWeightVersionRequest, DeleteVersionLeaseRequest,
     DeleteWeightVersionShardRequest, ObjectStorageSource, ObjectStorageType,
@@ -18,7 +18,6 @@ use modelexpress_common::grpc::refit::{
 use prost::Message;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Script};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{RefitBackend, RefitBackendError, RefitResult};
@@ -79,13 +78,10 @@ fn idempotency_key(model_name: &str, request_key: &str) -> String {
     format!("mx:refit:version-request:{model_name}:{request_key}")
 }
 
-fn lease_id(version_id: &str, worker_id: &str) -> String {
-    let digest = Sha256::digest(format!("{version_id}\0{worker_id}").as_bytes());
-    let mut id = String::with_capacity(8);
-    for byte in &digest[..4] {
-        let _ = write!(id, "{byte:02x}");
-    }
-    id
+fn lease_id(version_id: &str, worker_id: &str) -> RefitResult<String> {
+    let digest = sha256_hex(format!("{version_id}\0{worker_id}").as_bytes())
+        .map_err(|error| RefitBackendError::Internal(error.to_string()))?;
+    Ok(digest[..8].to_string())
 }
 
 fn now_unix_ms() -> RefitResult<u64> {
@@ -134,6 +130,23 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         .get("trainer_mesh_id")
         .filter(|mesh_id| !mesh_id.is_empty())
         .cloned();
+    // Older records have only s3_uri; a missing provider still means S3.
+    let object_storage = fields
+        .get("object_storage_uri")
+        .or_else(|| fields.get("s3_uri"))
+        .filter(|uri| !uri.is_empty())
+        .map(|uri| -> RefitResult<ObjectStorageSource> {
+            let storage_type = if fields.contains_key("object_storage_type") {
+                parse_hash_field(&fields, "object_storage_type")?
+            } else {
+                ObjectStorageType::S3.into()
+            };
+            Ok(ObjectStorageSource {
+                uri: uri.clone(),
+                storage_type,
+            })
+        })
+        .transpose()?;
     Ok(WeightVersion {
         uid: hash_field(&fields, "uid")?.to_string(),
         model_name: hash_field(&fields, "model_name")?.to_string(),
@@ -146,13 +159,7 @@ fn version_from_hash(fields: HashMap<String, String>) -> RefitResult<WeightVersi
         layout_signature: hash_field(&fields, "layout_signature")?.to_string(),
         state: parse_hash_field(&fields, "state")?,
         created_at_unix_ms: parse_hash_field(&fields, "created_at_unix_ms")?,
-        object_storage: fields
-            .get("s3_uri")
-            .filter(|uri| !uri.is_empty())
-            .map(|uri| ObjectStorageSource {
-                uri: uri.clone(),
-                storage_type: ObjectStorageType::S3.into(),
-            }),
+        object_storage,
         trainer_mesh_id,
         trainer_mesh_generation: parse_hash_field(&fields, "trainer_mesh_generation")?,
         version_number: fields
@@ -326,6 +333,21 @@ impl RedisRefitBackend {
                 .version_number
                 .map(|number| number.to_string())
                 .unwrap_or_default(),
+        );
+        invocation.arg(
+            request
+                .object_storage
+                .as_ref()
+                .map_or(i32::from(ObjectStorageType::Unspecified), |source| {
+                    source.storage_type
+                }),
+        );
+        invocation.arg(
+            request
+                .object_storage
+                .as_ref()
+                .filter(|source| source.storage_type == i32::from(ObjectStorageType::S3))
+                .map_or("", |source| source.uri.as_str()),
         );
         let mut redis = self.redis.clone();
         invocation
@@ -975,7 +997,7 @@ impl RefitBackend for RedisRefitBackend {
         request: &RegisterVersionLeaseRequest,
     ) -> RefitResult<VersionLease> {
         self.get_weight_version(&request.version_id).await?;
-        let lease_id = lease_id(&request.version_id, &request.worker_id);
+        let lease_id = lease_id(&request.version_id, &request.worker_id)?;
         let mut redis = self.redis.clone();
         let result: String = Script::new(REGISTER_LEASE_LUA)
             .key(version_key(&request.version_id))
@@ -1094,6 +1116,56 @@ mod tests {
         let version = version_from_hash(stored_version("", Some("0")))
             .expect("generation is not applicable without a mesh");
         assert_eq!(version.trainer_mesh_generation, 0);
+    }
+
+    #[test]
+    fn legacy_s3_version_metadata_remains_readable() -> RefitResult<()> {
+        let fields = HashMap::from([
+            ("uid", "legacy-s3"),
+            ("model_name", "test/model"),
+            ("idempotency_key", "legacy-request"),
+            ("payload_format", "3"),
+            ("base_version_id", ""),
+            ("trainer_mesh_generation", "0"),
+            ("layout_signature", ""),
+            ("state", "2"),
+            ("created_at_unix_ms", "1234"),
+            ("s3_uri", "s3://weights/run/model.safetensors.index.json"),
+        ])
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        let version = version_from_hash(fields)?;
+        assert_eq!(
+            version.object_storage,
+            Some(ObjectStorageSource {
+                uri: "s3://weights/run/model.safetensors.index.json".to_string(),
+                storage_type: ObjectStorageType::S3.into(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stored_object_storage_uri_takes_precedence_over_s3_mirror() -> RefitResult<()> {
+        for uri in ["az://weights/current", ""] {
+            let mut fields = stored_version("", Some("0"));
+            fields.insert("object_storage_uri".to_string(), uri.to_string());
+            fields.insert("s3_uri".to_string(), "s3://weights/stale".to_string());
+            fields.insert(
+                "object_storage_type".to_string(),
+                i32::from(ObjectStorageType::Azure).to_string(),
+            );
+            let version = version_from_hash(fields)?;
+            assert_eq!(
+                version.object_storage,
+                (!uri.is_empty()).then(|| ObjectStorageSource {
+                    uri: uri.to_string(),
+                    storage_type: ObjectStorageType::Azure.into(),
+                }),
+            );
+        }
+        Ok(())
     }
 
     #[test]

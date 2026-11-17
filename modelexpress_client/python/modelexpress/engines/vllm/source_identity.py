@@ -72,6 +72,18 @@ def build_source_identity(
         dtype=dtype,
         quantization=quantization,
         revision=_resolve_model_revision(model_config),
+        extra_parameters=(
+            {
+                f"vllm_{name}": str(getattr(parallel, name, 1) or 1)
+                for name in (
+                    "data_parallel_size",
+                    "prefill_context_parallel_size",
+                    "decode_context_parallel_size",
+                )
+            }
+            if envs.MX_P2P_COLD_START
+            else {}
+        ),
     )
 
 

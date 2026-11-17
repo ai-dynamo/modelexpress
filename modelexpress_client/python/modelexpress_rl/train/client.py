@@ -19,6 +19,7 @@ from modelexpress.client import _get_server_url
 
 from .. import envs as rl_envs
 from .. import refit_pb2, refit_pb2_grpc
+from ..azure import _parse_uri as parse_azure_uri
 from ..object_storage import ObjectStorageType
 from ..version import TrainerTensorsMetadata, WeightVersionRef
 from .adapter import (
@@ -68,6 +69,11 @@ class ObjectStorageConfig:
         if not isinstance(self.storage_type, ObjectStorageType):
             raise TypeError("storage_type must be an ObjectStorageType")
         _required(self.uri_prefix, "object_storage.uri_prefix")
+        if self.storage_type is ObjectStorageType.AZURE:
+            for field in ("endpoint_url", "region_name"):
+                if getattr(self, field) is not None:
+                    raise ValueError(f"{field} is not supported for Azure object storage")
+            parse_azure_uri(f"{self.uri_prefix.rstrip('/')}/model.safetensors.index.json")
         _required(
             self.initial_base_version_id,
             "object_storage.initial_base_version_id",
@@ -106,7 +112,7 @@ class ModelExpressTrainerConfig:
 class StagedWeightVersionShard:
     """Publication handle for one rank's contribution to a global version.
 
-    For incremental S3 staging, publish() first waits for all submitted buckets.
+    For object-storage staging, publish() first waits for all submitted buckets.
     """
 
     def __init__(
@@ -165,8 +171,10 @@ class ModelExpressTrainerClient:
         use_storage = config.object_storage is not None
         if use_storage:
             assert config.object_storage is not None
-            if config.object_storage.storage_type is not ObjectStorageType.S3:
-                raise ValueError("only S3 object storage is currently supported")
+            if config.object_storage.storage_type not in {
+                ObjectStorageType.S3, ObjectStorageType.AZURE,
+            }:
+                raise ValueError("only S3 and Azure object storage are currently supported")
             if (
                 staging_mode is not TrainerStagingMode.WRITE_TO_STORAGE
                 or payload_format is not WeightPayloadFormat.XOR_DELTA
@@ -269,9 +277,9 @@ class ModelExpressTrainerClient:
         tensors: Any = None,
         tensor_iter: Iterable[list[tuple[str, torch.Tensor]]] | None = None,
     ) -> StagedWeightVersionShard:
-        """Stage a canonical HF iterator or one S3 tensor bucket.
+        """Stage a canonical HF iterator or one object-storage tensor bucket.
 
-        For S3, pass ``tensors=[(name, tensor), ...]`` repeatedly for one version,
+        Pass ``tensors=[(name, tensor), ...]`` repeatedly for one storage version,
         then publish a returned handle once all buckets have been submitted.
         An empty bucket initializes a rank with no tensors to contribute.
         The SDK retains the bucket and its tensors; keep their contents stable
