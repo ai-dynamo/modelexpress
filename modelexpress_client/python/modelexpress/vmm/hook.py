@@ -64,6 +64,9 @@ _active_lock = threading.Lock()
 # and we don't want it garbage-collected. The MemPool is NOT kept here: each
 # use_arena scope gets its own pool and drops it on exit, see use_arena.
 _pluggable_alloc = None  # torch.cuda.CUDAPluggableAllocator
+# Pools from scopes that could not release on exit (release_idle=False).
+# Kept alive so they are never destroyed inside a caller's own pool scope.
+_retained_pools: list = []
 _callbacks_initialized = False
 # Separate lock for init so concurrent first-time use_arena calls don't
 # double-initialize the pluggable allocator. Kept separate
@@ -156,7 +159,11 @@ def install_pluggable_allocator() -> None:
 
 
 @contextmanager
-def use_arena(arena: "VmmArena", device: "torch.device | int") -> Iterator[None]:
+def use_arena(
+    arena: "VmmArena",
+    device: "torch.device | int",
+    release_idle: bool = True,
+) -> Iterator[None]:
     """Direct subsequent CUDA allocations on `device` into `arena`.
 
     Exit semantics: on context exit, the scope's MemPool is dropped and
@@ -173,6 +180,11 @@ def use_arena(arena: "VmmArena", device: "torch.device | int") -> Iterator[None]
     while it is the active one. Segments that still hold live tensors stay
     allocated.
 
+    Pass release_idle=False when the caller itself runs inside another
+    allocate-to-pool scope (vLLM sleep mode wraps model loading in its own
+    pool). Destroying a MemPool there trips an allocator assert, so the pool
+    is kept alive instead and its idle segments stay mapped, as before.
+
     Only one arena can be active at a time per process; nested or
     concurrent use_arena calls raise RuntimeError.
     """
@@ -181,8 +193,6 @@ def use_arena(arena: "VmmArena", device: "torch.device | int") -> Iterator[None]
 
     _ensure_callbacks_initialized()
     from torch.cuda.memory import MemPool
-
-    pool = MemPool(allocator=_pluggable_alloc.allocator())
 
     with _active_lock:
         if _active_arena is not None:
@@ -197,13 +207,19 @@ def use_arena(arena: "VmmArena", device: "torch.device | int") -> Iterator[None]
         _vmm_alloc_ext.set_active_arena(arena.capsule)
         _active_arena = arena
 
+    # Created only once this scope owns the arena: a pool built before the
+    # nesting check would be destroyed inside the outer scope's pool.
+    pool = None
     try:
+        pool = MemPool(allocator=_pluggable_alloc.allocator())
         with torch.cuda.use_mem_pool(pool, device=device):
             yield
     finally:
         # Drop the last reference while the arena is still active, so the
         # pool's idle segments are freed back into this arena (see the
         # docstring). use_mem_pool has already released its own reference.
+        if pool is not None and not release_idle:
+            _retained_pools.append(pool)
         del pool
         with _active_lock:
             _vmm_alloc_ext.set_active_arena(None)

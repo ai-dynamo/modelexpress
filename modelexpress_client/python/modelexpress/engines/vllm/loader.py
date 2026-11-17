@@ -346,7 +346,10 @@ class MxModelLoader(BaseModelLoader):
         # timers only bracket existing calls; nothing here changes load order.
         model_id = ctx.identity.model_name
         with metrics.time_load("vllm", model_id, model_role):
-            with maybe_enter_vmm_arena(ctx):
+            # vLLM sleep mode loads inside its own memory pool, where the
+            # arena's pool cannot be released on exit.
+            release_idle = not getattr(model_config, "enable_sleep_mode", False)
+            with maybe_enter_vmm_arena(ctx, release_idle=release_idle):
                 if ctx.p2p_enabled and ctx.p2p_role == "main":
                     with metrics.time_load_phase("vllm", model_id, "artifact_install"):
                         install_vllm_cache_artifacts(ctx)

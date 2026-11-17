@@ -40,7 +40,9 @@ _vmm_arenas: dict[int, "VmmArena"] = {}
 
 
 @contextmanager
-def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
+def maybe_enter_vmm_arena(
+    ctx: "LoadContext", release_idle: bool = True
+) -> Iterator[None]:
     """If ``MX_VMM_ARENA=1`` is set, install a VmmArena hook around the
     load envelope. Otherwise yield without installing anything.
 
@@ -253,7 +255,7 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
     ctx.vmm_arena = arena
     published = False
     try:
-        with use_arena(arena, device=ctx.device_id):
+        with use_arena(arena, device=ctx.device_id, release_idle=release_idle):
             yield
         _vmm_arenas[ctx.device_id] = arena
         published = True
