@@ -86,7 +86,7 @@ pub struct BuildInfoLabels {
     pub component: &'static str,
     /// Crate version, from `CARGO_PKG_VERSION` at compile time.
     pub version: &'static str,
-    /// Metadata backend in use: `redis`, `kubernetes`, or `memory`.
+    /// Metadata backend in use: `redis`, `redis-cluster`, `kubernetes`, or `memory`.
     pub backend: String,
     /// Benchmark run label from `MX_METRICS_SCHEME`; empty when unset.
     pub scheme: String,
@@ -162,5 +162,18 @@ mod tests {
         assert!(series[0].contains(r#"backend="redis""#), "{series:?}");
 
         assert!(encoded.trim_end().ends_with("# EOF"), "not OpenMetrics");
+    }
+
+    #[test]
+    fn build_info_renders_redis_cluster_backend_label() {
+        let mut registry = new_registry();
+        register_build_info(
+            &mut registry,
+            &BackendConfig::RedisCluster {
+                urls: vec!["redis://n1:6379".to_string(), "redis://n2:6379".to_string()],
+            },
+        );
+        let encoded = encode_text(&registry).unwrap_or_else(|_| String::from("<encode failed>"));
+        assert!(encoded.contains(r#"backend="redis-cluster""#), "{encoded}");
     }
 }

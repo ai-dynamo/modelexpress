@@ -111,8 +111,10 @@ pub const DEFAULT_NGC_API_BASE: &str = "https://api.ngc.nvidia.com";
 pub const DEFAULT_NGC_AUTHN_BASE: &str = "https://authn.nvidia.com";
 
 // ── Redis / metadata backend (server) ───────────────────────────────────────
-/// Selects the metadata backend implementation (`redis`, `kubernetes`, `memory`).
+/// Selects the metadata backend implementation (`redis`, `redis-cluster`, `kubernetes`, `memory`).
 pub const MX_METADATA_BACKEND: &str = "MX_METADATA_BACKEND";
+/// Redis deployment topology (`"standalone"` or `"cluster"`). Defaults to `"standalone"`.
+pub const MX_REDIS_MODE: &str = "MX_REDIS_MODE";
 /// Full Redis connection URL (preferred) for the redis metadata backend.
 pub const MX_REDIS_URL: &str = "MX_REDIS_URL";
 /// Full Redis connection URL alias for charts predating the `MX_` prefix.
@@ -125,6 +127,16 @@ pub const REDIS_HOST: &str = "REDIS_HOST";
 pub const MX_REDIS_PORT: &str = "MX_REDIS_PORT";
 /// Redis port alias for charts predating the `MX_` prefix.
 pub const REDIS_PORT: &str = "REDIS_PORT";
+/// Redis Cluster TCP connect timeout in milliseconds (default 5000).
+pub const MX_REDIS_CONNECTION_TIMEOUT_MS: &str = "MX_REDIS_CONNECTION_TIMEOUT_MS";
+/// Redis Cluster command response timeout in milliseconds (default 10000).
+pub const MX_REDIS_RESPONSE_TIMEOUT_MS: &str = "MX_REDIS_RESPONSE_TIMEOUT_MS";
+/// Maximum number of retries for Redis Cluster topology/command errors (default 8).
+pub const MX_REDIS_CLUSTER_RETRIES: &str = "MX_REDIS_CLUSTER_RETRIES";
+/// Initial backoff delay in milliseconds between Redis Cluster retries (default 50).
+pub const MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS: &str = "MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS";
+/// Maximum backoff delay in milliseconds between Redis Cluster retries (default 2000).
+pub const MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS: &str = "MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS";
 /// Kubernetes namespace for ModelCacheEntry CRs (overrides [`POD_NAMESPACE`]).
 pub const MX_METADATA_NAMESPACE: &str = "MX_METADATA_NAMESPACE";
 /// Kubernetes namespace injected via the downward API for in-cluster pods.
@@ -185,6 +197,13 @@ const DEFAULT_GC_TIMEOUT_SECS: u64 = 3600;
 /// Default collective-refit transfer timeout, matching the Python client's
 /// `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` default of 600.0 seconds.
 const DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_SECS: u64 = 600;
+
+// ── Default Redis Cluster client timings ────────────────────────────────────
+const DEFAULT_REDIS_CONNECTION_TIMEOUT_MS: u64 = 5_000;
+const DEFAULT_REDIS_RESPONSE_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_REDIS_CLUSTER_RETRIES: u32 = 8;
+const DEFAULT_REDIS_CLUSTER_MIN_RETRY_WAIT_MS: u64 = 50;
+const DEFAULT_REDIS_CLUSTER_MAX_RETRY_WAIT_MS: u64 = 2_000;
 
 // ── Getters ───────────────────────────────────────────────────────────────
 
@@ -290,6 +309,15 @@ pub fn redis_url() -> Option<String> {
     env::var(MX_REDIS_URL).or_else(|_| env::var(REDIS_URL)).ok()
 }
 
+/// Raw [`MX_REDIS_MODE`] value if set and non-empty after trimming.
+#[must_use]
+pub fn redis_mode() -> Option<String> {
+    env::var(MX_REDIS_MODE)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Redis host from [`MX_REDIS_HOST`], then [`REDIS_HOST`].
 pub fn redis_host() -> Option<String> {
     env::var(MX_REDIS_HOST)
@@ -302,6 +330,69 @@ pub fn redis_port() -> Option<String> {
     env::var(MX_REDIS_PORT)
         .or_else(|_| env::var(REDIS_PORT))
         .ok()
+}
+
+/// Redis Cluster TCP connect timeout in milliseconds
+/// ([`MX_REDIS_CONNECTION_TIMEOUT_MS`], default 5000).
+#[must_use]
+pub fn redis_connection_timeout_ms() -> u64 {
+    env_positive_u64(
+        MX_REDIS_CONNECTION_TIMEOUT_MS,
+        DEFAULT_REDIS_CONNECTION_TIMEOUT_MS,
+    )
+}
+
+/// Redis Cluster command response timeout in milliseconds
+/// ([`MX_REDIS_RESPONSE_TIMEOUT_MS`], default 10000).
+#[must_use]
+pub fn redis_response_timeout_ms() -> u64 {
+    env_positive_u64(
+        MX_REDIS_RESPONSE_TIMEOUT_MS,
+        DEFAULT_REDIS_RESPONSE_TIMEOUT_MS,
+    )
+}
+
+/// Maximum number of retries on Redis Cluster topology/command errors
+/// ([`MX_REDIS_CLUSTER_RETRIES`], default 8; `0` disables retries).
+#[must_use]
+pub fn redis_cluster_retries() -> u32 {
+    let Ok(raw) = env::var(MX_REDIS_CLUSTER_RETRIES) else {
+        return DEFAULT_REDIS_CLUSTER_RETRIES;
+    };
+    match raw.trim().parse::<u32>() {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::warn!(
+                var = MX_REDIS_CLUSTER_RETRIES,
+                value = ?raw,
+                default = DEFAULT_REDIS_CLUSTER_RETRIES,
+                "value is not a non-negative u32 integer; using the default"
+            );
+            DEFAULT_REDIS_CLUSTER_RETRIES
+        }
+    }
+}
+
+/// Initial Redis Cluster retry backoff in milliseconds
+/// ([`MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS`], default 50).
+#[must_use]
+pub fn redis_cluster_min_retry_wait_ms() -> u64 {
+    env_positive_u64(
+        MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS,
+        DEFAULT_REDIS_CLUSTER_MIN_RETRY_WAIT_MS,
+    )
+}
+
+/// Maximum Redis Cluster retry backoff in milliseconds
+/// ([`MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS`], default 2000), clamped to at least
+/// [`redis_cluster_min_retry_wait_ms`].
+#[must_use]
+pub fn redis_cluster_max_retry_wait_ms() -> u64 {
+    env_positive_u64(
+        MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS,
+        DEFAULT_REDIS_CLUSTER_MAX_RETRY_WAIT_MS,
+    )
+    .max(redis_cluster_min_retry_wait_ms())
 }
 
 /// Kubernetes namespace from [`MX_METADATA_NAMESPACE`], then [`POD_NAMESPACE`].
@@ -359,6 +450,26 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Read an environment variable as a positive `u64` (> 0), logging a warning and
+/// returning `default` if unset/unparseable or zero.
+fn env_positive_u64(name: &str, default: u64) -> u64 {
+    let Ok(raw) = env::var(name) else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            tracing::warn!(
+                var = name,
+                value = ?raw,
+                default,
+                "value is not a positive integer; using the default"
+            );
+            default
+        }
+    }
 }
 
 /// Largest number of seconds [`env_secs_ceil`] returns. The value ends up as a
@@ -462,12 +573,27 @@ mod tests {
         assert_eq!(NGC_CLI_API_KEY, "NGC_CLI_API_KEY");
         assert_eq!(NGC_CLI_HOME, "NGC_CLI_HOME");
         assert_eq!(MX_METADATA_BACKEND, "MX_METADATA_BACKEND");
+        assert_eq!(MX_REDIS_MODE, "MX_REDIS_MODE");
         assert_eq!(MX_REDIS_URL, "MX_REDIS_URL");
         assert_eq!(REDIS_URL, "REDIS_URL");
         assert_eq!(MX_REDIS_HOST, "MX_REDIS_HOST");
         assert_eq!(REDIS_HOST, "REDIS_HOST");
         assert_eq!(MX_REDIS_PORT, "MX_REDIS_PORT");
         assert_eq!(REDIS_PORT, "REDIS_PORT");
+        assert_eq!(
+            MX_REDIS_CONNECTION_TIMEOUT_MS,
+            "MX_REDIS_CONNECTION_TIMEOUT_MS"
+        );
+        assert_eq!(MX_REDIS_RESPONSE_TIMEOUT_MS, "MX_REDIS_RESPONSE_TIMEOUT_MS");
+        assert_eq!(MX_REDIS_CLUSTER_RETRIES, "MX_REDIS_CLUSTER_RETRIES");
+        assert_eq!(
+            MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS,
+            "MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS"
+        );
+        assert_eq!(
+            MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS,
+            "MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS"
+        );
         assert_eq!(MX_METADATA_NAMESPACE, "MX_METADATA_NAMESPACE");
         assert_eq!(POD_NAMESPACE, "POD_NAMESPACE");
         assert_eq!(MX_REAPER_SCAN_INTERVAL_SECS, "MX_REAPER_SCAN_INTERVAL_SECS");
@@ -562,6 +688,13 @@ mod tests {
         let _n1 = EnvVarGuard::remove(&lock, MX_METADATA_NAMESPACE);
         let _n2 = EnvVarGuard::set(&lock, POD_NAMESPACE, "pod-ns");
         assert_eq!(metadata_namespace().as_deref(), Some("pod-ns"));
+
+        let _m = EnvVarGuard::remove(&lock, MX_REDIS_MODE);
+        assert_eq!(redis_mode(), None);
+        let _m = EnvVarGuard::set(&lock, MX_REDIS_MODE, "   ");
+        assert_eq!(redis_mode(), None);
+        let _m = EnvVarGuard::set(&lock, MX_REDIS_MODE, "  cluster  ");
+        assert_eq!(redis_mode().as_deref(), Some("cluster"));
     }
 
     #[test]
@@ -615,5 +748,62 @@ mod tests {
         let at_cap = MAX_ENV_SECS.to_string();
         let _g = EnvVarGuard::set(&lock, name, &at_cap);
         assert_eq!(nccl_refit_transfer_timeout_secs(), MAX_ENV_SECS);
+    }
+
+    #[test]
+    fn redis_cluster_timeout_and_retry_getters_default_parse_and_clamp() {
+        let lock = acquire_env_mutex();
+        let _c = EnvVarGuard::remove(&lock, MX_REDIS_CONNECTION_TIMEOUT_MS);
+        let _r = EnvVarGuard::remove(&lock, MX_REDIS_RESPONSE_TIMEOUT_MS);
+        let _n = EnvVarGuard::remove(&lock, MX_REDIS_CLUSTER_RETRIES);
+        let _min = EnvVarGuard::remove(&lock, MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS);
+        let _max = EnvVarGuard::remove(&lock, MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS);
+
+        assert_eq!(
+            redis_connection_timeout_ms(),
+            DEFAULT_REDIS_CONNECTION_TIMEOUT_MS
+        );
+        assert_eq!(
+            redis_response_timeout_ms(),
+            DEFAULT_REDIS_RESPONSE_TIMEOUT_MS
+        );
+        assert_eq!(redis_cluster_retries(), DEFAULT_REDIS_CLUSTER_RETRIES);
+        assert_eq!(
+            redis_cluster_min_retry_wait_ms(),
+            DEFAULT_REDIS_CLUSTER_MIN_RETRY_WAIT_MS
+        );
+        assert_eq!(
+            redis_cluster_max_retry_wait_ms(),
+            DEFAULT_REDIS_CLUSTER_MAX_RETRY_WAIT_MS
+        );
+
+        let _c = EnvVarGuard::set(&lock, MX_REDIS_CONNECTION_TIMEOUT_MS, " 7500 ");
+        let _r = EnvVarGuard::set(&lock, MX_REDIS_RESPONSE_TIMEOUT_MS, "15000");
+        let _n = EnvVarGuard::set(&lock, MX_REDIS_CLUSTER_RETRIES, "0");
+        let _min = EnvVarGuard::set(&lock, MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS, "100");
+        let _max = EnvVarGuard::set(&lock, MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS, "5000");
+        assert_eq!(redis_connection_timeout_ms(), 7_500);
+        assert_eq!(redis_response_timeout_ms(), 15_000);
+        assert_eq!(redis_cluster_retries(), 0);
+        assert_eq!(redis_cluster_min_retry_wait_ms(), 100);
+        assert_eq!(redis_cluster_max_retry_wait_ms(), 5_000);
+
+        // Zero or invalid values fall back to defaults, and max is clamped >= min.
+        let _c = EnvVarGuard::set(&lock, MX_REDIS_CONNECTION_TIMEOUT_MS, "0");
+        let _r = EnvVarGuard::set(&lock, MX_REDIS_RESPONSE_TIMEOUT_MS, "not-a-num");
+        let _n = EnvVarGuard::set(&lock, MX_REDIS_CLUSTER_RETRIES, "-1");
+        let _min = EnvVarGuard::set(&lock, MX_REDIS_CLUSTER_MIN_RETRY_WAIT_MS, "3000");
+        let _max = EnvVarGuard::set(&lock, MX_REDIS_CLUSTER_MAX_RETRY_WAIT_MS, "500");
+        assert_eq!(
+            redis_connection_timeout_ms(),
+            DEFAULT_REDIS_CONNECTION_TIMEOUT_MS
+        );
+        assert_eq!(
+            redis_response_timeout_ms(),
+            DEFAULT_REDIS_RESPONSE_TIMEOUT_MS
+        );
+        assert_eq!(redis_cluster_retries(), DEFAULT_REDIS_CLUSTER_RETRIES);
+        assert_eq!(redis_cluster_min_retry_wait_ms(), 3_000);
+        assert_eq!(redis_cluster_max_retry_wait_ms(), 3_000);
     }
 }

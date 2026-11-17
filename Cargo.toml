@@ -70,7 +70,7 @@ tower = { version = "0.5.3", features = ["util"] }
 http = "1.4.1"
 moka = { version = "0.12.15", features = ["future"] }
 secrecy = "0.10.3"
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "cluster-async"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 
 # Kubernetes client (kube-rs) for CRD-based metadata backend
