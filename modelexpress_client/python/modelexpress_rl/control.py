@@ -265,12 +265,17 @@ class ModelExpressControlClient:
         base_version_id: str | None = None,
         object_storage: ObjectStorageSource | None = None,
         state: WeightVersionState = WeightVersionState.STAGING,
+        max_trainer_readers: int = 0,
     ) -> WeightVersion:
-        """Create one global version with its initial lifecycle state."""
+        """Create one global version with its initial lifecycle state. A nonzero
+        ``max_trainer_readers`` lets at most that many generator reader groups read the version
+        from the trainer at once, so the rest copy it from peers that installed it."""
         _required(model_name, "model_name")
         _required(idempotency_key, "idempotency_key")
         if payload_format is WeightPayloadFormat.UNSPECIFIED:
             raise ValueError("payload_format must be specified")
+        if max_trainer_readers < 0:
+            raise ValueError("max_trainer_readers must be 0 (no limit) or positive")
         if state not in {WeightVersionState.STAGING, WeightVersionState.READY}:
             raise ValueError("new weight version state must be STAGING or READY")
         if object_storage is not None and not isinstance(
@@ -297,6 +302,7 @@ class ModelExpressControlClient:
                 WeightVersionState.STAGING: refit_pb2.WEIGHT_VERSION_STATE_STAGING,
                 WeightVersionState.READY: refit_pb2.WEIGHT_VERSION_STATE_READY,
             }[state],
+            max_trainer_readers=max_trainer_readers,
         )
         if uid is not None:
             request.uid = _required(uid, "uid")

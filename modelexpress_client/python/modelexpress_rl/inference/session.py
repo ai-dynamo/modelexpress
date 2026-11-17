@@ -82,7 +82,7 @@ class WeightUpdateSession:
         methods: tuple[UpdateMethod, ...],
         installer: EngineInstaller,
         max_transfer_attempts: int,
-        start_lease: Callable[[str], Any],
+        start_lease: Callable[..., Any],
         resolve_replay_chain: Callable[[WeightVersion], tuple[WeightVersion, ...]]
         | None = None,
     ) -> None:
@@ -149,7 +149,7 @@ class WeightUpdateSession:
         resolver: SourceResolver,
     ) -> SessionUpdate:
         with refit_span("setup_registration"):
-            lease = self._start_lease(version.version_id)
+            lease = self._start_lease(version.version_id, source=resolver.kind)
         try:
             plan, prepared = self._prepare_candidates(version, resolver=resolver)
             return SessionUpdate(plan=plan, prepared=prepared, lease=lease)
@@ -277,7 +277,7 @@ class WeightUpdateSession:
         try:
             with refit_span("setup_registration"):
                 for version in versions:
-                    leases.append(self._start_lease(version.version_id))
+                    leases.append(self._start_lease(version.version_id, source=resolver.kind))
         except BaseException as primary_error:
             self._close_lease(
                 _LeaseGroup(leases), versions[-1].version_id, primary_error

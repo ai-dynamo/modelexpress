@@ -621,7 +621,9 @@ def test_binding_manifest_is_available_before_version_publication():
 
 
 @pytest.fixture
-def lifecycle_trainer(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
+def lifecycle_trainer(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> Iterator[SimpleNamespace]:
     service = _RefitService()
     service.mesh_id = "mesh-a"
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=2))
@@ -641,6 +643,7 @@ def lifecycle_trainer(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespa
         rpc_timeout_seconds=0.1, registration_ttl_seconds=60,
         staging_mode=TrainerStagingMode.COPY_TO_DEVICE,
         payload_format=WeightPayloadFormat.FULL_TENSOR,
+        release_after_trainer_reads=getattr(request, "param", False),
     ))
     trainer.bind_tensors("model")
     with grpc.insecure_channel(publisher.endpoint) as channel:
@@ -685,6 +688,35 @@ def test_replacement_waits_for_every_published_version_to_release(
     assert [publication.version_id for publication in case.service.shards] == [
         "version-a", "version-b", "version-b", "version-c",
     ]
+
+
+@pytest.mark.parametrize("lifecycle_trainer", [False, True], indirect=True)
+def test_release_waits_only_for_trainer_readers_when_configured(
+    lifecycle_trainer: SimpleNamespace, request: pytest.FixtureRequest,
+) -> None:
+    case = lifecycle_trainer
+    case.trainer.publish_version(version=WeightVersionRef("version-a"))
+
+    case.trainer.release_version(version=WeightVersionRef("version-a"))
+
+    expected = request.node.callspec.params["lifecycle_trainer"]
+    assert [shard.wait_for_trainer_readers_only for shard in case.service.deleted_shards] == [expected]
+
+
+@pytest.mark.parametrize("timeout", [0, 0.2])
+def test_release_with_a_timeout_reports_a_version_still_read(
+    lifecycle_trainer: SimpleNamespace, timeout: float
+) -> None:
+    case = lifecycle_trainer
+    version = WeightVersionRef("version-a")
+    case.trainer.publish_version(version=version)
+    case.service.lease_active = True
+
+    held = case.trainer.release_version(version=version, timeout=timeout)
+    case.service.lease_active = False
+    released = case.trainer.release_version(version=version, timeout=timeout)
+
+    assert (held, released, len(case.service.deleted_shards)) == (False, True, 1)
 
 
 def test_same_mesh_generation_keeps_stable_metadata_digest(

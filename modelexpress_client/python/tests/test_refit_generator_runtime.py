@@ -232,7 +232,7 @@ def test_object_storage_runtime_preserves_source_order(
         max_transfer_attempts=3,
         rpc_timeout_seconds=30,
         service=lambda: object(),
-        start_lease=lambda _version_id: object(),
+        start_lease=lambda _version_id, **_: object(),
         resolve_replay_chain=resolve_chain,
     )
 
@@ -324,7 +324,7 @@ def test_missing_inference_context_uses_object_storage_without_p2p(
         max_transfer_attempts=3,
         rpc_timeout_seconds=30,
         service=lambda: object(),
-        start_lease=lambda _version_id: object(),
+        start_lease=lambda _version_id, **_: object(),
         resolve_replay_chain=resolve_chain,
     )
 
@@ -398,7 +398,7 @@ def test_runtime_validates_streaming_support_before_allocating_transfers(
         max_transfer_attempts=3,
         rpc_timeout_seconds=30,
         service=lambda: pytest.fail("initialization must not perform source discovery"),
-        start_lease=lambda _version_id: pytest.fail("initialization must not acquire leases"),
+        start_lease=lambda _version_id, **_: pytest.fail("initialization must not acquire leases"),
         streaming=StreamingSettings(512) if bounded else None,
     )
     expected = PreparedStreamingTensors if bounded else PreparedEngineTensors
@@ -451,7 +451,7 @@ def test_trainer_only_runtime_does_not_open_generator_listener(monkeypatch):
         max_transfer_attempts=3,
         rpc_timeout_seconds=30,
         service=lambda: object(),
-        start_lease=lambda _version_id: object(),
+        start_lease=lambda _version_id, **_: object(),
     )
 
     assert transfer_kwargs["listen_port"] is None
@@ -501,7 +501,7 @@ def test_object_storage_runtime_survives_p2p_initialization_failure(
         max_transfer_attempts=3,
         rpc_timeout_seconds=30,
         service=lambda: object(),
-        start_lease=lambda _version_id: object(),
+        start_lease=lambda _version_id, **_: object(),
     )
 
     assert runtime.methods == (canonical,)
@@ -548,7 +548,7 @@ def test_generator_runtime_closes_resources_when_resolver_creation_fails(
             max_transfer_attempts=3,
             rpc_timeout_seconds=30,
             service=lambda: object(),
-            start_lease=lambda _version_id: object(),
+            start_lease=lambda _version_id, **_: object(),
         )
 
     assert full_tensor.closed

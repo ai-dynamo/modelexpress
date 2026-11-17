@@ -328,6 +328,36 @@ def test_tensor_read_drain_timeout_restores_source_availability():
         server.stop(grace=None)
 
 
+def test_tensor_read_beyond_max_readers_is_refused_until_one_releases(monkeypatch):
+    monkeypatch.setenv("MX_MAX_TENSOR_READERS", "1")
+    server = WorkerGrpcServer(
+        tensor_protos=[],
+        mx_source_id="source-123",
+        port=0,
+        worker_id="generation-1",
+    )
+    endpoint = f"127.0.0.1:{server.start()}"
+    lease, _ = prepare_tensor_read(
+        endpoint, "source-123", worker_id="generation-1", timeout=1.0
+    )
+    try:
+        with pytest.raises(grpc.RpcError) as refused:
+            prepare_tensor_read(
+                endpoint, "source-123", worker_id="generation-1", timeout=1.0
+            )
+        assert refused.value.code() == grpc.StatusCode.RESOURCE_EXHAUSTED, refused.value
+
+        lease.release()
+        next_lease, _ = prepare_tensor_read(
+            endpoint, "source-123", worker_id="generation-1", timeout=1.0
+        )
+        next_lease.release()
+        next_lease.close()
+    finally:
+        lease.close()
+        server.stop(grace=None)
+
+
 def test_abandoned_tensor_read_lease_expires_without_client_cleanup(monkeypatch):
     monkeypatch.setattr(
         "modelexpress.metadata.worker_server._tensor_read_lease_timeout_seconds",

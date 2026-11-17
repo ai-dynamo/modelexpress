@@ -39,6 +39,7 @@ class FullTensorNixlPublicationMethod:
         service: Callable[[], refit_pb2_grpc.RefitServiceStub],
         worker_id: str,
         rpc_timeout_seconds: float,
+        release_after_trainer_reads: bool = False,
     ) -> None:
         if staging_mode not in adapter.supported_staging_modes:
             raise ValueError(
@@ -55,6 +56,7 @@ class FullTensorNixlPublicationMethod:
         self._service = service
         self._worker_id = worker_id
         self._rpc_timeout_seconds = rpc_timeout_seconds
+        self._release_after_trainer_reads = release_after_trainer_reads
         self.published: dict[str, list[StagedWeightVersionShardData]] = {}
         self._metadata_identity: MeshIdentity | None = None
         self._metadata_digest: str | None = None
@@ -181,36 +183,39 @@ class FullTensorNixlPublicationMethod:
                 timeout=self._rpc_timeout_seconds,
             )
 
-    def release(self, *, version: WeightVersionRef) -> None:
+    def release(self, *, version: WeightVersionRef, timeout: float | None = None) -> bool:
         if version.version_id not in self.published:
-            return
+            return True
         logical_shard_id = self.logical_shard_id
         request = refit_pb2.DeleteWeightVersionShardRequest(
             version_id=version.version_id,
             logical_shard_id=logical_shard_id,
             worker_id=self._worker_id,
+            wait_for_trainer_readers_only=self._release_after_trainer_reads,
         )
-        deadline = monotonic() + self._rpc_timeout_seconds
+        deadline = monotonic() + (self._rpc_timeout_seconds if timeout is None else timeout)
         # Publication buffers must outlive every generator reader lease.
         while True:
             try:
-                self._service().DeleteWeightVersionShard(
-                    request, timeout=max(deadline - monotonic(), 0.001)
-                )
+                self._service().DeleteWeightVersionShard(request, timeout=self._rpc_timeout_seconds)
                 break
             except grpc.RpcError as error:
                 if (
                     error.code() is not grpc.StatusCode.FAILED_PRECONDITION
                     or error.details() != "weight version has an active lease"
-                    or monotonic() >= deadline
                 ):
                     raise
+                if monotonic() >= deadline:
+                    if timeout is None:
+                        raise
+                    return False
                 sleep(min(0.05, max(deadline - monotonic(), 0)))
         self._manifest_publisher.release_version_metadata(
             version_id=version.version_id,
             logical_shard_id=logical_shard_id,
         )
         del self.published[version.version_id]
+        return True
 
     def close(self) -> None:
         self.published.clear()

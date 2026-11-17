@@ -49,12 +49,24 @@ class _ArtifactSource:
     chunk_manager: Any
 
 
-class _TensorReadLeases:
-    """Protect published tensor storage while peers are reading it."""
+class _TensorSourceBusy(RuntimeError):
+    """The source already serves as many readers as it accepts; read another."""
 
-    def __init__(self) -> None:
+
+class _TensorReadLeases:
+    """Protect published tensor storage while peers are reading it.
+
+    ``max_readers`` bounds concurrent readers so they do not share one source's
+    network. A refused peer reads from another source, and the readers of this
+    one become sources themselves. Zero serves any number of readers.
+    """
+
+    def __init__(self, max_readers: int = 0) -> None:
+        if max_readers < 0:
+            raise ValueError("max tensor readers must not be negative")
         self._condition = Condition()
         self._accepting = True
+        self._max_readers = max_readers
         self._leases: dict[str, float] = {}
 
     def prepare(self, timeout_seconds: int) -> str:
@@ -64,6 +76,10 @@ class _TensorReadLeases:
             self._drop_expired_locked()
             if not self._accepting:
                 raise RuntimeError("tensor source is draining")
+            if self._max_readers and len(self._leases) >= self._max_readers:
+                raise _TensorSourceBusy(
+                    f"tensor source is serving its maximum of {self._max_readers} readers"
+                )
             lease_id = uuid.uuid4().hex
             self._leases[lease_id] = time.monotonic() + timeout_seconds
             return lease_id
@@ -136,7 +152,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         self._worker_rank = worker_rank
         self._accelerator = accelerator
         self._worker_id = worker_id
-        self._tensor_read_leases = _TensorReadLeases()
+        self._tensor_read_leases = _TensorReadLeases(envs.MX_MAX_TENSOR_READERS)
         self._tensor_read_lease_timeout = _tensor_read_lease_timeout_seconds()
         self._artifact_sources: dict[str, _ArtifactSource] = {}
         self._artifact_lock = Lock()
@@ -244,6 +260,8 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             return self._tensor_read_leases.prepare(
                 self._tensor_read_lease_timeout
             )
+        except _TensorSourceBusy as error:
+            context.abort(grpc.StatusCode.RESOURCE_EXHAUSTED, str(error))
         except RuntimeError as error:
             context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
 
