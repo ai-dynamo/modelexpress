@@ -75,6 +75,21 @@ _callbacks_initialized = False
 _init_lock = threading.Lock()
 
 
+def pool_release_safe_in_pool_scope() -> bool:
+    """Whether a MemPool can be destroyed while the caller sits inside
+    another allocate-to-pool scope.
+
+    Up to torch 2.12, emptying a pool asserts captures_underway.empty(),
+    which counts every active mempool diversion, so destroying our pool
+    inside vLLM's sleep-mode pool aborts the process. From torch 2.13 the
+    assert is !is_capture_context(), which only checks for a real CUDA
+    stream capture.
+    """
+    import torch
+
+    return torch.__version__ >= (2, 13)
+
+
 class ArenaUnavailableError(RuntimeError):
     """Raised when arena machinery is requested but _vmm_alloc_ext failed
     to build or import. Catch this in callers that want a graceful
@@ -182,8 +197,9 @@ def use_arena(
 
     Pass release_idle=False when the caller itself runs inside another
     allocate-to-pool scope (vLLM sleep mode wraps model loading in its own
-    pool). Destroying a MemPool there trips an allocator assert, so the pool
-    is kept alive instead and its idle segments stay mapped, as before.
+    pool) and pool_release_safe_in_pool_scope() is False. Destroying a
+    MemPool there trips an allocator assert on those torch versions, so the
+    pool is kept alive instead and its idle segments stay mapped, as before.
 
     Only one arena can be active at a time per process; nested or
     concurrent use_arena calls raise RuntimeError.

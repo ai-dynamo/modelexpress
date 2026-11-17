@@ -346,9 +346,13 @@ class MxModelLoader(BaseModelLoader):
         # timers only bracket existing calls; nothing here changes load order.
         model_id = ctx.identity.model_name
         with metrics.time_load("vllm", model_id, model_role):
-            # vLLM sleep mode loads inside its own memory pool, where the
-            # arena's pool cannot be released on exit.
-            release_idle = not getattr(model_config, "enable_sleep_mode", False)
+            # vLLM sleep mode loads inside its own memory pool, where torch
+            # before 2.13 cannot destroy the arena's pool on exit.
+            release_idle = True
+            if getattr(model_config, "enable_sleep_mode", False):
+                from ...vmm import hook as vmm_hook
+
+                release_idle = vmm_hook.pool_release_safe_in_pool_scope()
             with maybe_enter_vmm_arena(ctx, release_idle=release_idle):
                 if ctx.p2p_enabled and ctx.p2p_role == "main":
                     with metrics.time_load_phase("vllm", model_id, "artifact_install"):

@@ -374,6 +374,26 @@ class TestUseArenaPoolLifetime:
         assert events == ["activate", "pool_created", "deactivate"]
         assert len(vmm_hook._retained_pools) == 1
 
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ("2.10.0+cu128", False),
+            ("2.12.1", False),
+            ("2.13.0", True),
+            ("2.14.0+cu130", True),
+        ],
+    )
+    def test_pool_release_safe_in_pool_scope_by_torch_version(
+        self, monkeypatch, version, expected
+    ):
+        torch = pytest.importorskip("torch")
+        from torch.torch_version import TorchVersion
+
+        from modelexpress.vmm import hook as vmm_hook
+
+        monkeypatch.setattr(torch, "__version__", TorchVersion(version))
+        assert vmm_hook.pool_release_safe_in_pool_scope() is expected
+
     def test_nesting_check_runs_before_pool_creation(self, monkeypatch):
         torch = pytest.importorskip("torch")
         import torch.cuda.memory as torch_cuda_memory
