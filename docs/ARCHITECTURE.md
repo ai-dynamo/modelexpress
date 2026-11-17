@@ -1175,12 +1175,17 @@ graph TD
 Zero-byte and unallocated (null-address) tensors remain in manifests and
 participate in exact name, size, and dtype validation. On the sender they stay
 in the published manifest but are excluded from NIXL registration; on the
-receiver they count as matched tensors but are omitted from NIXL descriptor
-lists because they have no registered memory range; a nonzero-size tensor
-skipped this way logs a warning, since the local tensor keeps its current
-values. Arena registration ignores such tensors in its containment check. Both
-sides share one predicate for this. A manifest made entirely of empty tensors completes as a
-successful no-op transfer.
+receiver zero-byte tensors count as matched but are omitted from NIXL
+descriptor lists. A nonzero-size source tensor without an address is rejected
+when exact matching is required; otherwise it is skipped with a warning and
+the receive is recorded as partial, since the local tensor keeps its current
+values. A source with payload matched to a nonzero-size local tensor without
+an address is rejected in every mode before preparing NIXL descriptors.
+Arena and additional-tensor registration exclude both empty and unallocated
+tensors from memory-range and contiguity checks, while retaining their names
+in the catalog. All registration paths share the same memory-range predicate.
+A manifest made entirely of zero-byte tensors completes as a successful no-op
+transfer, including in exact-match mode.
 
 Tarred cache artifacts carry regular files and directories only. The source
 side enumerates members explicitly and hands tar that list, so nothing else can
