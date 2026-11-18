@@ -143,12 +143,20 @@ reports the requested version and the desired-version ConfigMap is updated.
 A failed update leaves paused generators paused. Inspect the failure before
 restarting a generator; its startup uses the last persisted desired version.
 
+#### Requirements
+
 Use a dedicated namespace with the Dynamo v1beta1 operator, one available GPU,
 `hf-token-secret`, and `nvcr-imagepullsecret`. Populate the `shared-model-cache`
 PVC with a complete Hugging Face checkpoint, including model configuration and
 tokenizer files. The example mounts this checkpoint read-only. Its default model
 is `Qwen/Qwen3-0.6B`, the small model used by the existing S3 example. Changing
 models can require larger memory, GPU, and cache limits in the manifests.
+
+Install `kubectl` and `envsubst`. Prepare the namespace, secrets, and model PVC
+before running the example. Resource names are fixed; use a fresh namespace for
+each run.
+
+#### Build
 
 Build from the repository root. Use matching Dynamo source and frontend image
 revisions. The following pair is also used by the S3 example:
@@ -164,7 +172,13 @@ docker buildx build --platform linux/amd64 \
   -f examples/rl/dynamo_vllm_azure_refit/Dockerfile \
   --build-context dynamo=/tmp/dynamo-azure-example \
   --push -t "$WORKER_IMAGE" .
+```
 
+#### Run
+
+For Blob recovery with one generator:
+
+```bash
 export NAMESPACE=my-azure-refit-example
 export RUN_ID="azure-$(date +%s)"
 export MODEL_NAME=Qwen/Qwen3-0.6B
@@ -180,10 +194,10 @@ NAMESPACE=my-azure-refit-p2p SCENARIO=p2p RUN_ID="azure-p2p-$(date +%s)" \
   examples/rl/dynamo_vllm_azure_refit/run.sh
 ```
 
-The script requires `kubectl` and `envsubst`. Prepare the namespace, secrets, and
-model PVC before running it. Resource names are fixed; use a fresh namespace for
-each run. The script leaves resources for inspection. To remove them, delete
+The script leaves resources for inspection. To remove them, delete
 the dedicated namespace when its model PVC is no longer needed.
+
+#### Validation
 
 Azurite uses public example credentials and temporary storage. Redis also has no
 persistence in this example. The restart check replaces only the generator; it
