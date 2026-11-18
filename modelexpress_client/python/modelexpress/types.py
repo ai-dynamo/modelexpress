@@ -8,12 +8,13 @@ from dataclasses import dataclass
 
 @dataclass
 class TensorDescriptor:
-    """Descriptor for a tensor in GPU memory."""
+    """Descriptor for a tensor in accelerator or host memory."""
     name: str
     addr: int
     size: int
     device_id: int
     dtype: str
+    mem_type: int = 0
 
 
 @dataclass

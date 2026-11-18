@@ -127,21 +127,31 @@ message SourceIdentity {
 // Tensor Descriptors
 // ============================================================================
 
+// Where a tensor's bytes live, as NIXL registers them.
+enum TensorMemoryType {
+  TENSOR_MEMORY_TYPE_VRAM = 0;  // accelerator memory (default)
+  TENSOR_MEMORY_TYPE_DRAM = 1;  // host memory
+}
+
 message TensorDescriptor {
   // Tensor name (e.g., "model.layers.0.self_attn.q_proj.weight")
   string name = 1;
 
-  // GPU memory address
+  // Memory address (device or host, see mem_type)
   uint64 addr = 2;
 
   // Size in bytes
   uint64 size = 3;
 
-  // GPU device ID (0-7 for 8-GPU setup)
+  // Accelerator device ID (0-7 for 8-GPU setup); 0 for host memory
   uint32 device_id = 4;
 
   // Data type (e.g., "float16", "bfloat16")
   string dtype = 5;
+
+  // Memory type of addr. Old publishers leave this unset, which decodes as
+  // VRAM, the only kind published before this field existed.
+  TensorMemoryType mem_type = 6;
 }
 
 // Small discovery summary for file-backed artifact sources. This does not carry

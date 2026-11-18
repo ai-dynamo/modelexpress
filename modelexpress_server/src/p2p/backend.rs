@@ -182,6 +182,8 @@ pub struct TensorRecord {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    /// Memory type of addr (maps to `TensorMemoryType` proto enum)
+    pub mem_type: i32,
 }
 
 /// Bounded artifact discovery summary stored with worker metadata.
@@ -241,6 +243,7 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
             size: desc.size,
             device_id: desc.device_id,
             dtype: desc.dtype,
+            mem_type: desc.mem_type,
         }
     }
 }
@@ -299,6 +302,7 @@ impl From<TensorRecord> for modelexpress_common::grpc::p2p::TensorDescriptor {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            mem_type: record.mem_type,
         }
     }
 }
