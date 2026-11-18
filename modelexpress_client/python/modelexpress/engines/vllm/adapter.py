@@ -542,11 +542,16 @@ class VllmAdapter(EngineAdapter):
         return result
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
-        self._release_loader_cache()
-        return self._process_weights_after_loading(result)
+        return self._finish_checkpoint_load(result)
 
     def after_native_load(self, result: LoadResult) -> LoadResult:
-        self._release_loader_cache()
+        return self._finish_checkpoint_load(result)
+
+    def _finish_checkpoint_load(self, result: LoadResult) -> LoadResult:
+        from vllm.model_executor.model_loader.base_loader import _has_online_quant
+
+        if result.model is not None and _has_online_quant(result.model):
+            self._release_loader_cache()
         return self._process_weights_after_loading(result)
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
@@ -609,7 +614,7 @@ class VllmAdapter(EngineAdapter):
         return result
 
     def _release_loader_cache(self) -> None:
-        """Release allocator blocks cached by checkpoint loading.
+        """Release allocator blocks cached by online-quantized checkpoint loading.
 
         Native vLLM does this between ``load_weights`` and post-processing.
         RDMA target preparation skips it and releases the cache only after a

@@ -825,8 +825,8 @@ def test_load_hooks_finalize_online_quant_before_postprocessing(
 ):
     """Check that load hooks finalize layerwise loading only for online quant.
 
-    Checkpoint hooks release the allocator cache first; RDMA target
-    preparation leaves it untouched.
+    Online-quantized checkpoint hooks release the allocator cache before
+    finalization; other loads and RDMA target preparation leave it untouched.
     """
     events = []
 
@@ -839,7 +839,6 @@ def test_load_hooks_finalize_online_quant_before_postprocessing(
     _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
 
     def has_online_quant(model):
-        events.append(("check", model))
         return online_quant
 
     def finalize(model, config):
@@ -860,6 +859,10 @@ def test_load_hooks_finalize_online_quant_before_postprocessing(
 
     adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
     monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.gc.collect",
+        lambda: events.append("gc"),
+    )
+    monkeypatch.setattr(
         adapter.accelerator_backend,
         "empty_cache",
         lambda: events.append("empty_cache"),
@@ -876,11 +879,10 @@ def test_load_hooks_finalize_online_quant_before_postprocessing(
 
     assert getattr(adapter, hook_name)(result) is result
 
-    expected = (
-        ["model_specific"] if hook_name == "before_rdma_receive" else ["empty_cache"]
-    )
-    expected.append(("check", model))
+    expected = ["model_specific"] if hook_name == "before_rdma_receive" else []
     if online_quant:
+        if hook_name != "before_rdma_receive":
+            expected.extend(("gc", "empty_cache"))
         expected.append(("layerwise", model, adapter.model_config))
     expected.append(("process", model, adapter.model_config, torch.device("cpu")))
     assert events == expected
