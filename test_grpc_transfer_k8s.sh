@@ -22,7 +22,9 @@ TIMEOUT_SECONDS=600
 CLEANUP=true
 TEST_MODE="all"  # "cli", "env", or "all"
 KIND_CLUSTER_NAME="${MX_KIND_CLUSTER_NAME:-kind}"
+KUBE_CONTEXT="kind-${KIND_CLUSTER_NAME}"
 CREATED_CLUSTER=false
+CREATED_NAMESPACE=false
 
 # Colors for output
 RED='\033[0;31m'
@@ -84,13 +86,23 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+kind_kubectl() {
+    kubectl --context "$KUBE_CONTEXT" "$@"
+}
+
+kind_helm() {
+    helm --kube-context "$KUBE_CONTEXT" "$@"
+}
+
 cleanup() {
     if [ "$CLEANUP" = true ]; then
-        log_info "Cleaning up Kubernetes resources..."
-        kubectl delete job grpc-transfer-test-cli -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-        kubectl delete job grpc-transfer-test-env -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-        helm uninstall "$RELEASE_NAME" -n "$NAMESPACE" 2>/dev/null || true
-        kubectl delete namespace "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+        if [ "$CREATED_NAMESPACE" = true ]; then
+            log_info "Cleaning up Kubernetes resources..."
+            kind_kubectl delete job grpc-transfer-test-cli -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+            kind_kubectl delete job grpc-transfer-test-env -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+            kind_helm uninstall "$RELEASE_NAME" -n "$NAMESPACE" 2>/dev/null || true
+            kind_kubectl delete namespace "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+        fi
         if [ "$CREATED_CLUSTER" = true ]; then
             log_info "Deleting kind cluster ${KIND_CLUSTER_NAME}..."
             kind delete cluster --name "${KIND_CLUSTER_NAME}" 2>/dev/null || true
@@ -98,10 +110,12 @@ cleanup() {
         log_info "Cleanup complete"
     else
         log_warning "Skipping cleanup (--no-cleanup specified)"
-        log_info "To cleanup manually, run:"
-        echo "  kubectl delete job grpc-transfer-test-cli grpc-transfer-test-env -n $NAMESPACE"
-        echo "  helm uninstall $RELEASE_NAME -n $NAMESPACE"
-        echo "  kubectl delete namespace $NAMESPACE"
+        if [ "$CREATED_NAMESPACE" = true ]; then
+            log_info "To cleanup manually, run:"
+            echo "  kubectl --context $KUBE_CONTEXT delete job grpc-transfer-test-cli grpc-transfer-test-env -n $NAMESPACE"
+            echo "  helm --kube-context $KUBE_CONTEXT uninstall $RELEASE_NAME -n $NAMESPACE"
+            echo "  kubectl --context $KUBE_CONTEXT delete namespace $NAMESPACE"
+        fi
         if [ "$CREATED_CLUSTER" = true ]; then
             echo "  kind delete cluster --name ${KIND_CLUSTER_NAME}"
         fi
@@ -146,13 +160,16 @@ check_prerequisites() {
     else
         log_info "Using existing kind cluster ${KIND_CLUSTER_NAME}"
     fi
+    if ! kubectl config get-contexts "$KUBE_CONTEXT" -o name | grep -qxF -- "$KUBE_CONTEXT"; then
+        log_error "Kubernetes context $KUBE_CONTEXT is unavailable"
+        exit 1
+    fi
     if [ "$CREATED_CLUSTER" = true ]; then
         CONTAINER_IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${KIND_CLUSTER_NAME}-control-plane" 2>/dev/null || true)
         if [ -n "${CONTAINER_IP}" ]; then
             kubectl config set-cluster "kind-${KIND_CLUSTER_NAME}" --server="https://${CONTAINER_IP}:6443" --insecure-skip-tls-verify=true >/dev/null
         fi
     fi
-    kubectl config use-context "kind-${KIND_CLUSTER_NAME}" >/dev/null 2>&1 || true
 
     log_success "Prerequisites met"
 }
@@ -173,13 +190,14 @@ build_and_load_image() {
 
 deploy_server() {
     log_info "Creating namespace: $NAMESPACE"
-    kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+    kind_kubectl create namespace "$NAMESPACE"
+    CREATED_NAMESPACE=true
 
     log_info "Installing ModelExpress CRDs..."
-    kubectl apply -f ./examples/crds.yaml
+    kind_kubectl apply -f ./examples/crds.yaml
 
     log_info "Deploying ModelExpress server with local storage (no PVC)..."
-    helm upgrade --install "$RELEASE_NAME" ./helm \
+    kind_helm upgrade --install "$RELEASE_NAME" ./helm \
         -n "$NAMESPACE" \
         -f ./helm/values-local-storage.yaml \
         --set image.repository="$IMAGE_NAME" \
@@ -190,12 +208,12 @@ deploy_server() {
     log_success "Server deployed"
 
     # Get service name
-    SERVICE_NAME=$(kubectl get svc -n "$NAMESPACE" -l "app.kubernetes.io/instance=$RELEASE_NAME" -o jsonpath='{.items[0].metadata.name}')
+    SERVICE_NAME=$(kind_kubectl get svc -n "$NAMESPACE" -l "app.kubernetes.io/instance=$RELEASE_NAME" -o jsonpath='{.items[0].metadata.name}')
     log_info "Server service: $SERVICE_NAME"
 
     # Wait for pod to be ready
     log_info "Waiting for server pod to be ready..."
-    kubectl wait --for=condition=ready pod \
+    kind_kubectl wait --for=condition=ready pod \
         -l "app.kubernetes.io/instance=$RELEASE_NAME" \
         -n "$NAMESPACE" \
         --timeout="${TIMEOUT_SECONDS}s"
@@ -210,10 +228,10 @@ run_test_cli_flags() {
     log_info "========================================"
     log_info "Testing: --no-shared-storage --transfer-chunk-size 65536"
 
-    SERVICE_NAME=$(kubectl get svc -n "$NAMESPACE" -l "app.kubernetes.io/instance=$RELEASE_NAME" -o jsonpath='{.items[0].metadata.name}')
+    SERVICE_NAME=$(kind_kubectl get svc -n "$NAMESPACE" -l "app.kubernetes.io/instance=$RELEASE_NAME" -o jsonpath='{.items[0].metadata.name}')
 
     # Create Job that uses CLI flags
-    kubectl apply -n "$NAMESPACE" -f - <<EOF
+    kind_kubectl apply -n "$NAMESPACE" -f - <<EOF
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -276,7 +294,7 @@ EOF
     local job_result=""
     while [ $SECONDS -lt $deadline ]; do
         local conditions
-        conditions=$(kubectl get job/grpc-transfer-test-cli -n "$NAMESPACE" \
+        conditions=$(kind_kubectl get job/grpc-transfer-test-cli -n "$NAMESPACE" \
             -o jsonpath='{.status.conditions[*].type}' 2>/dev/null || true)
         if echo "$conditions" | grep -qw "Complete"; then job_result="complete"; break; fi
         if echo "$conditions" | grep -qw "Failed"; then job_result="failed"; break; fi
@@ -284,13 +302,13 @@ EOF
     done
     if [ "$job_result" = "complete" ]; then
         log_info "Job output:"
-        kubectl logs job/grpc-transfer-test-cli -n "$NAMESPACE" | tail -20
+        kind_kubectl logs job/grpc-transfer-test-cli -n "$NAMESPACE" | tail -20
         log_success "CLI flags test PASSED"
         return 0
     else
         log_error "CLI flags test FAILED"
         log_info "Job output:"
-        kubectl logs job/grpc-transfer-test-cli -n "$NAMESPACE" 2>/dev/null | tail -30 || true
+        kind_kubectl logs job/grpc-transfer-test-cli -n "$NAMESPACE" 2>/dev/null | tail -30 || true
         return 1
     fi
 }
@@ -302,10 +320,10 @@ run_test_env_vars() {
     log_info "========================================"
     log_info "Testing: MODEL_EXPRESS_NO_SHARED_STORAGE=true MODEL_EXPRESS_TRANSFER_CHUNK_SIZE=65536"
 
-    SERVICE_NAME=$(kubectl get svc -n "$NAMESPACE" -l "app.kubernetes.io/instance=$RELEASE_NAME" -o jsonpath='{.items[0].metadata.name}')
+    SERVICE_NAME=$(kind_kubectl get svc -n "$NAMESPACE" -l "app.kubernetes.io/instance=$RELEASE_NAME" -o jsonpath='{.items[0].metadata.name}')
 
     # Create Job that uses environment variables (no CLI flags)
-    kubectl apply -n "$NAMESPACE" -f - <<EOF
+    kind_kubectl apply -n "$NAMESPACE" -f - <<EOF
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -374,7 +392,7 @@ EOF
     local job_result=""
     while [ $SECONDS -lt $deadline ]; do
         local conditions
-        conditions=$(kubectl get job/grpc-transfer-test-env -n "$NAMESPACE" \
+        conditions=$(kind_kubectl get job/grpc-transfer-test-env -n "$NAMESPACE" \
             -o jsonpath='{.status.conditions[*].type}' 2>/dev/null || true)
         if echo "$conditions" | grep -qw "Complete"; then job_result="complete"; break; fi
         if echo "$conditions" | grep -qw "Failed"; then job_result="failed"; break; fi
@@ -382,13 +400,13 @@ EOF
     done
     if [ "$job_result" = "complete" ]; then
         log_info "Job output:"
-        kubectl logs job/grpc-transfer-test-env -n "$NAMESPACE" | tail -20
+        kind_kubectl logs job/grpc-transfer-test-env -n "$NAMESPACE" | tail -20
         log_success "Environment variables test PASSED"
         return 0
     else
         log_error "Environment variables test FAILED"
         log_info "Job output:"
-        kubectl logs job/grpc-transfer-test-env -n "$NAMESPACE" 2>/dev/null | tail -30 || true
+        kind_kubectl logs job/grpc-transfer-test-env -n "$NAMESPACE" 2>/dev/null | tail -30 || true
         return 1
     fi
 }
