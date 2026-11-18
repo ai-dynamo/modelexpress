@@ -131,7 +131,7 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 |---|---|---|
 | MX_METADATA_BACKEND | empty on client; required on server | redis, kubernetes/k8s/crd, or client-only k8s-service |
 | MX_METADATA_PORT | 5555 | Base NIXL metadata port; worker port is base plus device ID |
-| MX_WORKER_GRPC_PORT | 6555 | Base worker gRPC port for tensor and artifact manifests |
+| MX_WORKER_GRPC_PORT | 6555 | Base worker gRPC port for tensor and artifact manifests; worker port is base plus device ID |
 | MX_WORKER_HOST | auto-detect | Advertised worker host override |
 | MX_MODEL_REVISION | unset | Source-identity revision label; pin an exact revision for decentralized source pools |
 | MX_NIXL_BACKEND | UCX | NIXL backend; LIBFABRIC is used for AWS EFA |
@@ -143,6 +143,8 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_K8S_SERVICE_PATTERN | mx-sources | Service DNS pattern; {rank} is replaced with the worker rank |
 | MX_K8S_SOURCE_RETRIES | 5 | Fresh-channel retries for k8s-service revision mismatches |
 | MX_K8S_SOURCE_BACKOFF_SECONDS | 0.5 | Backoff between k8s-service retries |
+
+MX_METADATA_PORT and MX_WORKER_GRPC_PORT each reserve base..base+num_local_devices-1 (5555-5562 for the default NIXL port on an 8-GPU node). Keep both ranges clear of ports used by other services in the pod.
 
 Use a central backend for mixed revisions, live updates, or per-worker addressability. Use k8s-service only for stable, interchangeable source pods; see [Kubernetes Service backend](K8S_SERVICE_BACKEND.md).
 
