@@ -191,10 +191,36 @@ def _eligible_on_every_rank(
     return shared
 
 
-def _gather_load_outcomes(
-    outcome: str, strategy: LoadStrategy, ctx: LoadContext
-) -> list[str]:
-    """Share this rank's load outcome for ``strategy`` and return every rank's."""
+def _load_all_ranks(
+    strategy: LoadStrategy, result: LoadResult, ctx: LoadContext
+) -> LoadResult:
+    """Run ``strategy.load()`` and keep its result only if every engine rank loaded.
+
+    Later strategies (InstantTensor, distributed ModelStreamer) and the engine's
+    post-load barrier are collective across ranks, so every rank must leave a
+    strategy the same way. Each rank reports its outcome exactly once, also when
+    its load raised, so no rank waits on a peer that never reports. Called before
+    finalize(), so a rank never registers or publishes weights its peers did not
+    load; a finalize() that fails on one rank afterwards is not covered.
+
+    Raises this rank's own load error; StrategyRecoveryError if any rank could not
+    recover; or StrategyFailed(mutated=True) on a rank that loaded while another
+    rank failed, so it falls back with the others.
+    """
+    outcome = _LOADED
+    failure: Exception | None = None
+    # Hold this rank's error until the others have heard its outcome; raising
+    # here would leave them waiting in the gather below.
+    try:
+        result = strategy.load(result, ctx)
+    except StrategyRecoveryError as e:
+        outcome, failure = _FATAL, e
+    except Exception as e:
+        outcome, failure = _FAILED, e
+
+    # Every value carries the strategy it is about, so ranks that reached
+    # different points of the chain fail loudly instead of comparing unrelated
+    # outcomes.
     phase = f"outcome:{strategy.name}"
     state = (phase, outcome)
     states = ctx.adapter.all_gather_state(state) if ctx.adapter is not None else (state,)
@@ -204,7 +230,25 @@ def _gather_load_outcomes(
                 f"[Worker {ctx.global_rank}] Ranks are out of step in the loading "
                 f"chain: this rank is at {phase!r}, rank {rank} at {peer_phase!r}"
             )
-    return [peer_outcome for _peer_phase, peer_outcome in states]
+    outcomes = [peer_outcome for _peer_phase, peer_outcome in states]
+
+    # Every rank sees the same outcomes, so every rank picks the same branch: all
+    # stop if any rank is fatal, all fall back if any rank failed, else all keep.
+    if _FATAL in outcomes and outcome != _FATAL:
+        raise StrategyRecoveryError(
+            f"[Worker {ctx.global_rank}] Another rank could not recover from "
+            f"strategy {strategy.name}"
+        ) from failure
+    if failure is not None:
+        raise failure
+    failed = sum(1 for peer_outcome in outcomes if peer_outcome != _LOADED)
+    if failed:
+        raise StrategyFailed(
+            f"Strategy {strategy.name} succeeded here but failed on {failed} of "
+            f"{len(outcomes)} ranks",
+            mutated=True,
+        )
+    return result
 
 
 def execute_load_strategies(
@@ -226,40 +270,7 @@ def execute_load_strategies(
             logger.info(f"[Worker {ctx.global_rank}] Trying strategy: {strategy.name}")
             try:
                 with _strategy_phases(strategy, result, ctx):
-                    # Every rank leaves this strategy the same way. Later strategies
-                    # (InstantTensor, distributed ModelStreamer) and the engine's
-                    # post-load barrier are collective across ranks, so a rank keeps
-                    # its load only if every rank loaded. Every rank reports exactly
-                    # once per strategy, also when its load raised, so no rank waits
-                    # on a peer that never reports. Reporting before finalize() keeps
-                    # a rank from registering or publishing weights its peers did not
-                    # load; a finalize() that fails on one rank afterwards is not
-                    # covered.
-                    try:
-                        result = strategy.load(result, ctx)
-                    except StrategyRecoveryError:
-                        _gather_load_outcomes(_FATAL, strategy, ctx)
-                        raise
-                    except Exception as e:
-                        if _FATAL in _gather_load_outcomes(_FAILED, strategy, ctx):
-                            raise StrategyRecoveryError(
-                                f"[Worker {ctx.global_rank}] Another rank could not "
-                                f"recover from strategy {strategy.name}"
-                            ) from e
-                        raise
-                    outcomes = _gather_load_outcomes(_LOADED, strategy, ctx)
-                    if _FATAL in outcomes:
-                        raise StrategyRecoveryError(
-                            f"[Worker {ctx.global_rank}] Another rank could not "
-                            f"recover from strategy {strategy.name}"
-                        )
-                    failed = sum(1 for outcome in outcomes if outcome != _LOADED)
-                    if failed:
-                        raise StrategyFailed(
-                            f"Strategy {strategy.name} succeeded here but failed on "
-                            f"{failed} of {len(outcomes)} ranks",
-                            mutated=True,
-                        )
+                    result = _load_all_ranks(strategy, result, ctx)
                 publish_source_if_supported(result, ctx)
                 span.set_attribute("weight_loading_strategy", strategy.name)
                 return result.value
