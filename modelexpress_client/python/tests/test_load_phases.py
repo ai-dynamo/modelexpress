@@ -85,11 +85,14 @@ class _StreamingStrategy(LoadStrategy):
 
 
 def _ctx(*, is_reload=False):
+    adapter = MagicMock()
+    # A single engine rank: the chain agrees on each outcome with itself.
+    adapter.all_gather_state.side_effect = lambda state: (state,)
     return SimpleNamespace(
         global_rank=0,
         is_reload=is_reload,
         p2p_enabled=False,
-        adapter=MagicMock(),
+        adapter=adapter,
         identity=SimpleNamespace(model_name="m"),
     )
 
