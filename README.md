@@ -229,7 +229,7 @@ docker compose -f docker/docker-compose.yml up --build
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MODEL_EXPRESS_SERVER_PORT` | `8001` | gRPC port |
-| `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Cache root |
+| `MODEL_EXPRESS_CACHE_DIRECTORY` | (unset) | Cache root. When unset, the server uses the directory that a client with no setting uses; see [Cache Settings](docs/DEPLOYMENT.md#cache-settings). |
 | `MX_METADATA_BACKEND` | Server: required; client: unset | Server: `redis` \| `kubernetes`. Client: unset, `server`, `redis`, or `kubernetes` uses a central coordinator; `k8s-service` enables decentralized Kubernetes Service routing. |
 | `REDIS_URL` | (required for `redis`) | Redis connection URL. Alternatively set `MX_REDIS_HOST` + `MX_REDIS_PORT`. No localhost fallback. |
 | `MX_SERVER_ADDRESS` | `localhost:8001` | Client-side gRPC server address (P2P). Recommended. |

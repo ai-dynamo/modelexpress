@@ -208,9 +208,29 @@ pub async fn run_server(
         }
     }
 
+    let cache_dir = config.cache_directory();
+    info!("Model cache directory: {}", cache_dir.display());
+
+    let (finalizer_shutdown_tx, finalizer_handle) =
+        if let BackendConfig::Kubernetes { namespace } = &backend {
+            let client = kube::Client::try_default().await?;
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(crate::registry::backend::kubernetes::finalizer::run(
+                client,
+                namespace.clone(),
+                cache_dir.clone(),
+                crate::services::DOWNLOAD_LEASE_DURATION,
+                shutdown_rx,
+            ));
+            (Some(shutdown_tx), Some(handle))
+        } else {
+            (None, None)
+        };
+
     // Initialize the download tracker, injected with the registry.
     let tracker = Arc::new(ModelDownloadTracker::new(
         registry.clone(),
+        Some(cache_dir.clone()),
         download_metrics,
         registry_metrics.clone(),
     ));
@@ -219,7 +239,7 @@ pub async fn run_server(
     let cache_service = CacheEvictionService::new(
         registry.clone(),
         config.cache.eviction.clone(),
-        config.cache.directory.clone(),
+        cache_dir,
         cache_metrics.clone(),
     );
 
@@ -386,6 +406,12 @@ pub async fn run_server(
         if stats_shutdown_tx.send(()).is_err() {
             error!("Failed to send shutdown signal to registry stats refresh");
         }
+
+        if let Some(tx) = finalizer_shutdown_tx
+            && tx.send(()).is_err()
+        {
+            error!("Failed to send shutdown signal to the ModelCacheEntry finalizer");
+        }
     };
 
     let mode = config.security.resolve_mode();
@@ -464,6 +490,11 @@ pub async fn run_server(
     }
     if let Err(e) = reaper_handle.await {
         error!("Reaper join error: {e}");
+    }
+    if let Some(handle) = finalizer_handle
+        && let Err(e) = handle.await
+    {
+        error!("ModelCacheEntry finalizer join error: {e}");
     }
 
     // The metrics listener stops last, once the gRPC server has drained and the

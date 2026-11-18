@@ -265,6 +265,27 @@ helm upgrade my-modelexpress ./helm
 helm uninstall my-modelexpress
 ```
 
+With `MX_METADATA_BACKEND: kubernetes`, each `ModelCacheEntry` has a finalizer that
+only a ModelExpress server removes. `helm uninstall` keeps the CRDs and the entries.
+Before you delete the namespace or the CRDs, delete the entries while the server
+still runs (this also deletes the cached files), or release them after the uninstall
+(the cached files stay):
+
+```bash
+# Before the uninstall
+kubectl delete mxcache --all --timeout=120s
+
+# Or after the uninstall
+RELEASE='[{"op":"test","path":"/metadata/finalizers/0","value":"modelexpress.nvidia.com/cache-files"},{"op":"remove","path":"/metadata/finalizers/0"}]'
+for entry in $(kubectl get mxcache -o name); do
+  kubectl patch $entry --type=json -p "$RELEASE" || echo "not released: $entry"
+done
+```
+
+The patch removes only the ModelExpress finalizer. It changes nothing on an entry
+where a different finalizer is first in the list, and the loop prints `not released`
+with the name of that entry.
+
 ## Troubleshooting
 
 ### Check Pod Status

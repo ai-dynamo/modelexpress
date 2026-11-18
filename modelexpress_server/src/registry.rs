@@ -7,9 +7,11 @@
 //! `backend` owns the `RegistryBackend` trait plus its Redis, Kubernetes CRD, and
 //! (behind the `memory-backend` feature) in-memory implementations. `state` wraps the
 //! backend in a lazy-connect manager used by `ModelDownloadTracker` and
-//! `CacheEvictionService`. `entry_key` defines the identity every backend keys on.
+//! `CacheEvictionService`. `entry_key` defines the identity every backend keys on, and
+//! `entry_files` decides which cached files deleting an entry removes.
 
 pub mod backend;
+pub mod entry_files;
 pub mod entry_key;
 pub mod k8s_types;
 pub mod state;

@@ -7,7 +7,7 @@ use modelexpress_common::config::{LogFormat, LogLevel, load_layered_config};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::Level;
 
 use crate::cache::CacheEvictionConfig;
@@ -258,12 +258,13 @@ fn default_metrics_port() -> u16 {
 }
 
 /// Cache configuration wrapper
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CacheConfig {
     /// Cache eviction settings
     pub eviction: CacheEvictionConfig,
-    /// Cache directory path
-    pub directory: PathBuf,
+    /// Cache directory path. `None` when the flag, the environment and the config file
+    /// do not set one; [`ServerConfig::cache_directory`] gives the directory then.
+    pub directory: Option<PathBuf>,
     /// Maximum cache size in bytes
     pub max_size_bytes: Option<u64>,
 }
@@ -289,16 +290,6 @@ impl Default for ServerSettings {
             host: "0.0.0.0".to_string(),
             port: modelexpress_common::constants::DEFAULT_GRPC_PORT,
             metrics_port: default_metrics_port(),
-        }
-    }
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            eviction: CacheEvictionConfig::default(),
-            directory: PathBuf::from("./cache"),
-            max_size_bytes: None,
         }
     }
 }
@@ -365,7 +356,7 @@ impl ServerConfig {
 
         // Apply cache overrides
         if let Some(cache_directory) = args.cache_directory {
-            config.cache.directory = cache_directory;
+            config.cache.directory = Some(cache_directory);
         }
 
         if let Some(cache_eviction_enabled) = args.cache_eviction_enabled {
@@ -395,7 +386,7 @@ impl ServerConfig {
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Validate cache directory
-        if let Some(parent) = self.cache.directory.parent()
+        if let Some(parent) = self.cache.directory.as_deref().and_then(Path::parent)
             && !parent.exists()
         {
             return Err(ConfigError::Message(format!(
@@ -410,6 +401,20 @@ impl ServerConfig {
             .map_err(ConfigError::Message)?;
 
         Ok(())
+    }
+
+    /// The one directory the server keeps models in. Downloads, cache eviction and the
+    /// Kubernetes finalizer all use it, so a delete looks where the download wrote.
+    ///
+    /// A directory set for the server wins. With none set, this is the directory a
+    /// client with no setting finds, so a client and a server that share storage on
+    /// one host agree without configuration.
+    pub fn cache_directory(&self) -> PathBuf {
+        self.cache.directory.clone().unwrap_or_else(|| {
+            modelexpress_common::cache::CacheConfig::discover()
+                .unwrap_or_default()
+                .local_path
+        })
     }
 
     /// Get the server socket address
@@ -455,7 +460,10 @@ impl ServerConfig {
         }
 
         info!("Cache Configuration:");
-        info!("  Directory: {}", self.cache.directory.display());
+        match &self.cache.directory {
+            Some(directory) => info!("  Directory: {}", directory.display()),
+            None => info!("  Directory: not set"),
+        }
         info!("  Max Size: {:?}", self.cache.max_size_bytes);
         info!("  Eviction Enabled: {}", self.cache.eviction.enabled);
         info!(
@@ -753,6 +761,7 @@ mod tests {
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port.get(), 8002);
         assert!(!config.cache.eviction.enabled);
+        assert_eq!(config.cache_directory(), PathBuf::from("./test_cache"));
         assert_eq!(config.logging.level, LogLevel::Debug);
         assert_eq!(config.logging.format, LogFormat::Json);
     }
@@ -841,7 +850,14 @@ mod tests {
         assert_eq!(config.server.port.get(), 9000);
         assert_eq!(config.logging.level, LogLevel::Error);
         assert_eq!(config.logging.format, LogFormat::Json);
-        assert_eq!(config.cache.directory, PathBuf::from("/tmp/override_cache"));
+        assert_eq!(
+            config.cache.directory,
+            Some(PathBuf::from("/tmp/override_cache"))
+        );
+        assert_eq!(
+            config.cache_directory(),
+            PathBuf::from("/tmp/override_cache")
+        );
         assert!(!config.cache.eviction.enabled);
     }
 
@@ -1006,6 +1022,30 @@ mod tests {
             assert!(!config.cache.eviction.enabled);
             assert_eq!(config.logging.level, LogLevel::Debug);
         }
+    }
+
+    /// With no directory set, the server takes the one a client with no setting finds.
+    /// A directory set for the server replaces it for every server path, also when the
+    /// discovery finds another directory.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_set_cache_directory_wins_over_the_discovered_one() {
+        use modelexpress_common::test_support::{EnvVarGuard, acquire_env_mutex};
+
+        let env_lock = acquire_env_mutex();
+        let discovered = tempdir().expect("Failed to create temp dir");
+        let _cache_dir_guard = EnvVarGuard::set(
+            &env_lock,
+            modelexpress_common::envs::MODEL_EXPRESS_CACHE_DIRECTORY,
+            &discovered.path().to_string_lossy(),
+        );
+
+        let mut config = ServerConfig::default();
+        assert_eq!(config.cache.directory, None);
+        assert_eq!(config.cache_directory(), discovered.path());
+
+        config.cache.directory = Some(PathBuf::from("/data/models"));
+        assert_eq!(config.cache_directory(), PathBuf::from("/data/models"));
     }
 
     /// The env var must stay wired through clap.

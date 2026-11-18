@@ -15,8 +15,9 @@
 //! Instrumenting it would mean inventing a `from` value.
 //!
 //! The claim lifecycle does know. A won claim is `absent -> downloading`, an
-//! error-retry reset is `error -> downloading`, and a finished claim is
-//! `downloading -> {downloaded, error}`. Those three cover every transition that
+//! error-retry reset is `error -> downloading`, a reclaim of a record whose files
+//! are missing is `downloaded -> downloading`, and a finished claim is
+//! `downloading -> {downloaded, error}`. Those cover every transition that
 //! matters for "is a model wedged", they are exact rather than sampled, and none
 //! of them needs a keyspace scan to compute.
 //!
@@ -215,16 +216,16 @@ pub struct RegistryMetrics {
 impl RegistryMetrics {
     /// The transitions the code can actually produce, and where each comes from.
     ///
-    /// The label domain is 4x4, but ten of those sixteen pairs are unreachable:
+    /// The label domain is 4x4, but nine of those sixteen pairs are unreachable:
     /// nothing moves an entry from `downloaded` to `error`, and `absent` is only
     /// ever a source for a first claim or a target for a delete. Pre-creating
-    /// all sixteen exported ten series that could never leave zero.
+    /// all sixteen exported nine series that could never leave zero.
     ///
     /// Keep this in step with the call sites. A pair that is produced but not
     /// listed still records correctly -- `get_or_create` makes it on demand --
     /// but its first occurrence in each process is invisible to `increase()`,
     /// which is the whole reason this pre-creation exists.
-    const REACHABLE_TRANSITIONS: [(StatusLabel, StatusLabel); 6] = [
+    const REACHABLE_TRANSITIONS: [(StatusLabel, StatusLabel); 7] = [
         // record_claim(Claimed): a first claim on an entry that did not exist.
         (StatusLabel::Absent, StatusLabel::Downloading),
         // record_claim(Takeover): ownership changed, the entry never left
@@ -232,6 +233,8 @@ impl RegistryMetrics {
         (StatusLabel::Downloading, StatusLabel::Downloading),
         // reset_download_claim: an error-retry restarting a failed download.
         (StatusLabel::Error, StatusLabel::Downloading),
+        // try_reclaim_downloaded: a record whose files are missing from the cache.
+        (StatusLabel::Downloaded, StatusLabel::Downloading),
         // finish_download_claim, both terminal outcomes.
         (StatusLabel::Downloading, StatusLabel::Downloaded),
         (StatusLabel::Downloading, StatusLabel::Error),
@@ -281,7 +284,7 @@ impl RegistryMetrics {
         // second. Born at zero, the increment is a visible step.
         //
         // Scoped to these three families deliberately. Their alerts key on rare
-        // one-shot events, and the domains are small: 4 + 3 + 6 series. The
+        // one-shot events, and the domains are small: 4 + 3 + 7 series. The
         // gRPC and backend families would cost 154 and 93 permanently-zero
         // series per pod for ratio alerts that need sustained traffic to fire
         // anyway.
@@ -721,7 +724,7 @@ mod tests {
         );
 
         // The unreachable pairs must stay absent. Pre-creating the full 4x4
-        // exported ten series that could never leave zero.
+        // exported nine series that could never leave zero.
         for (from, to) in [
             (StatusLabel::Absent, StatusLabel::Absent),
             (StatusLabel::Absent, StatusLabel::Downloaded),
@@ -754,6 +757,7 @@ mod tests {
         metrics.record_claim(ClaimResult::Claimed);
         metrics.record_claim(ClaimResult::Takeover);
         metrics.record_transition(StatusLabel::Error, StatusLabel::Downloading);
+        metrics.record_transition(StatusLabel::Downloaded, StatusLabel::Downloading);
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Downloaded);
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Error);
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Absent);

@@ -13,7 +13,7 @@ use hf_hub::api::tokio::{ApiBuilder, ApiError};
 use hf_hub::{Cache, Repo, RepoType};
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
@@ -83,6 +83,29 @@ impl HuggingFaceProviderCache {
         cache_root.join(format!("models--{}", model_name.replace('/', "--")))
     }
 
+    /// Reject a model name that does not have a cache directory of its own.
+    ///
+    /// [`Self::repo_root`] replaces each `/` with `--`. A Hub repository id has no `--`,
+    /// and no part of it starts or ends with `-`, so two ids never give one directory.
+    /// Other names can: `org--model` gives the directory of `org/model`, and a delete
+    /// by that name would remove the files of the other model.
+    fn validate_model_name(model_name: &str) -> Result<()> {
+        let has_its_own_directory = model_name.split('/').all(|part| {
+            !part.is_empty()
+                && !part.starts_with('-')
+                && !part.ends_with('-')
+                && !part.contains("--")
+        });
+        if !has_its_own_directory {
+            anyhow::bail!(
+                "'{model_name}' is not a Hugging Face repository id: each part between '/' \
+                 must have a character, must not start or end with '-', and must not \
+                 contain '--'"
+            );
+        }
+        Ok(())
+    }
+
     fn snapshots_dir(cache_root: &Path, model_name: &str) -> PathBuf {
         Self::repo_root(cache_root, model_name).join("snapshots")
     }
@@ -91,11 +114,36 @@ impl HuggingFaceProviderCache {
         Self::repo_root(cache_root, model_name).join("refs")
     }
 
+    /// The snapshot directory of `commit`.
+    ///
+    /// A commit can be caller input: a requested revision that names no ref is used as
+    /// the commit. It must be one plain directory name, or the join would leave
+    /// `snapshots/` and a delete or a file listing would act on another directory.
+    fn snapshot_dir(cache_root: &Path, model_name: &str, commit: &str) -> Result<PathBuf> {
+        let mut components = Path::new(commit).components();
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(name)), None) if name == commit => {
+                Ok(Self::snapshots_dir(cache_root, model_name).join(commit))
+            }
+            _ => anyhow::bail!(
+                "Revision '{commit}' of model '{model_name}' is not a commit identifier"
+            ),
+        }
+    }
+
     /// Read the commit a cached `refs/<revision>` entry points at.
     ///
     /// Returns `None` when the ref does not exist, so callers can fall back to
     /// treating the requested revision as a commit SHA.
     fn read_ref(cache_root: &Path, model_name: &str, revision: &str) -> Option<String> {
+        // A branch name can have several components, but `..` or a root would read a
+        // file outside `refs/`.
+        let stays_in_refs = Path::new(revision)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+        if !stays_in_refs {
+            return None;
+        }
         let ref_path = Self::refs_dir(cache_root, model_name).join(revision);
         let commit = fs::read_to_string(ref_path).ok()?;
         let commit = commit.trim();
@@ -146,6 +194,7 @@ impl HuggingFaceProviderCache {
 
 impl ProviderCache for HuggingFaceProviderCache {
     fn clear_model(&self, cache_root: &Path, model_name: &str) -> Result<()> {
+        Self::validate_model_name(model_name)?;
         let model_path = Self::repo_root(cache_root, model_name);
 
         if model_path.exists() {
@@ -453,7 +502,7 @@ impl HuggingFaceProvider {
                     cache_dir, model_name, revision,
                 );
                 let snapshot =
-                    HuggingFaceProviderCache::snapshots_dir(cache_dir, model_name).join(&commit);
+                    HuggingFaceProviderCache::snapshot_dir(cache_dir, model_name, &commit)?;
                 if snapshot.is_dir() {
                     Ok(commit)
                 } else {
@@ -698,6 +747,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
     /// Attempt to delete a model from Hugging Face cache
     /// Returns Ok(()) if the model was successfully deleted or didn't exist
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
+        HuggingFaceProviderCache::validate_model_name(model_name)?;
         info!("Deleting model from Hugging Face cache: {model_name}");
         let token = resolve_hf_token();
         let api = ApiBuilder::from_env()
@@ -797,6 +847,11 @@ impl ModelProviderTrait for HuggingFaceProvider {
 
     /// Delete a single cached revision, leaving the model's other revisions intact.
     ///
+    /// `revision` is the commit that names the snapshot directory. It is not looked up
+    /// in `refs/`: the caller decides from commits which snapshots other entries still
+    /// use, and a branch name that resolved here to one of those commits would delete
+    /// a snapshot the caller meant to keep.
+    ///
     /// Once the last snapshot is gone the whole repository directory is removed, which
     /// also reclaims the blobs the snapshots pointed at.
     async fn delete_model_revision(
@@ -805,7 +860,14 @@ impl ModelProviderTrait for HuggingFaceProvider {
         cache_dir: PathBuf,
         revision: Option<&str>,
     ) -> Result<()> {
-        let Some(revision) = revision else {
+        HuggingFaceProviderCache::validate_model_name(model_name)?;
+        let Some(commit) = revision else {
+            // Server replicas that share a cache each run this delete for one entry, so
+            // a missing directory is the usual case here and not worth a warning.
+            if !HuggingFaceProviderCache::repo_root(&cache_dir, model_name).exists() {
+                debug!("Model '{model_name}' is not cached");
+                return Ok(());
+            }
             // Remove the repository directory outright rather than going through
             // `delete_model`, which enumerates the repo's files from the Hub and so
             // frees nothing when the Hub is unreachable. Cache eviction has to reclaim
@@ -814,10 +876,7 @@ impl ModelProviderTrait for HuggingFaceProvider {
             return HuggingFaceProviderCache.clear_model(&cache_dir, model_name);
         };
 
-        let commit =
-            HuggingFaceProviderCache::local_commit_for_revision(&cache_dir, model_name, revision);
-        let snapshot =
-            HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(&commit);
+        let snapshot = HuggingFaceProviderCache::snapshot_dir(&cache_dir, model_name, commit)?;
 
         if snapshot.exists() {
             fs::remove_dir_all(&snapshot)
@@ -910,11 +969,16 @@ impl ModelProviderTrait for HuggingFaceProvider {
         };
 
         let commit = Self::resolve_revision_offline(&cache_dir, model_name, Some(revision))?;
-        Ok(HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(commit))
+        HuggingFaceProviderCache::snapshot_dir(&cache_dir, model_name, &commit)
     }
 
     fn supports_revisions(&self) -> bool {
         true
+    }
+
+    fn canonical_model_name(&self, model_name: &str) -> Result<String> {
+        HuggingFaceProviderCache::validate_model_name(model_name)?;
+        Ok(model_name.to_string())
     }
 
     /// Write `refs/<revision>` for a snapshot that was installed by streaming rather
@@ -1666,7 +1730,7 @@ mod tests {
 
         let provider = HuggingFaceProvider;
         provider
-            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), Some("main"))
+            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), Some("abc1234"))
             .await
             .expect("Deleting one revision should succeed");
 
@@ -1683,6 +1747,146 @@ mod tests {
             !repo_root.exists(),
             "The repository directory should be removed once its last snapshot is gone"
         );
+    }
+
+    /// The caller decides from commits which snapshots to keep. A branch name that the
+    /// delete resolved through `refs/` could be one of those commits.
+    #[tokio::test]
+    async fn test_delete_model_revision_does_not_follow_refs() {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let repo_root = temp_dir.path().join("models--test--model");
+        let snapshot = repo_root.join("snapshots/abc1234");
+        std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+        std::fs::write(snapshot.join("config.json"), b"{}").expect("Failed to write config");
+        std::fs::create_dir_all(repo_root.join("refs")).expect("Failed to create refs");
+        std::fs::write(repo_root.join("refs/main"), "abc1234").expect("Failed to write ref");
+
+        HuggingFaceProvider
+            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), Some("main"))
+            .await
+            .expect("A revision with no snapshot is not an error");
+
+        assert!(snapshot.join("config.json").exists());
+        assert!(repo_root.join("refs/main").exists());
+    }
+
+    /// `repo_root` maps `/` to `--`, so these names give the cache directory of a
+    /// different model, or no model at all.
+    #[tokio::test]
+    async fn test_a_name_without_its_own_cache_directory_is_rejected() {
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let cache_dir = temp_dir.path().to_path_buf();
+        let snapshot = cache_dir.join("models--org--model/snapshots/abc1234");
+        std::fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+
+        let provider = HuggingFaceProvider;
+        for name in [
+            "org--model",
+            "org-/model",
+            "org/-model",
+            "-org/model",
+            "org/model-",
+            "org//model",
+            "/model",
+            "org/",
+            "",
+        ] {
+            assert!(
+                provider.canonical_model_name(name).is_err(),
+                "{name:?} must not be a model name"
+            );
+            assert!(
+                provider
+                    .delete_model_revision(name, cache_dir.clone(), None)
+                    .await
+                    .is_err(),
+                "delete must reject {name:?}"
+            );
+            assert!(
+                provider
+                    .delete_model(name, cache_dir.clone())
+                    .await
+                    .is_err(),
+                "delete must reject {name:?}"
+            );
+            assert!(
+                HuggingFaceProviderCache
+                    .clear_model(&cache_dir, name)
+                    .is_err(),
+                "clear must reject {name:?}"
+            );
+            assert!(snapshot.exists(), "{name:?} removed the files of org/model");
+        }
+
+        for name in [
+            "org/model",
+            "gpt2",
+            "meta-llama/Llama-3.1-8B-Instruct",
+            "a.b/c_d-e",
+        ] {
+            assert_eq!(
+                provider
+                    .canonical_model_name(name)
+                    .expect("a repository id is a model name"),
+                name
+            );
+        }
+    }
+
+    /// A revision is caller input that becomes a path component. One that points out
+    /// of `snapshots/` must be rejected before any path is built from it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_a_revision_cannot_address_a_path_outside_the_snapshots() {
+        let env_lock = acquire_env_mutex();
+        let _offline_guard = EnvVarGuard::set(&env_lock, crate::envs::HF_HUB_OFFLINE, "1");
+        let temp_dir = TempDir::new().expect("Failed to create temporary directory");
+        let cache_dir = temp_dir.path().join("cache");
+        let outside = temp_dir.path().join("outside");
+        let repo_root = cache_dir.join("models--test--model");
+        let neighbor = cache_dir.join("models--test--neighbor");
+        for dir in [&repo_root.join("snapshots/abc1234"), &neighbor, &outside] {
+            std::fs::create_dir_all(dir).expect("Failed to create directory");
+        }
+        // A file that a `..` ref lookup would read as a commit.
+        std::fs::write(temp_dir.path().join("commit"), "abc1234").expect("Failed to write file");
+
+        let provider = HuggingFaceProvider;
+        let absolute = outside.to_string_lossy().into_owned();
+        for revision in [
+            "../..",
+            "..",
+            ".",
+            "abc1234/..",
+            "abc1234/../abc1234",
+            "../../../commit",
+            absolute.as_str(),
+        ] {
+            assert!(
+                provider
+                    .delete_model_revision("test/model", cache_dir.clone(), Some(revision))
+                    .await
+                    .is_err(),
+                "delete must reject {revision:?}"
+            );
+            assert!(
+                provider
+                    .get_model_path_revision("test/model", cache_dir.clone(), Some(revision))
+                    .await
+                    .is_err(),
+                "path lookup must reject {revision:?}"
+            );
+            assert!(
+                provider
+                    .resolve_revision("test/model", Some(cache_dir.clone()), Some(revision))
+                    .await
+                    .is_err(),
+                "offline resolution must reject {revision:?}"
+            );
+            for dir in [&repo_root.join("snapshots/abc1234"), &neighbor, &outside] {
+                assert!(dir.exists(), "{revision:?} removed {}", dir.display());
+            }
+        }
     }
 
     #[cfg(unix)]

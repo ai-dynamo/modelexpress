@@ -228,6 +228,74 @@ async fn concurrent_error_retries_yield_single_winner() {
     backend.delete_model(&name).await.expect("cleanup");
 }
 
+/// A record whose files are missing is taken back to DOWNLOADING in place. Every
+/// server that sees the missing files tries, and exactly one must own the download.
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
+async fn concurrent_reclaims_of_a_downloaded_record_yield_single_winner() {
+    let backend = Arc::new(fresh_backend().await);
+    let name = unique_name("reclaim");
+
+    backend
+        .set_status(
+            &name,
+            ModelProvider::HuggingFace,
+            ModelStatus::DOWNLOADED,
+            None,
+        )
+        .await
+        .expect("seed DOWNLOADED record");
+
+    let mut handles = Vec::new();
+    for owner in 0..8 {
+        let b = backend.clone();
+        let n = name.clone();
+        let claim_id = format!("reclaim-owner-{owner}");
+        handles.push(tokio::spawn(async move {
+            let won = b
+                .try_reclaim_downloaded(
+                    &n,
+                    ModelProvider::HuggingFace,
+                    &claim_id,
+                    TEST_LEASE_DURATION,
+                )
+                .await;
+            (claim_id, won)
+        }));
+    }
+
+    let mut winners = Vec::new();
+    for h in handles {
+        let (claim_id, won) = h.await.expect("spawn join");
+        if won.expect("reclaim CAS result") {
+            winners.push(claim_id);
+        }
+    }
+    assert_eq!(winners.len(), 1, "exactly one replica must win the reclaim");
+
+    let rec = backend
+        .get_model_record(&name)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(rec.status, ModelStatus::DOWNLOADING);
+    assert!(
+        backend
+            .finish_download_claim(
+                &name,
+                ModelProvider::HuggingFace,
+                &winners[0],
+                ModelStatus::DOWNLOADED,
+                None,
+            )
+            .await
+            .expect("finish"),
+        "the winner owns the lease"
+    );
+
+    backend.delete_model(&name).await.expect("cleanup");
+}
+
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
 async fn touch_updates_last_used_at() {

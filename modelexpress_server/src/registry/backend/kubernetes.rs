@@ -11,9 +11,18 @@
 //! provider is in the name so the same model under different providers maps to distinct CRs;
 //! `spec.modelName`/`spec.provider` keep the originals. Pre-0.5.0 name-only CRs are migrated
 //! lazily on claim (see `try_claim_for_download`); name-addressed reads cover both forms.
+//!
+//! Every CR carries [`CACHE_FILES_FINALIZER`], so a delete from any client only marks it
+//! for deletion until [`finalizer`] has deleted the cached files it covers.
 
-use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
-use crate::registry::k8s_types::{ModelCacheEntry, ModelCacheEntrySpec, phase};
+#[cfg(test)]
+mod fake_api;
+pub mod finalizer;
+
+use super::{ClaimOutcome, ModelRecord, RECLAIM_MESSAGE, RegistryBackend, RegistryResult};
+use crate::registry::k8s_types::{
+    CACHE_FILES_FINALIZER, ModelCacheEntry, ModelCacheEntrySpec, phase,
+};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use kube::{
@@ -46,6 +55,9 @@ const K8S_NAME_MAX: usize = 253;
 const NAME_BUDGET: usize = K8S_NAME_MAX - CR_NAME_PREFIX.len();
 /// Hex chars of SHA256 suffix appended when the sanitized name exceeds the budget.
 const HASH_SUFFIX_LEN: usize = 12;
+/// How many times a download completion reads the CR again after a write that changed
+/// its resourceVersion but not its claim.
+const FINISH_CLAIM_ATTEMPTS: usize = 3;
 
 #[derive(Default)]
 struct StatusPatch<'a> {
@@ -163,6 +175,60 @@ impl KubernetesRegistryBackend {
         Api::namespaced(self.client.clone(), &self.namespace)
     }
 
+    /// A new CR that already carries the finalizer. Adding it after create would bump
+    /// the resourceVersion that the creator's claim patch is fenced on.
+    fn new_cr(cr_name: &str, model_name: &str, provider: &str) -> ModelCacheEntry {
+        let mut cr = ModelCacheEntry::new(
+            cr_name,
+            ModelCacheEntrySpec {
+                model_name: model_name.to_string(),
+                provider: provider.to_string(),
+            },
+        );
+        cr.metadata.finalizers = Some(vec![CACHE_FILES_FINALIZER.to_string()]);
+        cr
+    }
+
+    fn is_terminating(cr: &ModelCacheEntry) -> bool {
+        cr.metadata.deletion_timestamp.is_some()
+    }
+
+    /// Only a watching server removes the finalizer, so without `watch` every delete
+    /// would hang.
+    async fn ensure_can_watch(&self) -> RegistryResult<()> {
+        use k8s_openapi::api::authorization::v1::{
+            ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+        };
+        use kube::Resource;
+
+        let review = SelfSubjectAccessReview {
+            spec: SelfSubjectAccessReviewSpec {
+                resource_attributes: Some(ResourceAttributes {
+                    group: Some(ModelCacheEntry::group(&()).into_owned()),
+                    resource: Some(ModelCacheEntry::plural(&()).into_owned()),
+                    verb: Some("watch".to_string()),
+                    namespace: Some(self.namespace.clone()),
+                    ..ResourceAttributes::default()
+                }),
+                ..SelfSubjectAccessReviewSpec::default()
+            },
+            ..SelfSubjectAccessReview::default()
+        };
+        let reviewed = Api::<SelfSubjectAccessReview>::all(self.client.clone())
+            .create(&PostParams::default(), &review)
+            .await?;
+        if reviewed.status.is_some_and(|status| status.allowed) {
+            Ok(())
+        } else {
+            Err(format!(
+                "the server cannot watch modelcacheentries in namespace '{}': grant the \
+                 `watch` verb, which deleting cached files on ModelCacheEntry delete requires",
+                self.namespace
+            )
+            .into())
+        }
+    }
+
     /// Provider-scoped CR name: `sanitize("{provider}/{model_name}")`, so the sha256 suffix
     /// binds (provider, name) and providers never collide.
     fn cr_name_for(provider: ModelProvider, model_name: &str) -> Result<String, DigestError> {
@@ -194,14 +260,28 @@ impl KubernetesRegistryBackend {
     }
 
     /// First existing CR among the candidates (provider-scoped keys, then legacy). Used by
-    /// name-addressed reads; in practice a name maps to a single provider.
+    /// name-addressed reads; in practice a name maps to a single provider. A marked CR
+    /// is a record that is already deleted, so reads do not see it.
     async fn find_existing_cr(&self, model_name: &str) -> RegistryResult<Option<ModelCacheEntry>> {
         for cr_name in Self::candidate_cr_names(model_name)? {
-            if let Some(cr) = self.get_cr(&cr_name).await? {
+            if let Some(cr) = self.get_cr(&cr_name).await?
+                && !Self::is_terminating(&cr)
+            {
                 return Ok(Some(cr));
             }
         }
         Ok(None)
+    }
+
+    /// Every CR that is not marked for deletion. Callers count and evict records, and
+    /// a marked CR only waits for its files to go.
+    async fn list_live(&self) -> RegistryResult<Vec<ModelCacheEntry>> {
+        let crs = self.api().list(&ListParams::default()).await?;
+        Ok(crs
+            .items
+            .into_iter()
+            .filter(|cr| !Self::is_terminating(cr))
+            .collect())
     }
 
     /// Lazy migration: if a matching-provider legacy CR exists, recreate it under the
@@ -221,14 +301,16 @@ impl KubernetesRegistryBackend {
         if Self::provider_from_str(&legacy_cr.spec.provider)? != provider {
             return Ok(None);
         }
+        if Self::is_terminating(&legacy_cr) {
+            // Its files are being deleted; copying it would keep a record of them.
+            return Ok(Some(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING)));
+        }
 
         let legacy_status = legacy_cr.status.clone().unwrap_or_default();
-        let new_cr = ModelCacheEntry::new(
+        let new_cr = Self::new_cr(
             scoped_name,
-            ModelCacheEntrySpec {
-                model_name: legacy_cr.spec.model_name.clone(),
-                provider: legacy_cr.spec.provider.clone(),
-            },
+            &legacy_cr.spec.model_name,
+            &legacy_cr.spec.provider,
         );
         // create is atomic; a 409 means a concurrent claim/migration already made the
         // provider-scoped CR, so we adopt whatever it holds.
@@ -434,6 +516,11 @@ impl KubernetesRegistryBackend {
         lease_duration: std::time::Duration,
         claim_uninitialized: bool,
     ) -> RegistryResult<ClaimOutcome> {
+        if Self::is_terminating(&cr) {
+            // Neither report files that are about to be deleted nor start a download into
+            // them. Waiters poll until the CR is gone, then claim a fresh one.
+            return Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING));
+        }
         let status_missing = cr.status.is_none();
         let status = cr.status.unwrap_or_default();
         let current = Self::status_from_phase(&status.phase);
@@ -521,6 +608,68 @@ impl KubernetesRegistryBackend {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Flip `from_phase` to DOWNLOADING and make `claim_id` the lease owner. Only the
+    /// caller that wins the CAS starts the download.
+    async fn claim_from_phase(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        from_phase: &str,
+        message: &str,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        // Callers run after a claim observed AlreadyExists (which already migrated any
+        // legacy CR), so the CAS targets the provider-scoped CR directly.
+        let cr_name = Self::cr_name_for(provider, model_name)?;
+        let Some(existing) = self.get_cr(&cr_name).await? else {
+            return Ok(false);
+        };
+        if Self::is_terminating(&existing) {
+            return Ok(false);
+        }
+        if existing.status.as_ref().map(|s| s.phase.as_str()) != Some(from_phase) {
+            return Ok(false);
+        }
+        let resource_version = existing
+            .metadata
+            .resource_version
+            .as_deref()
+            .ok_or("ModelCacheEntry has no resourceVersion")?;
+        // The resourceVersion test rejects the patch with 409 or 422 when anything
+        // changed the CR after the GET: a concurrent claim, or a delete that marked it.
+        let now = Utc::now().to_rfc3339();
+        let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
+        let patch = json!([
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            { "op": "test", "path": "/status/phase", "value": from_phase },
+            { "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADING },
+            { "op": "add", "path": "/status/message", "value": message },
+            { "op": "add", "path": "/status/lastUsedAt", "value": now },
+            { "op": "add", "path": "/status/claimId", "value": claim_id },
+            { "op": "add", "path": "/status/leaseExpiresAt", "value": lease_expires_at },
+        ]);
+        match self
+            .api()
+            .patch_status(
+                &cr_name,
+                &PatchParams::default(),
+                &Patch::<()>::Json(serde_json::from_value(patch).map_err(|e| e.to_string())?),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.clear_lease_observation(&cr_name);
+                Ok(true)
+            }
+            Err(kube::Error::Api(e)) if e.code == 422 || e.code == 409 => {
+                debug!("Claim of {cr_name} from {from_phase} lost to a concurrent write");
+                Ok(false)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 #[async_trait]
@@ -528,6 +677,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
     async fn connect(&self) -> RegistryResult<()> {
         // Exercise the ModelCacheEntry API to surface missing CRDs or RBAC errors early.
         let _ = self.api().list(&ListParams::default().limit(1)).await?;
+        self.ensure_can_watch().await?;
         info!(
             "Registry: connected to Kubernetes, namespace '{}'",
             self.namespace
@@ -574,13 +724,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
             .is_none();
 
         if is_new {
-            let cr = ModelCacheEntry::new(
-                &cr_name,
-                ModelCacheEntrySpec {
-                    model_name: model_name.to_string(),
-                    provider: Self::provider_str(provider).to_string(),
-                },
-            );
+            let cr = Self::new_cr(&cr_name, model_name, Self::provider_str(provider));
             match self.api().create(&PostParams::default(), &cr).await {
                 Ok(_) => debug!("Created ModelCacheEntry {cr_name} via set_status"),
                 Err(kube::Error::Api(e)) if e.code == 409 => {
@@ -654,9 +798,9 @@ impl RegistryBackend for KubernetesRegistryBackend {
         &self,
         limit: Option<u32>,
     ) -> RegistryResult<Vec<ModelRecord>> {
-        let crs = self.api().list(&ListParams::default()).await?;
-        let mut records: Vec<ModelRecord> = Vec::with_capacity(crs.items.len());
-        for cr in &crs.items {
+        let crs = self.list_live().await?;
+        let mut records: Vec<ModelRecord> = Vec::with_capacity(crs.len());
+        for cr in &crs {
             match Self::record_from_cr(cr) {
                 Ok(r) => records.push(r),
                 Err(e) => {
@@ -673,11 +817,11 @@ impl RegistryBackend for KubernetesRegistryBackend {
     }
 
     async fn get_status_counts(&self) -> RegistryResult<(u32, u32, u32)> {
-        let crs = self.api().list(&ListParams::default()).await?;
+        let crs = self.list_live().await?;
         let mut downloading = 0u32;
         let mut downloaded = 0u32;
         let mut error = 0u32;
-        for cr in &crs.items {
+        for cr in &crs {
             let phase = cr
                 .status
                 .as_ref()
@@ -715,13 +859,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
             return Ok(outcome);
         }
 
-        let cr = ModelCacheEntry::new(
-            &cr_name,
-            ModelCacheEntrySpec {
-                model_name: model_name.to_string(),
-                provider: Self::provider_str(provider).to_string(),
-            },
-        );
+        let cr = Self::new_cr(&cr_name, model_name, Self::provider_str(provider));
 
         match self.api().create(&PostParams::default(), &cr).await {
             Ok(created) => {
@@ -749,53 +887,33 @@ impl RegistryBackend for KubernetesRegistryBackend {
         claim_id: &str,
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
-        // Retry only runs after a claim observed AlreadyExists (which already migrated any
-        // legacy CR), so the CAS targets the provider-scoped CR directly.
-        let cr_name = Self::cr_name_for(provider, model_name)?;
-        let Some(existing) = self.get_cr(&cr_name).await? else {
-            return Ok(false);
-        };
-        let current_phase = existing
-            .status
-            .as_ref()
-            .map(|s| s.phase.as_str())
-            .unwrap_or_default()
-            .to_string();
-        if current_phase != phase::ERROR {
-            return Ok(false);
-        }
-        // Use a JSON Patch `test` op as a server-side precondition — kube rejects the
-        // patch with 422 if the status phase was flipped out from under us between
-        // GET and PATCH, and we report the CAS miss.
-        let now = Utc::now().to_rfc3339();
-        let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
-        let patch = json!([
-            { "op": "test", "path": "/status/phase", "value": phase::ERROR },
-            { "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADING },
-            { "op": "replace", "path": "/status/message", "value": "Retrying download..." },
-            { "op": "replace", "path": "/status/lastUsedAt", "value": now },
-            { "op": "add", "path": "/status/claimId", "value": claim_id },
-            { "op": "add", "path": "/status/leaseExpiresAt", "value": lease_expires_at },
-        ]);
-        match self
-            .api()
-            .patch_status(
-                &cr_name,
-                &PatchParams::default(),
-                &Patch::<()>::Json(serde_json::from_value(patch).map_err(|e| e.to_string())?),
-            )
-            .await
-        {
-            Ok(_) => {
-                self.clear_lease_observation(&cr_name);
-                Ok(true)
-            }
-            Err(kube::Error::Api(e)) if e.code == 422 || e.code == 409 => {
-                debug!("Error-retry CAS for {cr_name} lost to a concurrent write");
-                Ok(false)
-            }
-            Err(e) => Err(e.into()),
-        }
+        self.claim_from_phase(
+            model_name,
+            provider,
+            phase::ERROR,
+            "Retrying download...",
+            claim_id,
+            lease_duration,
+        )
+        .await
+    }
+
+    async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        self.claim_from_phase(
+            model_name,
+            provider,
+            phase::DOWNLOADED,
+            RECLAIM_MESSAGE,
+            claim_id,
+            lease_duration,
+        )
+        .await
     }
 
     async fn refresh_download_claim(
@@ -844,35 +962,61 @@ impl RegistryBackend for KubernetesRegistryBackend {
         message: Option<String>,
     ) -> RegistryResult<bool> {
         let cr_name = Self::cr_name_for(provider, model_name)?;
-        let now = Utc::now().to_rfc3339();
-        let patch = json!([
-            { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING },
-            { "op": "test", "path": "/status/claimId", "value": claim_id },
-            { "op": "replace", "path": "/status/phase", "value": Self::phase_from_status(status) },
-            { "op": "add", "path": "/status/message", "value": message },
-            { "op": "add", "path": "/status/lastUsedAt", "value": now },
-            { "op": "add", "path": "/status/claimId", "value": null },
-            { "op": "add", "path": "/status/leaseExpiresAt", "value": null },
-        ]);
-        match self
-            .api()
-            .patch_status(
-                &cr_name,
-                &PatchParams::default(),
-                &Patch::<()>::Json(serde_json::from_value(patch).map_err(|e| e.to_string())?),
-            )
-            .await
-        {
-            Ok(_) => {
-                self.clear_lease_observation(&cr_name);
-                Ok(true)
-            }
-            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 || e.code == 422 => {
+        for _ in 0..FINISH_CLAIM_ATTEMPTS {
+            let Some(existing) = self.get_cr(&cr_name).await? else {
+                return Ok(false);
+            };
+            let owns_claim = existing.status.as_ref().is_some_and(|current| {
+                current.phase == phase::DOWNLOADING && current.claim_id.as_deref() == Some(claim_id)
+            });
+            // A delete that marked the CR removes the files of this download next, so
+            // the download must not be published as complete.
+            if !owns_claim || Self::is_terminating(&existing) {
                 debug!("Download completion for {cr_name} lost ownership");
-                Ok(false)
+                return Ok(false);
             }
-            Err(e) => Err(e.into()),
+            let resource_version = existing
+                .metadata
+                .resource_version
+                .as_deref()
+                .ok_or("ModelCacheEntry has no resourceVersion")?;
+            let now = Utc::now().to_rfc3339();
+            // The resourceVersion test covers a delete that marks the CR after the GET.
+            let patch = json!([
+                { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+                { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING },
+                { "op": "test", "path": "/status/claimId", "value": claim_id },
+                { "op": "replace", "path": "/status/phase", "value": Self::phase_from_status(status) },
+                { "op": "add", "path": "/status/message", "value": message },
+                { "op": "add", "path": "/status/lastUsedAt", "value": now },
+                { "op": "add", "path": "/status/claimId", "value": null },
+                { "op": "add", "path": "/status/leaseExpiresAt", "value": null },
+            ]);
+            match self
+                .api()
+                .patch_status(
+                    &cr_name,
+                    &PatchParams::default(),
+                    &Patch::<()>::Json(serde_json::from_value(patch).map_err(|e| e.to_string())?),
+                )
+                .await
+            {
+                Ok(_) => {
+                    self.clear_lease_observation(&cr_name);
+                    return Ok(true);
+                }
+                Err(kube::Error::Api(e)) if e.code == 404 => return Ok(false),
+                // Something wrote the CR after the GET. A write that is not a delete
+                // or a takeover leaves the claim with this caller, so read again.
+                Err(kube::Error::Api(e)) if e.code == 409 || e.code == 422 => {}
+                Err(e) => return Err(e.into()),
+            }
         }
+        Err(format!(
+            "ModelCacheEntry {cr_name} changed during each of {FINISH_CLAIM_ATTEMPTS} attempts \
+             to finish its download"
+        )
+        .into())
     }
 }
 
@@ -1162,5 +1306,385 @@ mod tests {
             crd_string_enum("/status/properties/phase/enum"),
             "the CRD's status.phase enum must accept exactly the phases the backend writes, plus the empty initial phase"
         );
+    }
+
+    // --- marked CRs -------------------------------------------------------------
+    //
+    // A delete only marks a CR until the finalizer has deleted its files. These tests
+    // run against a fake API server, so they need no cluster.
+
+    use super::fake_api::{self, Calls};
+    use http::{Method, StatusCode};
+
+    const LEASE: std::time::Duration = std::time::Duration::from_secs(30);
+    const MODEL: &str = "org/model";
+
+    fn backend_on(client: Client) -> KubernetesRegistryBackend {
+        KubernetesRegistryBackend {
+            client,
+            namespace: fake_api::NAMESPACE.to_string(),
+            lease_observations: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn scoped_name() -> String {
+        KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, MODEL).expect("CR name")
+    }
+
+    fn hf_entry(name: &str, phase: &str) -> ModelCacheEntry {
+        fake_api::entry(
+            name,
+            MODEL,
+            "HuggingFace",
+            Some(fake_api::status(phase, None, None)),
+        )
+    }
+
+    /// A backend whose every GET by name answers with `cr`.
+    fn backend_serving(cr: ModelCacheEntry) -> (KubernetesRegistryBackend, Calls) {
+        let (client, calls) = fake_api::client(move |_| fake_api::ok(&cr));
+        (backend_on(client), calls)
+    }
+
+    fn writes(calls: &Calls) -> Vec<fake_api::Call> {
+        calls
+            .all()
+            .into_iter()
+            .filter(|call| call.method != Method::GET)
+            .collect()
+    }
+
+    /// A claim on a marked CR must neither report its files, which are about to go,
+    /// nor take over the download. The caller waits until the CR is gone.
+    #[tokio::test]
+    async fn a_marked_cr_answers_every_claim_with_downloading() {
+        for phase in [phase::DOWNLOADED, phase::ERROR, phase::DOWNLOADING] {
+            let marked = fake_api::marked(hf_entry(&scoped_name(), phase));
+            let (backend, calls) = backend_serving(marked);
+            let outcome = backend
+                .try_claim_for_download(MODEL, ModelProvider::HuggingFace, "claim", LEASE)
+                .await
+                .expect("claim");
+            assert_eq!(
+                outcome,
+                ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING),
+                "phase {phase}"
+            );
+            assert!(writes(&calls).is_empty(), "{:?}", calls.all());
+        }
+    }
+
+    /// A zero lease makes every unowned download claimable at once. The mark must
+    /// still win.
+    #[tokio::test]
+    async fn a_marked_cr_is_not_taken_over_when_its_lease_ends() {
+        let marked = fake_api::marked(hf_entry(&scoped_name(), phase::DOWNLOADING));
+        let (backend, calls) = backend_serving(marked.clone());
+        let outcome = backend
+            .try_claim_existing(marked, "claim", std::time::Duration::ZERO, false)
+            .await
+            .expect("claim");
+        assert_eq!(
+            outcome,
+            ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING)
+        );
+        assert!(calls.all().is_empty(), "{:?}", calls.all());
+    }
+
+    /// Migrating a marked legacy CR would copy a record whose files are being deleted.
+    #[tokio::test]
+    async fn a_marked_legacy_cr_is_not_migrated() {
+        let legacy_name = KubernetesRegistryBackend::legacy_cr_name_for(MODEL).expect("CR name");
+        let legacy = fake_api::marked(hf_entry(&legacy_name, phase::DOWNLOADED));
+        let (client, calls) = fake_api::client(move |call| {
+            if call.is(Method::GET, &legacy_name) {
+                fake_api::ok(&legacy)
+            } else {
+                fake_api::failure(StatusCode::NOT_FOUND)
+            }
+        });
+
+        let outcome = backend_on(client)
+            .try_claim_for_download(MODEL, ModelProvider::HuggingFace, "claim", LEASE)
+            .await
+            .expect("claim");
+        assert_eq!(
+            outcome,
+            ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING)
+        );
+        assert!(writes(&calls).is_empty(), "{:?}", calls.all());
+    }
+
+    #[tokio::test]
+    async fn a_marked_cr_refuses_the_retry_and_the_reclaim() {
+        let marked_error = fake_api::marked(hf_entry(&scoped_name(), phase::ERROR));
+        let (backend, calls) = backend_serving(marked_error);
+        assert!(
+            !backend
+                .try_reset_error_for_retry(MODEL, ModelProvider::HuggingFace, "claim", LEASE)
+                .await
+                .expect("retry")
+        );
+        assert!(writes(&calls).is_empty(), "{:?}", calls.all());
+
+        let marked_downloaded = fake_api::marked(hf_entry(&scoped_name(), phase::DOWNLOADED));
+        let (backend, calls) = backend_serving(marked_downloaded);
+        assert!(
+            !backend
+                .try_reclaim_downloaded(MODEL, ModelProvider::HuggingFace, "claim", LEASE)
+                .await
+                .expect("reclaim")
+        );
+        assert!(writes(&calls).is_empty(), "{:?}", calls.all());
+    }
+
+    /// A delete can mark the CR between the read and the patch. The resourceVersion
+    /// test makes the API server refuse the patch in that case.
+    #[tokio::test]
+    async fn the_reclaim_patch_is_fenced_on_the_version_it_read() {
+        let (backend, calls) = backend_serving(hf_entry(&scoped_name(), phase::DOWNLOADED));
+        assert!(
+            backend
+                .try_reclaim_downloaded(MODEL, ModelProvider::HuggingFace, "claim", LEASE)
+                .await
+                .expect("reclaim")
+        );
+        let patches = calls.matching(Method::PATCH, "/status");
+        assert_eq!(patches.len(), 1, "{:?}", calls.all());
+        let ops = patches[0].body.as_array().expect("JSON patch");
+        assert_eq!(
+            ops[..3],
+            [
+                json!({ "op": "test", "path": "/metadata/resourceVersion", "value": "7" }),
+                json!({ "op": "test", "path": "/status/phase", "value": phase::DOWNLOADED }),
+                json!({ "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADING }),
+            ]
+        );
+        assert!(ops.contains(&json!({ "op": "add", "path": "/status/claimId", "value": "claim" })));
+
+        // The record is in another phase: nothing is written.
+        let (backend, calls) = backend_serving(hf_entry(&scoped_name(), phase::ERROR));
+        assert!(
+            !backend
+                .try_reclaim_downloaded(MODEL, ModelProvider::HuggingFace, "claim", LEASE)
+                .await
+                .expect("reclaim")
+        );
+        assert!(writes(&calls).is_empty(), "{:?}", calls.all());
+
+        // The API server refuses the patch: the claim is lost, not failed.
+        for code in [StatusCode::CONFLICT, StatusCode::UNPROCESSABLE_ENTITY] {
+            let cr = hf_entry(&scoped_name(), phase::ERROR);
+            let (client, _calls) = fake_api::client(move |call| {
+                if call.method == Method::GET {
+                    fake_api::ok(&cr)
+                } else {
+                    fake_api::failure(code)
+                }
+            });
+            assert!(
+                !backend_on(client)
+                    .try_reset_error_for_retry(MODEL, ModelProvider::HuggingFace, "claim", LEASE)
+                    .await
+                    .expect("retry")
+            );
+        }
+    }
+
+    fn downloading_entry(claim_id: &str) -> ModelCacheEntry {
+        fake_api::entry(
+            &scoped_name(),
+            MODEL,
+            "HuggingFace",
+            Some(fake_api::status(phase::DOWNLOADING, Some(claim_id), None)),
+        )
+    }
+
+    async fn finish(backend: &KubernetesRegistryBackend, claim_id: &str) -> RegistryResult<bool> {
+        backend
+            .finish_download_claim(
+                MODEL,
+                ModelProvider::HuggingFace,
+                claim_id,
+                ModelStatus::DOWNLOADED,
+                None,
+            )
+            .await
+    }
+
+    /// A download can end after a delete marked its CR and before the finalizer
+    /// revokes the claim. The files are about to go, so the completion must not
+    /// publish DOWNLOADED.
+    #[tokio::test]
+    async fn a_marked_cr_refuses_the_completion() {
+        let (backend, calls) = backend_serving(fake_api::marked(downloading_entry("claim")));
+        assert!(!finish(&backend, "claim").await.expect("finish"));
+        assert!(writes(&calls).is_empty(), "{:?}", calls.all());
+
+        // Another owner, or no CR: also no write.
+        let (backend, calls) = backend_serving(downloading_entry("other"));
+        assert!(!finish(&backend, "claim").await.expect("finish"));
+        assert!(writes(&calls).is_empty(), "{:?}", calls.all());
+
+        let (client, calls) = fake_api::client(|_| fake_api::failure(StatusCode::NOT_FOUND));
+        assert!(!finish(&backend_on(client), "claim").await.expect("finish"));
+        assert!(writes(&calls).is_empty(), "{:?}", calls.all());
+    }
+
+    /// A delete can mark the CR between the read and the patch. The resourceVersion
+    /// test makes the API server refuse the patch, and the next read sees the mark.
+    #[tokio::test]
+    async fn the_completion_patch_is_fenced_on_the_version_it_read() {
+        let (backend, calls) = backend_serving(downloading_entry("claim"));
+        assert!(finish(&backend, "claim").await.expect("finish"));
+        let patches = calls.matching(Method::PATCH, "/status");
+        assert_eq!(patches.len(), 1, "{:?}", calls.all());
+        let ops = patches[0].body.as_array().expect("JSON patch");
+        assert_eq!(
+            ops[0],
+            json!({ "op": "test", "path": "/metadata/resourceVersion", "value": "7" })
+        );
+        assert!(ops.contains(
+            &json!({ "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADED })
+        ));
+
+        for code in [StatusCode::CONFLICT, StatusCode::UNPROCESSABLE_ENTITY] {
+            let refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (client, calls) = fake_api::client({
+                let refused = refused.clone();
+                move |call| {
+                    if call.method != Method::GET {
+                        refused.store(true, std::sync::atomic::Ordering::SeqCst);
+                        fake_api::failure(code)
+                    } else if refused.load(std::sync::atomic::Ordering::SeqCst) {
+                        fake_api::ok(&fake_api::marked(downloading_entry("claim")))
+                    } else {
+                        fake_api::ok(&downloading_entry("claim"))
+                    }
+                }
+            });
+            assert!(!finish(&backend_on(client), "claim").await.expect("finish"));
+            assert_eq!(writes(&calls).len(), 1, "{:?}", calls.all());
+        }
+    }
+
+    /// A write that changes the version but not the claim, such as a `lastUsedAt`
+    /// update, must not cost the owner its completed download.
+    #[tokio::test]
+    async fn a_completion_that_loses_the_version_tries_again() {
+        let patches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (client, calls) = fake_api::client({
+            let patches = patches.clone();
+            move |call| {
+                if call.method == Method::GET {
+                    fake_api::ok(&downloading_entry("claim"))
+                } else if patches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    fake_api::failure(StatusCode::CONFLICT)
+                } else {
+                    fake_api::ok(&downloading_entry("claim"))
+                }
+            }
+        });
+        assert!(finish(&backend_on(client), "claim").await.expect("finish"));
+        assert_eq!(writes(&calls).len(), 2, "{:?}", calls.all());
+
+        // A CR that changes on each attempt is an error, not a lost claim.
+        let (client, calls) = fake_api::client(|call| {
+            if call.method == Method::GET {
+                fake_api::ok(&downloading_entry("claim"))
+            } else {
+                fake_api::failure(StatusCode::CONFLICT)
+            }
+        });
+        assert!(finish(&backend_on(client), "claim").await.is_err());
+        assert_eq!(
+            writes(&calls).len(),
+            FINISH_CLAIM_ATTEMPTS,
+            "{:?}",
+            calls.all()
+        );
+    }
+
+    /// A marked CR is a record that is already deleted. Counting or listing it would
+    /// evict one live model too many and book a deleted download twice.
+    #[tokio::test]
+    async fn registry_reads_do_not_see_marked_crs() {
+        let live = hf_entry("live", phase::DOWNLOADED);
+        let marked = fake_api::marked(fake_api::entry(
+            "marked",
+            "org/deleted",
+            "HuggingFace",
+            Some(fake_api::status(phase::DOWNLOADING, Some("owner"), None)),
+        ));
+        let (client, _calls) = fake_api::client({
+            let items = vec![live, marked.clone()];
+            move |call| {
+                if call.path.ends_with("/modelcacheentries") {
+                    fake_api::list(&items)
+                } else {
+                    fake_api::ok(&marked)
+                }
+            }
+        });
+        let backend = backend_on(client);
+
+        let records = backend.get_models_by_last_used(None).await.expect("list");
+        let names: Vec<&str> = records.iter().map(|r| r.model_name.as_str()).collect();
+        assert_eq!(names, [MODEL]);
+        assert_eq!(
+            backend.get_status_counts().await.expect("counts"),
+            (0, 1, 0)
+        );
+        assert_eq!(
+            backend.get_status("org/deleted").await.expect("status"),
+            None
+        );
+        assert_eq!(
+            backend
+                .get_model_record("org/deleted")
+                .await
+                .expect("record"),
+            None
+        );
+    }
+
+    fn access_review(allowed: bool) -> serde_json::Value {
+        json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectAccessReview",
+            "spec": {},
+            "status": { "allowed": allowed },
+        })
+    }
+
+    /// Without `watch` no server removes the finalizer, and every delete would hang.
+    #[tokio::test]
+    async fn connect_fails_when_the_server_cannot_watch() {
+        for allowed in [true, false] {
+            let (client, calls) = fake_api::client(move |call| {
+                if call.method == Method::POST {
+                    (StatusCode::CREATED, access_review(allowed))
+                } else {
+                    fake_api::list(&[])
+                }
+            });
+            let result = backend_on(client).connect().await;
+            assert_eq!(result.is_ok(), allowed, "{result:?}");
+            if let Err(e) = result {
+                assert!(e.to_string().contains("`watch`"), "{e}");
+            }
+
+            let reviews = calls.matching(Method::POST, "/selfsubjectaccessreviews");
+            assert_eq!(reviews.len(), 1, "{:?}", calls.all());
+            assert_eq!(
+                reviews[0].body["spec"]["resourceAttributes"],
+                json!({
+                    "group": "modelexpress.nvidia.com",
+                    "resource": "modelcacheentries",
+                    "verb": "watch",
+                    "namespace": fake_api::NAMESPACE,
+                })
+            );
+        }
     }
 }

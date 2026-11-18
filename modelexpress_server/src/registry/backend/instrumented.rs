@@ -187,6 +187,29 @@ impl RegistryBackend for InstrumentedRegistryBackend {
         reset
     }
 
+    async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let reclaimed = self
+            .metrics
+            .time(
+                Store::Registry,
+                "try_reclaim_downloaded",
+                self.inner
+                    .try_reclaim_downloaded(model_name, provider, claim_id, lease_duration),
+            )
+            .await;
+        if matches!(reclaimed, Ok(true)) {
+            self.lifecycle
+                .record_transition(StatusLabel::Downloaded, StatusLabel::Downloading);
+        }
+        reclaimed
+    }
+
     async fn refresh_download_claim(
         &self,
         model_name: &str,
@@ -298,7 +321,7 @@ mod tests {
         );
     }
 
-    /// Twelve near-identical forwarding bodies invite a copy-pasted op literal, so
+    /// Thirteen near-identical forwarding bodies invite a copy-pasted op literal, so
     /// pin that each method reports under its own name and none under another's.
     #[tokio::test]
     async fn every_method_reports_under_its_own_op_name() {
@@ -324,6 +347,9 @@ mod tests {
             .times(1)
             .returning(|_, _, _, _| Ok(ClaimOutcome::Claimed));
         mock.expect_try_reset_error_for_retry()
+            .times(1)
+            .returning(|_, _, _, _| Ok(false));
+        mock.expect_try_reclaim_downloaded()
             .times(1)
             .returning(|_, _, _, _| Ok(false));
         mock.expect_refresh_download_claim()
@@ -364,6 +390,9 @@ mod tests {
             .try_reset_error_for_retry(model, ModelProvider::HuggingFace, "claim-1", lease)
             .await;
         let _ = backend
+            .try_reclaim_downloaded(model, ModelProvider::HuggingFace, "claim-1", lease)
+            .await;
+        let _ = backend
             .refresh_download_claim(model, ModelProvider::HuggingFace, "claim-1", lease)
             .await;
         let _ = backend
@@ -388,6 +417,7 @@ mod tests {
             "get_status_counts",
             "try_claim_for_download",
             "try_reset_error_for_retry",
+            "try_reclaim_downloaded",
             "refresh_download_claim",
             "finish_download_claim",
         ] {
@@ -634,6 +664,33 @@ mod tests {
             no_transition_booked(&encoded),
             "a replica that lost the retry race booked a transition: {encoded}"
         );
+    }
+
+    /// Only the request that wins the reclaim starts a download, so only it books
+    /// the arrival.
+    #[tokio::test]
+    async fn only_a_won_reclaim_records_the_arrival_from_downloaded() {
+        for won in [true, false] {
+            let mut mock = MockRegistryBackend::new();
+            mock.expect_try_reclaim_downloaded()
+                .times(1)
+                .returning(move |_, _, _, _| Ok(won));
+
+            let (backend, prom) = instrumented(mock);
+            let _ = backend
+                .try_reclaim_downloaded(MODEL, ModelProvider::HuggingFace, CLAIM, lease())
+                .await;
+
+            let encoded = scrape(&prom);
+            assert_eq!(
+                encoded.contains(
+                    r#"mx_registry_status_transitions_total{from="downloaded",to="downloading"} 1"#
+                ),
+                won,
+                "{encoded}"
+            );
+            assert_eq!(in_flight(&encoded), i64::from(won), "{encoded}");
+        }
     }
 
     /// `result="lost"` is the leading indicator of a duplicate download, so it

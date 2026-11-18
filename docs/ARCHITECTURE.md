@@ -110,10 +110,12 @@ ModelExpress/
 │       │   ├── stats_refresh.rs        # Background gauge refresh (own interval)
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
 │       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
-│       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
+│       │   ├── entry_files.rs          # Which cached files deleting an entry removes
+│       │   ├── k8s_types.rs            # ModelCacheEntry CRD type + cache-files finalizer
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
 │       │       ├── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       ├── kubernetes/finalizer.rs # Deletes cached files of deleted ModelCacheEntries
 │       │       └── instrumented.rs     # Metrics decorator over RegistryBackend
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
@@ -333,11 +335,11 @@ Six proto files define the server's gRPC services, all compiled via `tonic-build
 | `EnsureModelDownloaded` | `ModelDownloadRequest` | stream `ModelStatusUpdate` | Trigger download, stream progress |
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
-| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model's records from the registry (used by `model clear`) |
+| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model's records from the registry and the files they cover from the server cache (used by `model clear`) |
 
 Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
-`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the stale record is deleted and the download is re-claimed so the model is actually re-fetched rather than returning a false success.
+`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the record goes back to `DOWNLOADING` in place (`try_reclaim_downloaded`, a compare-and-set that one request wins) and the winner downloads the model again, so the request does not return a false success. The record is not deleted for this: a delete also deletes the files the entry covers, and server replicas that each have their own cache still hold good copies. The check runs on each claim attempt. A compare-and-set that loses to a write which leaves the record `DOWNLOADED` (a `last_used_at` update from a replica that has the files) is tried again, and a request that cannot take the record back after five attempts ends with `ERROR`, not with a cache hit. The check follows the weight mode of the request, so a metadata-only entry is not taken for a missing download because it has no weight files.
 
 #### Pinned revisions
 
@@ -355,7 +357,16 @@ Registry backends key every record, lease, and claim on one string. That key is 
 
 An unpinned, full-weight entry encodes to the bare model name, so records written before revisions existed keep parsing and providers without a revision concept keep the keys they have always used. Anything else encodes as `mx1:<revision>:<flags>:<model_name>`. The model name goes last because it is the only field with no character restrictions — a GCS object path accepts almost any byte, so a name containing the separator must not be able to impersonate the other fields and aim a delete at the wrong model.
 
-Cache eviction parses the key back to delete the right snapshot. It keeps the files while another entry still references the same commit, treating a revisionless entry as covering every snapshot of its model. When the evicted entry is the last one for its model the whole repository directory goes, so a snapshot kept alive by an earlier shared-file decision cannot outlive the last record pointing at it. Hugging Face snapshot entries are symlinks into `blobs/`, so a per-revision delete also reclaims the blobs no surviving snapshot references — otherwise it would free almost no disk.
+Deleting an entry deletes the files it covers (`registry/entry_files.rs`), whether cache eviction, the `DeleteModel` RPC, or (Kubernetes backend) a direct delete of the `ModelCacheEntry` removes it. The key is parsed back to delete the right snapshot. The files stay while another entry still references the same commit, treating a revisionless entry as covering every snapshot of its model. A metadata-only entry and a full-weight entry of one commit share the snapshot, so the weight files stay until the two entries are gone. The files also stay while another entry of the model is `DOWNLOADING`: its partial blobs have no snapshot link yet, and a per-revision delete would reclaim them. When the deleted entry is the last one for its model the whole repository directory goes, so a snapshot kept alive by an earlier shared-file decision cannot outlive the last record pointing at it. Hugging Face snapshot entries are symlinks into `blobs/`, so a per-revision delete also reclaims the blobs no surviving snapshot references — otherwise it would free almost no disk.
+
+Entries are compared by the canonical model name of their provider, so two records that name one cache directory count as one model. A name must also have a cache directory of its own:
+
+- The Hugging Face cache directory is `models--` and the name with each `/` replaced by `--`. A name that is not a repository id (a part between `/` that is empty, that starts or ends with `-`, or that contains `--`) gives the directory of a different model, as `org--model` does for `org/model`. The server refuses such a name in each request, and the provider refuses to delete by it.
+- An S3 object prefix can be a parent of another one. The directory of one model is then inside the directory of the other, and the two share the files below the inner prefix. A delete keeps the directory of each cached model below the deleted prefix. A delete of a model below a cached prefix removes only the completion marker of that model. GCS refuses to download a model whose prefix overlaps a cached one.
+
+The delete uses the revision of the key as the snapshot directory name and does not look it up in `refs/`. This is the identity that the rule above compares, so a key with a branch name cannot delete the snapshot of a key with the commit. The server writes only commit identifiers and names that the provider accepts into a key. A key with a revision that is not one plain directory name, or with a name that its provider refuses, covers no files, and its delete is skipped with a warning.
+
+`DeleteModel` deletes the records first and the files second. The response has `success: true` only when no record and no file of the model remains. If a record cannot be deleted, or the registry cannot be listed, the files stay and the response has `success: false`; the record count in the message has only the records that are gone. If the file delete fails, the response also has `success: false`, and a second request deletes the files although no record remains, because the files of the provider named in the request are always tried.
 
 ### p2p.proto - P2pService
 
@@ -421,9 +432,9 @@ The optional Redis-backed RefitService, immutable WeightVersion model, shard pub
    fail, so a scrape proves the exporter came up even on a server that never
    reaches a healthy state. A bind failure logs and continues rather than
    aborting startup.
-5. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
-6. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
-7. Start `CacheEvictionService` background task (reads the same registry)
+5. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error. On the Kubernetes backend this includes a check that the server can `watch` `modelcacheentries`.
+6. Resolve the model cache directory once (`ServerConfig::cache_directory`): the directory set for the server, or, when none is set, the directory that a client with no setting uses. The download tracker, cache eviction and the `ModelCacheEntry` finalizer all get this one value, so a delete looks where the download wrote. On the Kubernetes backend the finalizer controller starts here.
+7. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock, and start the `CacheEvictionService` background task (reads the same registry)
 8. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
 9. Start reaper background task for stale source detection and GC
 10. Start the registry-statistics refresh task (`MX_REGISTRY_STATS_INTERVAL_SECS`,
@@ -433,8 +444,8 @@ The optional Redis-backed RefitService, immutable WeightVersion model, shard pub
 11. Register the configured gRPC services with tonic (max message size: 100MB),
     wrapped in the per-RPC metrics layer
 12. Listen on configured address (default `0.0.0.0:8001`)
-13. Graceful shutdown on CTRL+C: signals the cache eviction service, the reaper
-    and the statistics refresh, then joins them. The `/metrics` listener stops
+13. Graceful shutdown on CTRL+C: signals the cache eviction service, the reaper,
+    the statistics refresh and the `ModelCacheEntry` finalizer, then joins them. The `/metrics` listener stops
     **last**, after the gRPC server has drained, so the drain window stays
     scrapeable.
 
@@ -445,7 +456,7 @@ server:
   host: "0.0.0.0"        # MODEL_EXPRESS_SERVER_HOST
   port: 8001              # MODEL_EXPRESS_SERVER_PORT
 cache:
-  directory: "./cache"    # MODEL_EXPRESS_CACHE_DIRECTORY
+  directory: null         # MODEL_EXPRESS_CACHE_DIRECTORY
   max_size_bytes: null
   eviction:
     enabled: true         # MODEL_EXPRESS_CACHE_EVICTION_ENABLED
@@ -470,6 +481,27 @@ Distributed backend selection lives outside the YAML, in env vars: `MX_METADATA_
 
 **Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names are `mx-cache-` followed by `sanitize_registry_name("{provider}/{model_name}")`, which lowercases, maps `/` to `--`, and appends a sha256 suffix over the original name. The P2P `ModelMetadata` CRs use their own `sanitize_model_name`; the two are separate implementations, not a shared helper.
 
+Every `ModelCacheEntry` carries the `modelexpress.nvidia.com/cache-files` finalizer: the server sets it on create, and the finalizer controller adds it to any CR that lacks it. A delete from any client (`kubectl delete mxcache`, the `DeleteModel` RPC, eviction) therefore only marks the CR. Every server replica runs the controller (`registry/backend/kubernetes/finalizer.rs`, kube-runtime `Controller` + `finalizer`), which deletes the files the entry covers with the `entry_files` rule (CRs that are themselves marked do not count as remaining entries) and then removes the finalizer. Each replica does this for its own cache directory, so replicas that share a cache repeat the delete and find nothing; the controller log states the result (no files remain, or the files were kept for another entry) and not which replica removed them. The finalizer is one mark for all replicas, and the first replica that finishes its cleanup removes it. With one cache for each replica, the delete is therefore complete only on the replicas that finished before the CR went away: a replica that is down, that has not started its cleanup, or whose file delete failed keeps its copy, and nothing deletes that copy later, because no entry names it. The next request for the model on that replica makes a new entry that covers the copy, and a `DeleteModel` request to that replica removes it while the model has no entry. A delete made while no server runs completes when one starts. A namespace that is being deleted cannot start one, so delete the entries, or remove their finalizers, before the namespace (see [DEPLOYMENT.md](DEPLOYMENT.md)).
+
+```mermaid
+sequenceDiagram
+    participant U as kubectl / server
+    participant K as API server
+    participant C as Finalizer controller
+    participant D as Server cache (NFS)
+    U->>K: delete ModelCacheEntry
+    K-->>C: CR has deletionTimestamp
+    alt phase Downloading with claimId
+        C->>K: clear status.claimId (owner fenced)
+        C->>C: wait until lease unchanged for one lease duration
+    end
+    C->>K: list remaining (unmarked) CRs
+    C->>D: delete files no remaining entry references
+    C->>K: remove finalizer, CR is gone
+```
+
+While a CR is marked, every claim on it reports `DOWNLOADING` without a mutation, so callers wait and then claim a fresh CR instead of using files that are about to go. For every other registry read (status, record, list, counts) a marked CR is a deleted record and is not returned, so it is not counted against `max_models` and not evicted a second time. If the entry was downloading, the controller clears `status.claimId`. That fences the owner exactly like a lease takeover: its next heartbeat and its completion both fail, so it stops and cannot publish the entry as downloaded. A download that ends before the controller clears the claim is fenced too: the completion reads the CR, stops when the CR is marked, and its patch tests the `resourceVersion` that it read, so a mark that arrives after the read makes the API server refuse the patch. The files go once the lease fingerprint has stayed unchanged for one lease duration (30s).
+
 Key operations on the async `RegistryBackend` trait:
 
 | Method | Redis implementation |
@@ -477,6 +509,7 @@ Key operations on the async `RegistryBackend` trait:
 | `get_status(name)` | `HGET mx:model:{provider}:{name} status` (falls back to the legacy name-only key so pre-0.5.0 records still resolve) |
 | `set_status(name, provider, status, msg)` | Lua `EVAL` updates status/provider/last_used_at/message atomically and `HSETNX`s `created_at` to preserve the first-write timestamp |
 | `try_claim_for_download(name, provider)` | `HSETNX status DOWNLOADING`; winner populates remaining fields without contention |
+| `try_reset_error_for_retry(name, provider, claim)` / `try_reclaim_downloaded(name, provider, claim)` | Lua `EVAL` compare-and-set from `ERROR` (retry) or `DOWNLOADED` (files missing) to `DOWNLOADING`; the winner owns the lease |
 | `touch_model(name)` | `HSET last_used_at {now}` (gated on `EXISTS` so touch is update-only, never create) |
 | `delete_model(name)` | `DEL` |
 | `get_models_by_last_used(limit)` | `SCAN mx:model:*` + pipelined `HGETALL` + Rust-side sort |
@@ -543,7 +576,7 @@ The `Client` struct in `modelexpress_client/src/lib.rs` wraps gRPC connections:
 | `list_cached_models()` | List locally cached models as `CacheStats` |
 | `clear_cached_model(name, provider)` | Remove a model's local files for a given provider |
 | `clear_all_cached_models()` | Clear the entire local cache |
-| `delete_model_on_server(name, provider)` | Delete the model's record from the server-side registry, so a cleared model leaves no stale `DOWNLOADED` record |
+| `delete_model_on_server(name, provider)` | Delete the model's records from the server-side registry and its files from the server cache, so a cleared model leaves no stale `DOWNLOADED` record |
 | `get_model_path(name, provider)` | Resolve the local cache path for a model through its provider |
 | `health_check()` | Call HealthService and return the server `Status` |
 | `send_request(action, payload)` | Send a generic ApiService request and deserialize the response |

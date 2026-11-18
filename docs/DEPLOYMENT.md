@@ -41,7 +41,7 @@ server:
   port: 8001
 
 cache:
-  directory: "./cache"
+  directory: null
   max_size_bytes: null
   eviction:
     enabled: true
@@ -129,6 +129,59 @@ Helm does not update an existing CRD from the chart's `crds/` directory. Then
 either enable `serviceAccount.rbac.enabled=true` on the Helm chart or apply
 `examples/p2p_transfer_k8s/server/kubernetes_backend/rbac-modelmetadata.yaml`.
 
+On the Kubernetes backend, deleting a `ModelCacheEntry` (`kubectl delete mxcache <name>`)
+also deletes the files it covers from the server cache, unless another entry still
+uses them: an entry of the same commit (for example the metadata-only entry next to
+a full-weight one), an entry with no revision, or an entry of the same model that is
+downloading. The files then go with the last entry of the model, and the server log
+says that they were kept. The server holds each CR with the
+`modelexpress.nvidia.com/cache-files` finalizer until the files are gone, so the
+server's RBAC must include `watch` on `modelcacheentries`; the server does not start
+without it.
+
+With one cache for each replica (see [Storage access modes](#storage-access-modes)),
+each replica deletes its own copy, and the first replica that finishes releases the
+entry. A replica that is down at that time, that has not started its delete, or whose
+file delete failed keeps its copy. No later step deletes that copy, because no entry
+names it. The replica uses the copy again when it gets a request for the model. To
+remove the copy, send `model clear` for the model to that replica while the model has
+no entry. On the Redis backend, only the replica that does the delete (its eviction
+cycle, or the `DeleteModel` request that it gets) deletes its copy. With a shared
+cache there is one copy, and the first delete removes it.
+
+Only a ModelExpress server removes the finalizer. A delete that no server can
+finish waits, and it blocks the delete of its namespace and of the CRD. Use one of
+these two procedures before you remove the last server:
+
+```bash
+# Delete the entries while the server runs. The server deletes the cached files.
+kubectl -n $NAMESPACE delete mxcache --all --timeout=120s
+
+# Or, after the server is gone, release the entries. The cached files stay.
+RELEASE='[{"op":"test","path":"/metadata/finalizers/0","value":"modelexpress.nvidia.com/cache-files"},{"op":"remove","path":"/metadata/finalizers/0"}]'
+for entry in $(kubectl -n $NAMESPACE get mxcache -o name); do
+  kubectl -n $NAMESPACE patch $entry --type=json -p "$RELEASE" || echo "not released: $entry"
+done
+```
+
+The patch removes only the ModelExpress finalizer. On an entry where a different
+finalizer is first in the list, the patch changes nothing and the loop prints
+`not released` with the name of the entry; use the index of the ModelExpress
+finalizer in the two paths for that entry.
+
+**Uninstall:** `helm uninstall` keeps the CRDs and the entries. Run one of the two
+procedures before `kubectl delete namespace` or a delete of the CRD, or the delete
+does not complete.
+
+**Rollback:** a server of version 0.8.0 or earlier does not remove the finalizer and
+does not know a deleted entry that waits on it. After a rollback, an entry that is
+deleted (by eviction, `model clear`, or `kubectl`) stays with phase `DOWNLOADED`
+although its files are gone, and the server reports the model as cached. Before
+you start the old version, stop all servers of the new version and release the
+entries with the second procedure. During a rolling update in either direction, a
+download that an old replica starts can lose its claim one time and start again
+after one lease duration (30s).
+
 Both CRD manifests are generated from the Rust types: after editing `modelexpress_server/src/{p2p,registry}/k8s_types.rs`, run `cargo run -p modelexpress-server --bin crdgen > examples/crds.yaml` and copy the output to `helm/crds/modelexpress-crds.yaml`; CI fails when `examples/crds.yaml` is stale.
 The chart creates a `ClusterRole` and `ClusterRoleBinding`, allowing the server
 to run in a dedicated namespace while accessing metadata resources in another
@@ -178,7 +231,7 @@ behaves as above.
 
 #### Storage access modes
 
-MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY`, default `./cache`). Its access-mode requirement depends on deployment topology, not on MX itself:
+MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY`; see [Cache Settings](#cache-settings) for the default). Its access-mode requirement depends on deployment topology, not on MX itself:
 
 | Mode | Cache volume | Notes |
 |------|-------------|-------|
@@ -196,9 +249,11 @@ For new multi-replica deployments, prefer the no-shared-storage row: each MX rep
 
 | Option | CLI Flag | Env Var | Default | Description |
 |--------|----------|---------|---------|-------------|
-| directory | `--cache-directory` | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Model cache directory |
+| directory | `--cache-directory` | `MODEL_EXPRESS_CACHE_DIRECTORY` | null (see below) | Model cache directory |
 | max_size_bytes | - | - | null (unlimited) | Max cache size in bytes |
 | eviction.enabled | `--cache-eviction-enabled` | `MODEL_EXPRESS_CACHE_EVICTION_ENABLED` | `true` | Enable LRU eviction |
+
+The server keeps models in one directory. Downloads, cache eviction, and the delete of cached files all use it. A directory from the flag, the environment variable, or the config file is that directory. When none of them sets one, the server uses the directory that a client with no setting uses, so that a client and a server on one host agree: the `local_path` in `~/.model-express/config.yaml`, then the first of `~/.model-express/cache`, `~/.cache/huggingface/hub`, `/cache`, `/app/models`, `./cache`, and `./models` that exists, then `~/.model-express/cache`. The server logs the result at startup (`Model cache directory`). Set the directory in each deployment, and give the same path to the clients that share the storage.
 
 Eviction policy settings (in config file only):
 - `eviction.policy.unused_threshold` - Evict models unused for this duration (default: 7 days)

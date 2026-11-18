@@ -23,10 +23,11 @@ use k8s_openapi::api::{
     rbac::v1::{Role, RoleBinding},
 };
 use kube::{
-    Client,
-    api::{Api, AttachParams, DeleteParams, ListParams, PostParams},
+    Client, ResourceExt,
+    api::{Api, AttachParams, DeleteParams, ListParams, Patch, PatchParams, PostParams},
     config::{KubeConfigOptions, Kubeconfig},
 };
+use modelexpress_server::registry::k8s_types::{CACHE_FILES_FINALIZER, ModelCacheEntry};
 
 const MX_RBAC_SA: &str = "modelexpress";
 use std::collections::BTreeSet;
@@ -37,6 +38,9 @@ use tokio::time::timeout;
 const IMAGE: &str = "modelexpress:multinode-test";
 const TEST_MODEL: &str = "hf-internal-testing/tiny-random-gpt2";
 const TIMEOUT: Duration = Duration::from_secs(300);
+/// The server waits one download lease (30s) before it deletes the files of an entry
+/// that was downloading, so a teardown step can take longer than that.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -119,11 +123,19 @@ async fn create_namespace(client: &Client, name: &str) -> Result<NamespaceGuard>
         "metadata": { "name": name }
     }))?;
 
-    // Delete if leftover from a previous failed run, wait until fully gone
+    // Delete if leftover from a previous failed run, wait until fully gone. A run that
+    // stopped before its teardown leaves cache entries, and no server runs in a
+    // namespace that is being deleted, so nothing but this loop releases them.
     let _ = ns_api.delete(name, &DeleteParams::default()).await;
-    while ns_api.get(name).await.is_ok() {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    timeout(TEARDOWN_TIMEOUT, async {
+        while ns_api.get(name).await.is_ok() {
+            release_cache_entries(client, name).await?;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        anyhow::Ok(())
+    })
+    .await
+    .with_context(|| format!("namespace {name} of an earlier run was not deleted"))??;
 
     ns_api.create(&PostParams::default(), &ns).await?;
 
@@ -133,9 +145,71 @@ async fn create_namespace(client: &Client, name: &str) -> Result<NamespaceGuard>
     })
 }
 
+/// Remove the cache-files finalizer from each `ModelCacheEntry` in `namespace`, so the
+/// entries can go although no server deletes their files.
+async fn release_cache_entries(client: &Client, namespace: &str) -> Result<()> {
+    let entries: Api<ModelCacheEntry> = Api::namespaced(client.clone(), namespace);
+    for entry in entries.list(&ListParams::default()).await? {
+        let Some(index) = entry
+            .finalizers()
+            .iter()
+            .position(|finalizer| finalizer == CACHE_FILES_FINALIZER)
+        else {
+            continue;
+        };
+        let path = format!("/metadata/finalizers/{index}");
+        let patch = serde_json::json!([
+            { "op": "test", "path": path, "value": CACHE_FILES_FINALIZER },
+            { "op": "remove", "path": path },
+        ]);
+        let released = entries
+            .patch(
+                &entry.name_any(),
+                &PatchParams::default(),
+                &Patch::<()>::Json(serde_json::from_value(patch)?),
+            )
+            .await;
+        match released {
+            Ok(_) => {}
+            // The entry is gone, or its finalizers changed. The caller lists again.
+            Err(kube::Error::Api(e)) if matches!(e.code, 404 | 409 | 422) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 struct NamespaceGuard {
     client: Client,
     name: String,
+}
+
+impl NamespaceGuard {
+    /// Delete the cache entries while the server runs, then the namespace.
+    ///
+    /// Each entry has a finalizer that only a server removes, after it deleted the
+    /// files of the entry. A namespace delete stops the server first, and the entries
+    /// then keep the namespace in `Terminating`.
+    async fn teardown(self) -> Result<()> {
+        let entries: Api<ModelCacheEntry> = Api::namespaced(self.client.clone(), &self.name);
+        entries
+            .delete_collection(&DeleteParams::default(), &ListParams::default())
+            .await?;
+        let drained = timeout(TEARDOWN_TIMEOUT, async {
+            while !entries.list(&ListParams::default()).await?.items.is_empty() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            anyhow::Ok(())
+        })
+        .await;
+        if drained.is_err() {
+            release_cache_entries(&self.client, &self.name).await?;
+        }
+
+        let ns_api: Api<Namespace> = Api::all(self.client.clone());
+        ns_api.delete(&self.name, &DeleteParams::default()).await?;
+        drained.context("the server did not release its cache entries")?
+    }
 }
 
 impl Drop for NamespaceGuard {
@@ -177,7 +251,7 @@ async fn create_kubernetes_backend_rbac(client: &Client, namespace: &str) -> Res
                     "modelmetadatas", "modelmetadatas/status",
                     "modelcacheentries", "modelcacheentries/status",
                 ],
-                "verbs": ["get", "list", "create", "update", "patch", "delete"],
+                "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
             },
             {
                 "apiGroups": [""],
@@ -584,7 +658,7 @@ async fn cross_node_transfer_default_chunks() -> Result<()> {
     let client = kube_client().await?;
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-default";
-    let _guard = create_namespace(&client, ns).await?;
+    let guard = create_namespace(&client, ns).await?;
     create_kubernetes_backend_rbac(&client, ns).await?;
 
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
@@ -598,7 +672,7 @@ async fn cross_node_transfer_default_chunks() -> Result<()> {
     assert!(files > 0, "expected files > 0, got {files}");
     assert!(bytes > 0, "expected bytes > 0, got {bytes}");
 
-    Ok(())
+    guard.teardown().await
 }
 
 /// Cross-node gRPC transfer with small 64KB chunks.
@@ -608,7 +682,7 @@ async fn cross_node_transfer_small_chunks() -> Result<()> {
     let client = kube_client().await?;
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-small";
-    let _guard = create_namespace(&client, ns).await?;
+    let guard = create_namespace(&client, ns).await?;
     create_kubernetes_backend_rbac(&client, ns).await?;
 
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
@@ -630,7 +704,7 @@ async fn cross_node_transfer_small_chunks() -> Result<()> {
     assert!(files > 0, "expected files > 0, got {files}");
     assert!(bytes > 0, "expected bytes > 0, got {bytes}");
 
-    Ok(())
+    guard.teardown().await
 }
 
 /// Cross-node gRPC transfer with large 4MB chunks.
@@ -640,7 +714,7 @@ async fn cross_node_transfer_large_chunks() -> Result<()> {
     let client = kube_client().await?;
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-large";
-    let _guard = create_namespace(&client, ns).await?;
+    let guard = create_namespace(&client, ns).await?;
     create_kubernetes_backend_rbac(&client, ns).await?;
 
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
@@ -662,7 +736,7 @@ async fn cross_node_transfer_large_chunks() -> Result<()> {
     assert!(files > 0, "expected files > 0, got {files}");
     assert!(bytes > 0, "expected bytes > 0, got {bytes}");
 
-    Ok(())
+    guard.teardown().await
 }
 
 /// Transfer integrity: compare md5 content hashes between server cache
@@ -674,7 +748,7 @@ async fn cross_node_transfer_integrity() -> Result<()> {
     let client = kube_client().await?;
     let (server_node, client_node) = select_nodes(&client).await?;
     let ns = "mx-test-integrity";
-    let _guard = create_namespace(&client, ns).await?;
+    let guard = create_namespace(&client, ns).await?;
     create_kubernetes_backend_rbac(&client, ns).await?;
 
     let svc = deploy_server(&client, ns, "mx-server", &server_node).await?;
@@ -700,7 +774,7 @@ async fn cross_node_transfer_integrity() -> Result<()> {
         client_hashes.difference(&server_hashes).collect::<Vec<_>>(),
     );
 
-    Ok(())
+    guard.teardown().await
 }
 
 /// Multi-replica: two servers on different nodes, each with independent caches.
@@ -711,7 +785,7 @@ async fn multi_replica_independent_caches() -> Result<()> {
     let client = kube_client().await?;
     let (node_a, node_b) = select_nodes(&client).await?;
     let ns = "mx-test-replica";
-    let _guard = create_namespace(&client, ns).await?;
+    let guard = create_namespace(&client, ns).await?;
     create_kubernetes_backend_rbac(&client, ns).await?;
 
     // Deploy two servers on different nodes
@@ -742,5 +816,5 @@ async fn multi_replica_independent_caches() -> Result<()> {
         "server B should have cached files, got {count_b}"
     );
 
-    Ok(())
+    guard.teardown().await
 }

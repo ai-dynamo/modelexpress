@@ -84,13 +84,29 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# Only a ModelExpress server removes the cache-files finalizer of a ModelCacheEntry.
+# After the server is gone, the entries keep the namespace in Terminating until
+# their finalizers are removed. The patch names the finalizer, so it does not
+# remove one that a different controller owns.
+release_cache_entry_finalizers() {
+    local entry
+    local patch='[{"op":"test","path":"/metadata/finalizers/0","value":"modelexpress.nvidia.com/cache-files"},{"op":"remove","path":"/metadata/finalizers/0"}]'
+    kubectl get modelcacheentries.modelexpress.nvidia.com -n "$NAMESPACE" -o name 2>/dev/null |
+        while read -r entry; do
+            kubectl patch "$entry" -n "$NAMESPACE" --type=json -p "$patch" >/dev/null 2>&1 || true
+        done
+}
+
 cleanup() {
     if [ "$CLEANUP" = true ]; then
         log_info "Cleaning up Kubernetes resources..."
         kubectl delete job grpc-transfer-test-cli -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
         kubectl delete job grpc-transfer-test-env -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
-        helm uninstall "$RELEASE_NAME" -n "$NAMESPACE" 2>/dev/null || true
-        kubectl delete namespace "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+        # Wait for the server pod to go, or it puts the finalizers back.
+        helm uninstall "$RELEASE_NAME" -n "$NAMESPACE" --wait --timeout 120s 2>/dev/null || true
+        release_cache_entry_finalizers
+        kubectl delete namespace "$NAMESPACE" --ignore-not-found=true --timeout=180s 2>/dev/null ||
+            log_warning "Namespace $NAMESPACE was not deleted in 180s"
         if [ "$CREATED_CLUSTER" = true ]; then
             log_info "Deleting kind cluster ${KIND_CLUSTER_NAME}..."
             kind delete cluster --name "${KIND_CLUSTER_NAME}" 2>/dev/null || true
@@ -100,6 +116,7 @@ cleanup() {
         log_warning "Skipping cleanup (--no-cleanup specified)"
         log_info "To cleanup manually, run:"
         echo "  kubectl delete job grpc-transfer-test-cli grpc-transfer-test-env -n $NAMESPACE"
+        echo "  kubectl delete modelcacheentries --all -n $NAMESPACE --timeout=120s"
         echo "  helm uninstall $RELEASE_NAME -n $NAMESPACE"
         echo "  kubectl delete namespace $NAMESPACE"
         if [ "$CREATED_CLUSTER" = true ]; then

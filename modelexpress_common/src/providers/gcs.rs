@@ -166,6 +166,22 @@ impl ModelProviderTrait for GcsProvider {
         Ok(model_dir)
     }
 
+    async fn has_cached_files(
+        &self,
+        model_name: &str,
+        cache_dir: PathBuf,
+        _revision: Option<&str>,
+        ignore_weights: bool,
+    ) -> bool {
+        let Ok(model) = ModelName::parse(model_name) else {
+            return false;
+        };
+        let model_dir = model.model_dir(&cache_dir);
+        ModelDir::new(&cache_dir, &model_dir)
+            .cache_satisfies_request(ignore_weights)
+            .unwrap_or(false)
+    }
+
     fn canonical_model_name(&self, model_name: &str) -> Result<String> {
         Ok(ModelName::parse(model_name)?.to_string())
     }
@@ -569,6 +585,42 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// A metadata-only download leaves the weight files of the manifest out of the
+    /// cache. That cache is complete for a metadata-only request and incomplete for a
+    /// full-weight one.
+    #[tokio::test]
+    async fn test_has_cached_files_follows_the_weight_mode_of_the_request() {
+        let provider = GcsProvider;
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_dir = temp_dir.path().to_path_buf();
+        let model_name = "gs://test-bucket/org/model/rev-metadata";
+        write_manifest_with_payloads(
+            temp_dir.path(),
+            model_name,
+            &[("tokenizer.json", b"{}")],
+            vec![
+                manifest_entry("tokenizer.json", b"{}"),
+                manifest_entry("weights/model.safetensors", b"weights"),
+            ],
+        );
+
+        assert!(
+            provider
+                .has_cached_files(model_name, cache_dir.clone(), None, true)
+                .await
+        );
+        assert!(
+            !provider
+                .has_cached_files(model_name, cache_dir.clone(), None, false)
+                .await
+        );
+        assert!(
+            !provider
+                .has_cached_files("gs://test-bucket/org/absent", cache_dir, None, true)
+                .await
+        );
     }
 
     #[tokio::test]

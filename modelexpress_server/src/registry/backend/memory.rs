@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 
-use crate::registry::backend::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
+use crate::registry::backend::{
+    ClaimOutcome, ModelRecord, RECLAIM_MESSAGE, RegistryBackend, RegistryResult,
+};
 
 #[derive(Debug)]
 struct DownloadLease {
@@ -45,6 +47,38 @@ impl InMemoryRegistryBackend {
             .ok()
             .and_then(|duration| now.checked_add_signed(duration))
             .unwrap_or(now)
+    }
+
+    /// Flip `from` to DOWNLOADING and make `claim_id` the lease owner.
+    fn claim_from_status(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        from: ModelStatus,
+        message: &str,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> bool {
+        let mut state = self.lock();
+        let now = Utc::now();
+        let lease_expires_at = Self::lease_deadline(now, lease_duration);
+        match state.models.get_mut(model_name) {
+            Some(record) if record.status == from => {
+                record.provider = provider;
+                record.status = ModelStatus::DOWNLOADING;
+                record.message = Some(message.to_string());
+                record.last_used_at = now;
+                state.leases.insert(
+                    model_name.to_string(),
+                    DownloadLease {
+                        claim_id: claim_id.to_string(),
+                        expires_at: lease_expires_at,
+                    },
+                );
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -195,26 +229,31 @@ impl RegistryBackend for InMemoryRegistryBackend {
         claim_id: &str,
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
-        let mut state = self.lock();
-        let now = Utc::now();
-        let lease_expires_at = Self::lease_deadline(now, lease_duration);
-        match state.models.get_mut(model_name) {
-            Some(record) if record.status == ModelStatus::ERROR => {
-                record.provider = provider;
-                record.status = ModelStatus::DOWNLOADING;
-                record.message = Some("Retrying download...".to_string());
-                record.last_used_at = now;
-                state.leases.insert(
-                    model_name.to_string(),
-                    DownloadLease {
-                        claim_id: claim_id.to_string(),
-                        expires_at: lease_expires_at,
-                    },
-                );
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+        Ok(self.claim_from_status(
+            model_name,
+            provider,
+            ModelStatus::ERROR,
+            "Retrying download...",
+            claim_id,
+            lease_duration,
+        ))
+    }
+
+    async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        Ok(self.claim_from_status(
+            model_name,
+            provider,
+            ModelStatus::DOWNLOADED,
+            RECLAIM_MESSAGE,
+            claim_id,
+            lease_duration,
+        ))
     }
 
     async fn refresh_download_claim(
@@ -437,6 +476,52 @@ mod tests {
         backend.touch_model("ghost").await.expect("touch unknown");
         backend.delete_model("ghost").await.expect("delete unknown");
         assert!(backend.get_status("ghost").await.expect("get").is_none());
+    }
+
+    // the reclaim only fires from DOWNLOADED, and its winner owns the new download
+    #[tokio::test]
+    async fn try_reclaim_downloaded_only_from_downloaded() {
+        let backend = InMemoryRegistryBackend::new();
+        let lease = std::time::Duration::from_secs(30);
+        let reclaim = |claim_id: &'static str| {
+            backend.try_reclaim_downloaded("m", ModelProvider::HuggingFace, claim_id, lease)
+        };
+        assert!(!reclaim("owner").await.expect("reclaim unknown"));
+
+        backend
+            .set_status("m", ModelProvider::HuggingFace, ModelStatus::ERROR, None)
+            .await
+            .expect("set error");
+        assert!(!reclaim("owner").await.expect("reclaim from error"));
+
+        backend
+            .set_status(
+                "m",
+                ModelProvider::HuggingFace,
+                ModelStatus::DOWNLOADED,
+                None,
+            )
+            .await
+            .expect("set downloaded");
+        assert!(reclaim("owner").await.expect("reclaim from downloaded"));
+        assert!(
+            !reclaim("late").await.expect("second reclaim"),
+            "the record is DOWNLOADING now, so a second caller loses"
+        );
+
+        assert!(
+            backend
+                .finish_download_claim(
+                    "m",
+                    ModelProvider::HuggingFace,
+                    "owner",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("finish"),
+            "the reclaim made its caller the lease owner"
+        );
     }
 
     // the error-retry CAS only fires when the model is currently in ERROR

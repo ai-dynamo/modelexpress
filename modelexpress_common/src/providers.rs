@@ -129,6 +129,9 @@ pub trait ModelProviderTrait: Send + Sync {
 
     /// Delete a single revision of a model from the provider's cache.
     /// A `None` revision deletes everything cached for the model.
+    ///
+    /// `revision` is the immutable revision that [`Self::resolve_revision`] returns,
+    /// not a branch or a tag.
     async fn delete_model_revision(
         &self,
         model_name: &str,
@@ -153,6 +156,23 @@ pub trait ModelProviderTrait: Send + Sync {
     ) -> Result<PathBuf> {
         reject_unsupported_revision(self.provider_name(), revision)?;
         self.get_model_path(model_name, cache_dir).await
+    }
+
+    /// Whether the cache holds the files a request for this model needs.
+    ///
+    /// A request made with `ignore_weights` is satisfied by a cache that has no weight
+    /// files. Providers whose [`Self::get_model_path`] requires the weights override
+    /// this, so such a cache is not taken for a missing download.
+    async fn has_cached_files(
+        &self,
+        model_name: &str,
+        cache_dir: PathBuf,
+        revision: Option<&str>,
+        _ignore_weights: bool,
+    ) -> bool {
+        self.get_model_path_revision(model_name, cache_dir, revision)
+            .await
+            .is_ok()
     }
 
     /// Return the canonical model name for this provider.

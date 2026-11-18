@@ -537,10 +537,11 @@ async fn show_model_status(
     Ok(())
 }
 
-/// Best-effort deletion of a model's server-side registry record. Removing the local
-/// files is the primary intent of `model clear`, so a server that is unreachable or
-/// returns an error is surfaced as a warning rather than failing the command. Returns
-/// `Ok(())` when the record was deleted, `Err(reason)` otherwise.
+/// Best-effort deletion of a model's server-side registry records and of the files
+/// they cover in the server cache. Removing the local files is the primary intent of
+/// `model clear`, so a server that is unreachable or returns an error is surfaced as
+/// a warning rather than failing the command. Returns `Ok(())` when the server deleted
+/// both, `Err(reason)` otherwise.
 async fn delete_model_registry_record(
     server_config: &ClientConfig,
     model_name: &str,
@@ -552,7 +553,7 @@ async fn delete_model_registry_record(
     client
         .delete_model_on_server(model_name, provider)
         .await
-        .map_err(|e| format!("server registry delete failed: {e}"))
+        .map_err(|e| format!("server delete failed: {e}"))
 }
 
 async fn clear_model(
@@ -587,7 +588,7 @@ async fn clear_model(
                 None => println!("   Server registry record removed"),
                 Some(reason) => println!(
                     "{}",
-                    format!("⚠️  Server registry record NOT removed: {reason}").yellow()
+                    format!("⚠️  Server cleanup NOT completed: {reason}").yellow()
                 ),
             }
         }
@@ -659,7 +660,7 @@ async fn clear_all_models(
                 println!(
                     "{}",
                     format!(
-                        "⚠️  {registry_failures} server registry record(s) NOT removed (see warnings)"
+                        "⚠️  {registry_failures} server cleanup(s) NOT completed (see warnings)"
                     )
                     .yellow()
                 );

@@ -10,10 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::registry::backend::ModelRecord;
-use crate::registry::entry_key::EntryKey;
+use crate::registry::entry_files;
 use crate::registry::state::RegistryManager;
 use modelexpress_common::config::DurationConfig;
-use modelexpress_common::download::get_provider;
 use modelexpress_common::models::ModelStatus;
 
 /// Configuration for cache eviction policies
@@ -393,49 +392,29 @@ impl CacheEvictionService {
             .await?
             .ok_or_else(|| format!("model '{entry_key}' not found in registry"))?;
 
-        let key = EntryKey::parse(entry_key);
+        let key = entry_files::record_key(entry_key, record.provider);
 
-        // Entries that outlive this one and belong to the same model. Which files we can
-        // delete depends entirely on what they still reference.
-        let siblings = self.registry.get_models_by_last_used(None).await?;
-        let survivors: Vec<EntryKey> = siblings
+        // Entries that outlive this one. Which files we can delete depends entirely on
+        // what they still reference.
+        let survivors: Vec<entry_files::Survivor> = self
+            .registry
+            .get_models_by_last_used(None)
+            .await?
             .iter()
             .filter(|sibling| sibling.model_name != entry_key)
-            .map(|sibling| EntryKey::parse(&sibling.model_name))
-            .filter(|other| other.model_name == key.model_name)
+            .map(entry_files::Survivor::from)
             .collect();
-
-        // An entry with no revision covers every snapshot of its model, so it shares
-        // files with all of them. That is how a record written before revisions existed
-        // behaves: evicting it must not delete a snapshot a revision-scoped entry uses,
-        // and a revision-scoped evict must not delete files the legacy entry covers.
-        let snapshot_still_referenced = survivors.iter().any(|other| {
-            other.revision == key.revision || other.revision.is_none() || key.revision.is_none()
-        });
 
         // Delete files from disk first. If this fails, we keep the registry record
         // so the next eviction cycle can retry.
-        let delete_revision = if survivors.is_empty() {
-            // Nothing else references this model. Drop the whole cache entry rather than
-            // just this revision, so snapshots left behind by an earlier shared-file
-            // decision cannot outlive the last record pointing at them.
-            Some(None)
-        } else if snapshot_still_referenced {
-            debug!(
-                "Keeping files for '{entry_key}': another registry entry still references \
-                 the same snapshot"
-            );
-            None
-        } else {
-            Some(key.revision.as_deref())
-        };
-
-        if let Some(revision) = delete_revision {
-            get_provider(record.provider)
-                .delete_model_revision(&key.model_name, self.cache_directory.clone(), revision)
-                .await
-                .map_err(|e| format!("failed to delete model files for '{entry_key}': {e}"))?;
-        }
+        entry_files::delete_files(
+            record.provider,
+            &key.model_name,
+            &self.cache_directory,
+            entry_files::deletable_scope(&key, &survivors),
+        )
+        .await
+        .map_err(|e| format!("failed to delete model files for '{entry_key}': {e}"))?;
 
         // Only remove from registry after successful filesystem deletion
         self.registry.delete_model(entry_key).await?;
@@ -491,6 +470,7 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use crate::registry::backend::MockRegistryBackend;
+    use crate::registry::entry_key::EntryKey;
     use modelexpress_common::models::ModelProvider;
     use tempfile::TempDir;
 

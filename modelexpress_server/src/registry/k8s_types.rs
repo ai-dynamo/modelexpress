@@ -95,6 +95,10 @@ enum PhaseSchema {
     Error,
 }
 
+/// Finalizer on every `ModelCacheEntry`. The server removes it only after it deleted
+/// the cached files the entry covers, so deleting the CR also deletes those files.
+pub const CACHE_FILES_FINALIZER: &str = "modelexpress.nvidia.com/cache-files";
+
 /// Phase strings used by the CRD. Match `ModelStatus` one-for-one.
 pub mod phase {
     pub const DOWNLOADING: &str = "Downloading";

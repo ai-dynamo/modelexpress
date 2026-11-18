@@ -4,10 +4,11 @@
 use crate::metrics::grpc::RpcOutcome;
 use crate::metrics::registry::{DownloadMetrics, RegistryMetrics, StatusLabel};
 use crate::registry::backend::ClaimOutcome;
+use crate::registry::entry_files;
 use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
 use modelexpress_common::{
-    cache::{CacheConfig, resolve_model_path},
+    cache::resolve_model_path,
     constants, download,
     grpc::{
         api::{ApiRequest, ApiResponse, api_service_server::ApiService},
@@ -39,35 +40,27 @@ static START_TIME: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
 /// download, so it should complete quickly or not at all.
 const REVISION_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Get the configured cache directory for model downloads
-fn get_server_cache_dir() -> Option<std::path::PathBuf> {
-    // Try to get cache configuration
-    if let Ok(config) = CacheConfig::discover() {
-        Some(config.local_path)
-    } else {
-        // Fall back to environment variable
-        modelexpress_common::envs::hf_hub_cache()
-    }
-}
-
-/// Returns true if the model's files are present in the given cache directory. Used to
-/// guard against stale `DOWNLOADED` registry records that point at a cache entry which no
-/// longer exists on disk (e.g. left behind by a client-side `model clear`). When no cache
-/// directory is configured we cannot verify, so we assume the files are present to preserve
-/// existing behavior rather than loop re-downloading forever.
+/// Returns true if the files a download target needs are present in the given cache
+/// directory. Used to guard against stale `DOWNLOADED` registry records that point at a
+/// cache entry which no longer exists on disk (e.g. left behind by a client-side
+/// `model clear`). When no cache directory is configured we cannot verify, so we assume
+/// the files are present to preserve existing behavior rather than loop re-downloading
+/// forever.
 async fn model_files_present(
     cache_dir: Option<std::path::PathBuf>,
-    model_name: &str,
-    provider: ModelProvider,
-    revision: Option<&str>,
+    target: &DownloadTarget,
 ) -> bool {
     let Some(cache_dir) = cache_dir else {
         return true;
     };
-    download::get_provider(provider)
-        .get_model_path_revision(model_name, cache_dir, revision)
+    download::get_provider(target.provider)
+        .has_cached_files(
+            &target.model_name,
+            cache_dir,
+            target.revision.as_deref(),
+            target.ignore_weights,
+        )
         .await
-        .is_ok()
 }
 
 /// A model download request reduced to the identity the registry and the provider need.
@@ -365,7 +358,7 @@ impl ModelService for ModelServiceImpl {
         let revision = resolve_target_revision(
             &model_name,
             provider,
-            get_server_cache_dir(),
+            self.tracker.cache_dir().map(Path::to_path_buf),
             model_request.revision.as_deref(),
         )
         .await?;
@@ -438,7 +431,10 @@ impl ModelService for ModelServiceImpl {
         );
 
         // Get the cache directory
-        let cache_dir = get_server_cache_dir()
+        let cache_dir = self
+            .tracker
+            .cache_dir()
+            .map(Path::to_path_buf)
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
         // Get the model path using the provider from the request. A requested revision
@@ -626,7 +622,10 @@ impl ModelService for ModelServiceImpl {
         info!("Listing files for model: {}", model_name);
 
         // Get the cache directory
-        let cache_dir = get_server_cache_dir()
+        let cache_dir = self
+            .tracker
+            .cache_dir()
+            .map(Path::to_path_buf)
             .ok_or_else(|| Status::internal("Server cache directory not configured"))?;
 
         // Get the model path using the provider from the request
@@ -680,17 +679,45 @@ impl ModelService for ModelServiceImpl {
 
         // A model can hold several entries at once (one per revision, and separate ones
         // for metadata-only downloads). `model clear` means "forget this model", so drop
-        // all of them rather than only the unpinned full-weight entry.
+        // all of them rather than only the unpinned full-weight entry, together with
+        // the files they cover in the server cache.
         let tracker = self.tracker.clone();
-        let outcome = tracker.delete_model_entries(&model_name).await;
+        let outcome = tracker
+            .delete_model_entries(&model_name, provider, tracker.cache_dir())
+            .await;
         let removed = outcome.removed;
         info!("Deleted {removed} registry record(s) for model '{model_name}'");
 
-        // The response stays `success: true` -- the fallback delete was still
-        // attempted and callers depend on that shape. But a registry outage and a
-        // model with no entries both return zero records here, so without the tag
-        // the RPC would be recorded as a plain success during an outage. That is
-        // the exact failure this layer exists to prevent.
+        if let Some(reason) = outcome.records_error {
+            // A record that can still be in the registry keeps its files. `success:
+            // true` would tell the caller that the model is gone.
+            return tagged(
+                DeleteModelResponse {
+                    success: false,
+                    message: Some(format!(
+                        "Removed {removed} registry record(s) for model '{model_name}', but \
+                         {reason}. Its files stay in the server cache. Send the request again."
+                    )),
+                },
+                RpcOutcome::BackendError,
+            );
+        }
+
+        if let Some(reason) = outcome.files_error {
+            // No record points at the remaining files, so only a second request can
+            // delete them. The failure tells the caller to send one.
+            return tagged(
+                DeleteModelResponse {
+                    success: false,
+                    message: Some(format!(
+                        "Removed {removed} registry record(s) for model '{model_name}', but \
+                         could not delete its files from the server cache: {reason}"
+                    )),
+                },
+                RpcOutcome::Error,
+            );
+        }
+
         tagged(
             DeleteModelResponse {
                 success: true,
@@ -698,11 +725,7 @@ impl ModelService for ModelServiceImpl {
                     "Model '{model_name}' removed from registry ({removed} record(s))"
                 )),
             },
-            if outcome.degraded {
-                RpcOutcome::BackendError
-            } else {
-                RpcOutcome::Ok
-            },
+            RpcOutcome::Ok,
         )
     }
 }
@@ -713,10 +736,14 @@ impl ModelService for ModelServiceImpl {
 /// registry was unreachable and only the fallback key was tried" -- both are
 /// zero.
 pub struct DeleteEntriesOutcome {
-    /// How many records were removed.
+    /// How many records were removed. A floor when the registry listing failed.
     pub removed: usize,
-    /// The registry listing failed, so `removed` is a floor rather than a count.
-    pub degraded: bool,
+    /// Why records of the model can still be in the registry: the listing failed, or
+    /// a record could not be deleted. The files stay in that case.
+    pub records_error: Option<String>,
+    /// Why files of the model are still in the server cache although no record of it
+    /// remains.
+    pub files_error: Option<String>,
 }
 
 /// Type alias for the complex waiting channels type
@@ -754,25 +781,33 @@ pub struct ModelDownloadTracker {
     registry: Arc<RegistryManager>,
     /// Maps model names to list of channels waiting for updates on this server replica.
     waiting_channels: WaitingChannels,
+    /// Root of the server's model cache. `None` leaves the choice to each provider.
+    cache_dir: Option<PathBuf>,
     download_metrics: DownloadMetrics,
     registry_metrics: RegistryMetrics,
 }
 
-const DOWNLOAD_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const DOWNLOAD_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(30);
 const DOWNLOAD_HEARTBEAT_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
 impl ModelDownloadTracker {
     pub fn new(
         registry: Arc<RegistryManager>,
+        cache_dir: Option<PathBuf>,
         download_metrics: DownloadMetrics,
         registry_metrics: RegistryMetrics,
     ) -> Self {
         Self {
             registry,
             waiting_channels: Arc::new(Mutex::new(HashMap::new())),
+            cache_dir,
             download_metrics,
             registry_metrics,
         }
+    }
+
+    pub fn cache_dir(&self) -> Option<&Path> {
+        self.cache_dir.as_deref()
     }
 
     /// Number of models with callers currently waiting on a download.
@@ -904,13 +939,27 @@ impl ModelDownloadTracker {
     }
 
     /// Deletes every registry entry belonging to `model_name`, whatever revision or
-    /// weight mode each entry covers.
+    /// weight mode each entry covers, then the files those entries covered under
+    /// `cache_dir`.
     ///
     /// The registry-listing failure is swallowed on purpose: the fallback still
     /// clears the common case, which is better than refusing outright. It is
     /// reported in the return value so the caller can say so, because otherwise a
     /// backend outage and a model with no entries are the same `0`.
-    pub async fn delete_model_entries(&self, model_name: &str) -> DeleteEntriesOutcome {
+    ///
+    /// Files are deleted only once every entry is gone. If one record survives a
+    /// failed delete, its files stay with it rather than leaving a `DOWNLOADED`
+    /// record that points at nothing, and the return value reports the record.
+    ///
+    /// The files of `provider`, the one the caller named, are deleted even when no
+    /// record is found. A call whose file delete failed leaves files with no record,
+    /// and this lets the next call finish the job.
+    pub async fn delete_model_entries(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        cache_dir: Option<&std::path::Path>,
+    ) -> DeleteEntriesOutcome {
         let records = match self.registry.get_models_by_last_used(None).await {
             Ok(records) => records,
             Err(e) => {
@@ -920,14 +969,17 @@ impl ModelDownloadTracker {
                 self.delete_status(model_name).await;
                 return DeleteEntriesOutcome {
                     removed: 0,
-                    degraded: true,
+                    records_error: Some(format!("its registry records could not be listed: {e}")),
+                    files_error: None,
                 };
             }
         };
 
         let mut removed: usize = 0;
+        let mut not_removed: usize = 0;
+        let mut providers = vec![provider];
         for record in records {
-            if EntryKey::parse(&record.model_name).belongs_to(model_name) {
+            if entry_files::record_key(&record.model_name, record.provider).belongs_to(model_name) {
                 // Deleting a record mid-download is a real exit from DOWNLOADING,
                 // and the only one the claim lifecycle cannot see: once the key
                 // is gone, finish_download_claim finds nothing to fence and
@@ -944,12 +996,41 @@ impl ModelDownloadTracker {
                     self.registry_metrics
                         .record_transition(StatusLabel::Downloading, StatusLabel::Absent);
                 }
-                removed = removed.saturating_add(1);
+                if !providers.contains(&record.provider) {
+                    providers.push(record.provider);
+                }
+                if deleted {
+                    removed = removed.saturating_add(1);
+                } else {
+                    not_removed = not_removed.saturating_add(1);
+                }
+            }
+        }
+
+        let mut file_errors: Vec<String> = Vec::new();
+        if let Some(cache_dir) = cache_dir
+            && not_removed == 0
+        {
+            // Every entry of the model is gone, so nothing can still reference its files.
+            for provider in providers {
+                if let Err(e) = entry_files::delete_files(
+                    provider,
+                    model_name,
+                    cache_dir,
+                    entry_files::FileScope::WholeModel,
+                )
+                .await
+                {
+                    error!("Failed to delete cached files for '{model_name}': {e:#}");
+                    file_errors.push(format!("{e:#}"));
+                }
             }
         }
         DeleteEntriesOutcome {
             removed,
-            degraded: false,
+            records_error: (not_removed > 0)
+                .then(|| format!("{not_removed} of its records could not be deleted")),
+            files_error: (!file_errors.is_empty()).then(|| file_errors.join("; ")),
         }
     }
 
@@ -966,7 +1047,7 @@ impl ModelDownloadTracker {
                 revision,
                 ignore_weights,
             } = target;
-            let cache_dir = get_server_cache_dir();
+            let cache_dir = tracker.cache_dir.clone();
             let download = download::download_model_revision(
                 &model_name,
                 provider,
@@ -1089,10 +1170,15 @@ impl ModelDownloadTracker {
         // status alone (`DOWNLOADING`) can't distinguish those cases across replicas.
         // A claim may report an existing `DOWNLOADED` record whose files no longer exist
         // on disk (e.g. after a client-side `model clear` that only removed local files).
-        // When that happens we drop the stale record and re-claim once, so the download
-        // path runs instead of returning a false success. Bounded to two attempts to
-        // avoid looping if the delete or a concurrent re-claim keeps the record around.
-        const MAX_CLAIM_ATTEMPTS: usize = 2;
+        // When that happens we take the record back to `DOWNLOADING` in place, so the
+        // download path runs instead of returning a false success. The record is not
+        // deleted: a delete also deletes the files the entry covers, and another server
+        // can still hold them. The reclaim can lose to a write that leaves the record
+        // `DOWNLOADED`, such as a `last_used_at` update from a server that has the
+        // files, so it is tried again. The attempts are bounded, and a record that is
+        // still `DOWNLOADED` with no files after the last one is an error for the
+        // caller, never a cache hit.
+        const MAX_CLAIM_ATTEMPTS: usize = 5;
         let mut claim_id = uuid::Uuid::new_v4().to_string();
         let mut attempt: usize = 0;
         let (status, is_owner) = loop {
@@ -1109,21 +1195,44 @@ impl ModelDownloadTracker {
                 }
                 Ok(ClaimOutcome::AlreadyExists(existing)) => {
                     if existing == ModelStatus::DOWNLOADED
-                        && attempt < MAX_CLAIM_ATTEMPTS
-                        && !model_files_present(
-                            get_server_cache_dir(),
-                            model_name,
-                            provider,
-                            target.revision.as_deref(),
-                        )
-                        .await
+                        && !model_files_present(self.cache_dir.clone(), target).await
                     {
+                        if attempt >= MAX_CLAIM_ATTEMPTS {
+                            error!(
+                                "Model '{model_name}' is DOWNLOADED in the registry, its files \
+                                 are missing from the cache, and {attempt} attempts to take \
+                                 the record back failed"
+                            );
+                            let error_update = identity.status_update(
+                                ModelStatus::ERROR,
+                                Some(
+                                    "Model files are missing from the server cache and the \
+                                     registry record could not be repaired"
+                                        .to_string(),
+                                ),
+                            );
+                            let _ = tx.send(Ok(error_update)).await;
+                            return ModelStatus::ERROR;
+                        }
                         error!(
                             "Registry reports model '{model_name}' as DOWNLOADED but its files \
-                             are missing from the cache; clearing the stale record and \
-                             re-downloading"
+                             are missing from the cache; downloading it again"
                         );
-                        self.delete_status(entry_key).await;
+                        match self
+                            .registry
+                            .try_reclaim_downloaded(
+                                entry_key,
+                                provider,
+                                &claim_id,
+                                DOWNLOAD_LEASE_DURATION,
+                            )
+                            .await
+                        {
+                            Ok(true) => break (ModelStatus::DOWNLOADING, true),
+                            // A concurrent request changed the record. Read it again.
+                            Ok(false) => {}
+                            Err(e) => error!("Failed to reclaim '{model_name}': {e}"),
+                        }
                         continue;
                     }
                     if existing == ModelStatus::DOWNLOADED {
@@ -1319,12 +1428,28 @@ mod tests {
     // RegistryBackend. The full backend semantics (claim atomicity, LRU ordering, etc.) are
     // covered by the per-backend unit tests in modelexpress_server::registry and by the
     // testcontainers-based integration tests.
+    /// The cache directory that `MODEL_EXPRESS_CACHE_DIRECTORY` names, which the tests
+    /// point at a temporary directory.
+    fn get_server_cache_dir() -> Option<PathBuf> {
+        modelexpress_common::cache::CacheConfig::discover()
+            .ok()
+            .map(|config| config.local_path)
+    }
+
     fn tracker_with_mock(
         mock: crate::registry::backend::MockRegistryBackend,
+    ) -> ModelDownloadTracker {
+        tracker_with_cache_dir(mock, get_server_cache_dir())
+    }
+
+    fn tracker_with_cache_dir(
+        mock: crate::registry::backend::MockRegistryBackend,
+        cache_dir: Option<PathBuf>,
     ) -> ModelDownloadTracker {
         let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
         ModelDownloadTracker::new(
             registry,
+            cache_dir,
             DownloadMetrics::register(&mut crate::metrics::new_registry()),
             RegistryMetrics::register(&mut crate::metrics::new_registry()),
         )
@@ -1344,7 +1469,12 @@ mod tests {
         let registry_metrics = RegistryMetrics::register(&mut metrics_registry);
         let registry = Arc::new(RegistryManager::with_backend(Arc::new(mock)));
         (
-            ModelDownloadTracker::new(registry, download_metrics, registry_metrics),
+            ModelDownloadTracker::new(
+                registry,
+                get_server_cache_dir(),
+                download_metrics,
+                registry_metrics,
+            ),
             metrics_registry,
         )
     }
@@ -1597,7 +1727,7 @@ mod tests {
 
     /// The bool `delete_status` returns is the sole gate on the `downloading ->
     /// absent` departure, and no caller is forced to read it -- there is no
-    /// `#[must_use]` and two of the three call sites discard it. So the contract
+    /// `#[must_use]` and one of the two call sites discards it. So the contract
     /// is pinned here directly rather than only through the delete-path tests
     /// below, which would still pass if the two arms were swapped in step.
     #[tokio::test]
@@ -1635,9 +1765,11 @@ mod tests {
         mock.expect_delete_model().once().returning(|_| Ok(()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        let outcome = tracker.delete_model_entries("m").await;
+        let outcome = tracker
+            .delete_model_entries("m", ModelProvider::HuggingFace, None)
+            .await;
         assert_eq!(outcome.removed, 1);
-        assert!(!outcome.degraded);
+        assert!(outcome.records_error.is_none());
 
         let encoded = encoded_metrics(&metrics_registry);
         assert_eq!(
@@ -1662,7 +1794,9 @@ mod tests {
             .returning(|_| Err("backend unreachable".into()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        tracker.delete_model_entries("m").await;
+        tracker
+            .delete_model_entries("m", ModelProvider::HuggingFace, None)
+            .await;
 
         let encoded = encoded_metrics(&metrics_registry);
         assert_eq!(
@@ -1684,7 +1818,9 @@ mod tests {
         mock.expect_delete_model().once().returning(|_| Ok(()));
 
         let (tracker, metrics_registry) = tracker_with_mock_and_registry(mock);
-        let outcome = tracker.delete_model_entries("m").await;
+        let outcome = tracker
+            .delete_model_entries("m", ModelProvider::HuggingFace, None)
+            .await;
         assert_eq!(outcome.removed, 1, "the record is still removed");
 
         let encoded = encoded_metrics(&metrics_registry);
@@ -1692,6 +1828,473 @@ mod tests {
             departures_from_downloading(&encoded),
             0,
             "a completed model was never in flight: {encoded}"
+        );
+    }
+
+    /// `model clear` forgets the model on the server too: once every entry is gone,
+    /// the files those entries covered are deleted from the server cache.
+    #[tokio::test]
+    async fn clearing_a_model_deletes_its_cached_files() {
+        let cache = TempDir::new().expect("cache dir");
+        let repo = cache.path().join("models--org--model");
+        std::fs::create_dir_all(repo.join("snapshots/abc")).expect("snapshot dir");
+        let other = cache.path().join("models--org--other");
+        std::fs::create_dir_all(&other).expect("other model dir");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used().once().returning(|_| {
+            Ok(vec![
+                record_with_status("org/model", ModelStatus::DOWNLOADED),
+                record_with_status(
+                    &EntryKey::new("org/model", Some("abc".to_string()), true).to_string(),
+                    ModelStatus::DOWNLOADED,
+                ),
+                record_with_status("org/other", ModelStatus::DOWNLOADED),
+            ])
+        });
+        mock.expect_delete_model().times(2).returning(|_| Ok(()));
+
+        let outcome = tracker_with_mock(mock)
+            .delete_model_entries("org/model", ModelProvider::HuggingFace, Some(cache.path()))
+            .await;
+        assert_eq!(outcome.removed, 2);
+        assert!(outcome.records_error.is_none());
+        assert!(!repo.exists(), "the cleared model's files must be deleted");
+        assert!(other.exists(), "another model's files must stay");
+    }
+
+    /// A record that survives a failed delete keeps its files, so the registry never
+    /// reports `DOWNLOADED` for a model whose files this call removed.
+    #[tokio::test]
+    async fn a_failed_record_delete_keeps_the_files() {
+        let cache = TempDir::new().expect("cache dir");
+        let repo = cache.path().join("models--org--model");
+        std::fs::create_dir_all(&repo).expect("model dir");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used().once().returning(|_| {
+            Ok(vec![record_with_status(
+                "org/model",
+                ModelStatus::DOWNLOADED,
+            )])
+        });
+        mock.expect_delete_model()
+            .once()
+            .returning(|_| Err("backend unreachable".into()));
+
+        let outcome = tracker_with_mock(mock)
+            .delete_model_entries("org/model", ModelProvider::HuggingFace, Some(cache.path()))
+            .await;
+        assert_eq!(outcome.removed, 0, "a record that stays is not counted");
+        assert!(outcome.records_error.is_some());
+        assert!(repo.exists());
+    }
+
+    /// `success: true` for a record that is still in the registry would tell the
+    /// caller that the model is gone, while the server still reports it as cached.
+    #[tokio::test]
+    async fn delete_model_rpc_fails_when_a_record_stays() {
+        let cache = TempDir::new().expect("cache dir");
+        let repo = cache.path().join("models--org--model");
+        std::fs::create_dir_all(&repo).expect("model dir");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used().once().returning(|_| {
+            Ok(vec![
+                record_with_status("org/model", ModelStatus::DOWNLOADED),
+                record_with_status(
+                    &EntryKey::new("org/model", Some("abc".to_string()), false).to_string(),
+                    ModelStatus::DOWNLOADED,
+                ),
+            ])
+        });
+        let deletes = std::sync::atomic::AtomicUsize::new(0);
+        mock.expect_delete_model().times(2).returning(move |_| {
+            if deletes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err("backend unreachable".into())
+            }
+        });
+        let service = ModelServiceImpl::new(Arc::new(tracker_with_cache_dir(
+            mock,
+            Some(cache.path().to_path_buf()),
+        )));
+
+        let response = service
+            .delete_model(Request::new(DeleteModelRequest {
+                model_name: "org/model".to_string(),
+                provider: GrpcModelProvider::HuggingFace as i32,
+            }))
+            .await
+            .expect("the failure is in the response body");
+        assert_eq!(
+            response.extensions().get::<RpcOutcome>(),
+            Some(&RpcOutcome::BackendError)
+        );
+        let response = response.into_inner();
+        assert!(!response.success);
+        let message = response.message.expect("failure message");
+        assert!(
+            message.contains("Removed 1 registry record(s)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("1 of its records could not be deleted"),
+            "{message}"
+        );
+        assert!(repo.exists(), "the files stay with the record that stays");
+    }
+
+    /// A registry that cannot be listed can hold records of the model, so the caller
+    /// must not hear that the model is gone.
+    #[tokio::test]
+    async fn delete_model_rpc_fails_when_the_registry_cannot_be_listed() {
+        let cache = TempDir::new().expect("cache dir");
+        let repo = cache.path().join("models--org--model");
+        std::fs::create_dir_all(&repo).expect("model dir");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(|_| Err("backend unreachable".into()));
+        mock.expect_delete_model()
+            .once()
+            .returning(|_| Err("backend unreachable".into()));
+        let service = ModelServiceImpl::new(Arc::new(tracker_with_cache_dir(
+            mock,
+            Some(cache.path().to_path_buf()),
+        )));
+
+        let response = service
+            .delete_model(Request::new(DeleteModelRequest {
+                model_name: "org/model".to_string(),
+                provider: GrpcModelProvider::HuggingFace as i32,
+            }))
+            .await
+            .expect("the failure is in the response body");
+        assert_eq!(
+            response.extensions().get::<RpcOutcome>(),
+            Some(&RpcOutcome::BackendError)
+        );
+        let response = response.into_inner();
+        assert!(!response.success);
+        let message = response.message.expect("failure message");
+        assert!(message.contains("could not be listed"), "{message}");
+        assert!(repo.exists());
+    }
+
+    /// A failed file delete leaves files that no record points at. The failure is
+    /// reported, and the next call deletes them although it finds no record.
+    #[tokio::test]
+    async fn a_failed_file_delete_is_reported_and_the_next_call_finishes_it() {
+        let cache = TempDir::new().expect("cache dir");
+        let repo = cache.path().join("models--org--model");
+        // A regular file where the repository directory belongs makes the delete fail.
+        std::fs::write(&repo, b"").expect("blocking file");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used().once().returning(|_| {
+            Ok(vec![record_with_status(
+                "org/model",
+                ModelStatus::DOWNLOADED,
+            )])
+        });
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+        let outcome = tracker_with_mock(mock)
+            .delete_model_entries("org/model", ModelProvider::HuggingFace, Some(cache.path()))
+            .await;
+        assert_eq!(outcome.removed, 1);
+        assert!(
+            outcome.records_error.is_none(),
+            "the record itself was deleted"
+        );
+        assert!(outcome.files_error.is_some());
+
+        std::fs::remove_file(&repo).expect("remove blocking file");
+        std::fs::create_dir_all(repo.join("snapshots/abc")).expect("snapshot dir");
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(|_| Ok(Vec::new()));
+        let outcome = tracker_with_mock(mock)
+            .delete_model_entries("org/model", ModelProvider::HuggingFace, Some(cache.path()))
+            .await;
+        assert_eq!(outcome.removed, 0);
+        assert!(outcome.files_error.is_none());
+        assert!(!repo.exists(), "the files left by the failed call must go");
+    }
+
+    /// `success: true` with files still on disk would tell the caller that the model
+    /// is gone, and nothing would make it try again.
+    #[tokio::test]
+    async fn delete_model_rpc_fails_when_the_files_stay() {
+        let cache = TempDir::new().expect("cache dir");
+        std::fs::write(cache.path().join("models--org--model"), b"").expect("blocking file");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(|_| Ok(Vec::new()));
+        let service = ModelServiceImpl::new(Arc::new(tracker_with_cache_dir(
+            mock,
+            Some(cache.path().to_path_buf()),
+        )));
+
+        let response = service
+            .delete_model(Request::new(DeleteModelRequest {
+                model_name: "org/model".to_string(),
+                provider: GrpcModelProvider::HuggingFace as i32,
+            }))
+            .await
+            .expect("the failure is in the response body")
+            .into_inner();
+        assert!(!response.success);
+        let message = response.message.expect("failure message");
+        assert!(message.contains("could not delete its files"), "{message}");
+    }
+
+    /// `org--model` is not a repository id, and its cache directory is the one of
+    /// `org/model`. The request stops before it reads a record or deletes a file.
+    #[tokio::test]
+    async fn delete_model_rpc_refuses_a_name_with_the_cache_directory_of_another_model() {
+        let cache = TempDir::new().expect("cache dir");
+        let snapshot = cache.path().join("models--org--model/snapshots/abc");
+        std::fs::create_dir_all(&snapshot).expect("snapshot dir");
+
+        let service = ModelServiceImpl::new(Arc::new(tracker_with_cache_dir(
+            crate::registry::backend::MockRegistryBackend::new(),
+            Some(cache.path().to_path_buf()),
+        )));
+        let status = service
+            .delete_model(Request::new(DeleteModelRequest {
+                model_name: "org--model".to_string(),
+                provider: GrpcModelProvider::HuggingFace as i32,
+            }))
+            .await
+            .expect_err("the name must be refused");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(snapshot.exists(), "the files of org/model must stay");
+    }
+
+    /// The cache directory of `s3://bucket/models/child` is inside the one of
+    /// `s3://bucket/models`. Clearing the parent name keeps the cached child.
+    #[tokio::test]
+    async fn clearing_a_model_keeps_a_cached_model_with_a_prefix_below() {
+        let cache = TempDir::new().expect("cache dir");
+        let child = cache.path().join("s3/bucket/models/child");
+        std::fs::create_dir_all(&child).expect("child model dir");
+        std::fs::write(child.join("config.json"), b"{}").expect("child model file");
+        std::fs::write(child.join(".mx-model"), b"").expect("child model marker");
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(|_| Ok(Vec::new()));
+        let outcome = tracker_with_mock(mock)
+            .delete_model_entries("s3://bucket/models", ModelProvider::S3, Some(cache.path()))
+            .await;
+        assert!(outcome.files_error.is_none());
+        assert!(child.join("config.json").exists());
+        assert!(child.join(".mx-model").exists());
+    }
+
+    /// The repair of a record whose files are missing must not delete the record. On
+    /// the Kubernetes backend a delete makes every server delete its copy of the files,
+    /// and servers that have their own cache still hold good copies.
+    #[tokio::test]
+    async fn a_downloaded_record_with_missing_files_is_reclaimed_in_place() {
+        let cache = TempDir::new().expect("cache dir");
+        let claims = std::sync::atomic::AtomicUsize::new(0);
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_try_claim_for_download()
+            .times(2)
+            .returning(move |_, _, _, _| {
+                let call = claims.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ClaimOutcome::AlreadyExists(if call == 0 {
+                    ModelStatus::DOWNLOADED
+                } else {
+                    ModelStatus::ERROR
+                }))
+            });
+        mock.expect_try_reclaim_downloaded()
+            .once()
+            .returning(|_, _, _, _| Ok(true));
+        mock.expect_delete_model().never();
+        // The NGC provider rejects this name before it opens a connection, so the
+        // download that the reclaim starts ends at once.
+        mock.expect_finish_download_claim()
+            .once()
+            .returning(|_, _, _, status, _| {
+                assert_eq!(status, ModelStatus::ERROR);
+                Ok(true)
+            });
+
+        let tracker = tracker_with_cache_dir(mock, Some(cache.path().to_path_buf()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let target = DownloadTarget {
+            model_name: "not-a-valid-ngc-artifact".to_string(),
+            provider: ModelProvider::Ngc,
+            revision: None,
+            ignore_weights: false,
+        };
+        assert_eq!(
+            tracker.ensure_model_downloaded(&target, &tx).await,
+            ModelStatus::ERROR
+        );
+        let first = rx
+            .recv()
+            .await
+            .expect("first update")
+            .expect("status update");
+        assert_eq!(
+            first.status,
+            modelexpress_common::grpc::model::ModelStatus::from(ModelStatus::DOWNLOADING) as i32,
+            "the caller must wait for the new download, not get a false cache hit"
+        );
+    }
+
+    /// Only the request that wins the reclaim downloads. A request that loses reads
+    /// the record again and waits for the winner.
+    #[tokio::test]
+    async fn a_lost_reclaim_waits_for_the_winner() {
+        let cache = TempDir::new().expect("cache dir");
+        let claims = std::sync::atomic::AtomicUsize::new(0);
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_try_claim_for_download()
+            .times(3)
+            .returning(move |_, _, _, _| {
+                let call = claims.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ClaimOutcome::AlreadyExists(match call {
+                    0 | 2 => ModelStatus::DOWNLOADED,
+                    _ => ModelStatus::DOWNLOADING,
+                }))
+            });
+        mock.expect_try_reclaim_downloaded()
+            .once()
+            .returning(|_, _, _, _| Ok(false));
+        mock.expect_delete_model().never();
+
+        let tracker = tracker_with_cache_dir(mock, Some(cache.path().to_path_buf()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let target = DownloadTarget {
+            model_name: "not-a-valid-ngc-artifact".to_string(),
+            provider: ModelProvider::Ngc,
+            revision: None,
+            ignore_weights: false,
+        };
+        assert_eq!(
+            tracker.ensure_model_downloaded(&target, &tx).await,
+            ModelStatus::DOWNLOADED
+        );
+    }
+
+    /// A reclaim can lose to a write that leaves the record `DOWNLOADED`, or it can
+    /// fail. The files are still missing, so the answer must not be a cache hit.
+    #[tokio::test]
+    async fn a_record_that_cannot_be_reclaimed_is_an_error_not_a_cache_hit() {
+        for reclaim_fails in [false, true] {
+            let cache = TempDir::new().expect("cache dir");
+            let mut mock = crate::registry::backend::MockRegistryBackend::new();
+            mock.expect_try_claim_for_download()
+                .times(5)
+                .returning(|_, _, _, _| Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADED)));
+            mock.expect_try_reclaim_downloaded()
+                .times(4)
+                .returning(move |_, _, _, _| {
+                    if reclaim_fails {
+                        Err("backend unreachable".into())
+                    } else {
+                        Ok(false)
+                    }
+                });
+            mock.expect_touch_model().never();
+            mock.expect_delete_model().never();
+
+            let tracker = tracker_with_cache_dir(mock, Some(cache.path().to_path_buf()));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let target = DownloadTarget {
+                model_name: "not-a-valid-ngc-artifact".to_string(),
+                provider: ModelProvider::Ngc,
+                revision: None,
+                ignore_weights: false,
+            };
+            assert_eq!(
+                tracker.ensure_model_downloaded(&target, &tx).await,
+                ModelStatus::ERROR,
+                "reclaim_fails={reclaim_fails}"
+            );
+            let update = rx
+                .recv()
+                .await
+                .expect("first update")
+                .expect("status update");
+            assert_eq!(
+                update.status,
+                modelexpress_common::grpc::model::ModelStatus::from(ModelStatus::ERROR) as i32
+            );
+            let message = update.message.expect("error message");
+            assert!(
+                message.contains("missing from the server cache"),
+                "{message}"
+            );
+        }
+    }
+
+    /// The reclaim that loses to a `last_used_at` update finds the record still
+    /// `DOWNLOADED`. The next attempt checks the files again and takes the record.
+    #[tokio::test]
+    async fn a_reclaim_that_loses_to_an_unrelated_write_is_tried_again() {
+        let cache = TempDir::new().expect("cache dir");
+        let claims = std::sync::atomic::AtomicUsize::new(0);
+        let reclaims = std::sync::atomic::AtomicUsize::new(0);
+
+        let mut mock = crate::registry::backend::MockRegistryBackend::new();
+        mock.expect_try_claim_for_download()
+            .times(3)
+            .returning(move |_, _, _, _| {
+                let call = claims.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ClaimOutcome::AlreadyExists(if call < 2 {
+                    ModelStatus::DOWNLOADED
+                } else {
+                    ModelStatus::ERROR
+                }))
+            });
+        mock.expect_try_reclaim_downloaded()
+            .times(2)
+            .returning(move |_, _, _, _| {
+                Ok(reclaims.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1)
+            });
+        mock.expect_touch_model().never();
+        // The NGC provider rejects this name before it opens a connection, so the
+        // download that the reclaim starts ends at once.
+        mock.expect_finish_download_claim()
+            .once()
+            .returning(|_, _, _, _, _| Ok(true));
+
+        let tracker = tracker_with_cache_dir(mock, Some(cache.path().to_path_buf()));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let target = DownloadTarget {
+            model_name: "not-a-valid-ngc-artifact".to_string(),
+            provider: ModelProvider::Ngc,
+            revision: None,
+            ignore_weights: false,
+        };
+        assert_eq!(
+            tracker.ensure_model_downloaded(&target, &tx).await,
+            ModelStatus::ERROR
+        );
+        let first = rx
+            .recv()
+            .await
+            .expect("first update")
+            .expect("status update");
+        assert_eq!(
+            first.status,
+            modelexpress_common::grpc::model::ModelStatus::from(ModelStatus::DOWNLOADING) as i32,
+            "the caller must wait for the new download, not get a false cache hit"
         );
     }
 
@@ -1861,6 +2464,7 @@ mod tests {
         )));
         ModelServiceImpl::new(Arc::new(ModelDownloadTracker::new(
             registry,
+            get_server_cache_dir(),
             DownloadMetrics::register(&mut crate::metrics::new_registry()),
             RegistryMetrics::register(&mut crate::metrics::new_registry()),
         )))
@@ -2093,36 +2697,21 @@ mod tests {
         let cache_dir = temp_dir.path().to_path_buf();
 
         // No files on disk: a stale DOWNLOADED record must not be honored.
-        assert!(
-            !model_files_present(
-                Some(cache_dir.clone()),
-                "test/model",
-                ModelProvider::HuggingFace,
-                None
-            )
-            .await
-        );
+        let target = test_target("test/model");
+        assert!(!model_files_present(Some(cache_dir.clone()), &target).await);
 
         // Once the snapshot exists, the cache hit is real.
         let model_dir = cache_dir.join("models--test--model/snapshots/abc123");
         std::fs::create_dir_all(&model_dir).expect("Failed to create model dir");
         std::fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write config");
-        assert!(
-            model_files_present(
-                Some(cache_dir),
-                "test/model",
-                ModelProvider::HuggingFace,
-                None
-            )
-            .await
-        );
+        assert!(model_files_present(Some(cache_dir), &target).await);
     }
 
     #[tokio::test]
     async fn test_model_files_present_assumes_present_without_cache_dir() {
         // With no configured cache directory we cannot verify, so we must not force a
         // re-download loop: assume the files are present.
-        assert!(model_files_present(None, "test/model", ModelProvider::HuggingFace, None).await);
+        assert!(model_files_present(None, &test_target("test/model")).await);
     }
 
     #[tokio::test]

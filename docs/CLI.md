@@ -132,10 +132,14 @@ modelexpress-cli model list --detailed
 modelexpress-cli model status
 
 # Clear specific model from storage. This removes the local files and also
-# deletes the model's record from the server-side registry, so a later
-# `model download` re-fetches the model instead of returning a false cache hit.
+# deletes the model's records from the server-side registry, together with the
+# files those records cover in the server cache, so a later `model download`
+# re-fetches the model instead of returning a false cache hit.
 # If the server is unreachable, the local files are still cleared and a warning
-# notes that the registry record may remain.
+# notes that the registry record may remain. If the server cannot delete its
+# files, the warning says so; run the command again to delete them.
+# A Hugging Face name must be a repository id. The command refuses a name such as
+# `org--model`, because its cache directory is the one of `org/model`.
 modelexpress-cli model clear google-t5/t5-small
 
 # Clear a Google Cloud Storage model from storage
@@ -167,7 +171,7 @@ modelexpress-cli model stats --detailed
 
 **Providers:**
 - `hugging-face`: Hugging Face model hub (default)
-- `ngc`: NVIDIA NGC catalog
+- `ngc`: NVIDIA NGC catalog. The model name is `org/name/version`, `org/team/name/version`, or `org/team/type/name/version`, with or without the `ngc://` scheme; `ngc://org/team/name:version` is also accepted. No part can be empty, `.` or `..`. The server keeps one registry record for each artifact, under the name `ngc://org[/team[/type]]/name/version` (the type is left out when it is `models`), whichever spelling a request uses.
 - `gcs`: Google Cloud Storage object prefix. The model name must be a full `gs://<bucket>/<path>` URL. See [`GCS_PROVIDER.md`](GCS_PROVIDER.md) for cache layout and provider behavior.
 
 For GCS downloads, configure Google Application Default Credentials on the process that performs the download: the server for `server-only`, the client for `direct`, and either process for `smart-fallback`. Common options are `GOOGLE_APPLICATION_CREDENTIALS`, `gcloud auth application-default login`, or Workload Identity on GKE.

@@ -78,6 +78,71 @@ impl S3ModelName {
         }
         path
     }
+
+    /// Whether the cache holds a model whose object prefix is a parent of this one.
+    fn is_inside_cached_model(&self, cache_dir: &Path) -> bool {
+        let bucket_dir = cache_dir.join(CACHE_ROOT_DIR_NAME).join(&self.bucket);
+        self.model_dir(cache_dir)
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| *ancestor != bucket_dir)
+            .any(is_cached_model)
+    }
+
+    /// Delete the files that only this model has in the cache.
+    ///
+    /// An object prefix can be a parent of another one, and then the directory of one
+    /// model is inside the directory of the other. A download also writes the objects
+    /// of each prefix below its own, so the two models share those files, and a delete
+    /// of one must not take the files of the other.
+    fn remove_from_cache(&self, cache_dir: &Path) -> Result<()> {
+        let model_dir = self.model_dir(cache_dir);
+        if !model_dir.exists() {
+            return Ok(());
+        }
+        if self.is_inside_cached_model(cache_dir) {
+            let marker = model_dir.join(MODEL_MARKER_FILE_NAME);
+            if marker.exists() {
+                fs::remove_file(&marker)
+                    .with_context(|| format!("Failed to remove '{}'", marker.display()))?;
+            }
+            info!("Keeping the files of '{self}': a cached model with a parent prefix has them");
+            return Ok(());
+        }
+        if !remove_dir_except_cached_models(&model_dir)? {
+            info!("Kept the cached models with a prefix below '{self}'");
+        }
+        Ok(())
+    }
+}
+
+/// A complete download leaves the marker in the model directory.
+fn is_cached_model(dir: &Path) -> bool {
+    dir.join(MODEL_MARKER_FILE_NAME).is_file()
+}
+
+/// Remove `dir` and its content, except each directory below it that is a cached model.
+/// Returns whether `dir` itself is gone.
+fn remove_dir_except_cached_models(dir: &Path) -> Result<bool> {
+    let mut is_empty = true;
+    for entry in fs::read_dir(dir).with_context(|| format!("Failed to read '{}'", dir.display()))? {
+        let entry = entry.with_context(|| format!("Failed to read '{}'", dir.display()))?;
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .with_context(|| format!("Failed to read the type of '{}'", path.display()))?
+            .is_dir();
+        if !is_dir {
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to remove '{}'", path.display()))?;
+        } else if is_cached_model(&path) || !remove_dir_except_cached_models(&path)? {
+            is_empty = false;
+        }
+    }
+    if is_empty {
+        fs::remove_dir(dir).with_context(|| format!("Failed to remove '{}'", dir.display()))?;
+    }
+    Ok(is_empty)
 }
 
 impl std::fmt::Display for S3ModelName {
@@ -264,13 +329,7 @@ impl ModelProviderTrait for S3Provider {
     }
 
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
-        let model = S3ModelName::parse(model_name)?;
-        let model_dir = model.model_dir(&cache_dir);
-        if model_dir.exists() {
-            fs::remove_dir_all(&model_dir)
-                .with_context(|| format!("Failed to remove '{}'", model_dir.display()))?;
-        }
-        Ok(())
+        S3ModelName::parse(model_name)?.remove_from_cache(&cache_dir)
     }
 
     async fn get_model_path(&self, model_name: &str, cache_dir: PathBuf) -> Result<PathBuf> {
@@ -295,13 +354,7 @@ pub(crate) struct S3ProviderCache;
 
 impl ProviderCache for S3ProviderCache {
     fn clear_model(&self, cache_dir: &Path, model_name: &str) -> Result<()> {
-        let model = S3ModelName::parse(model_name)?;
-        let model_dir = model.model_dir(cache_dir);
-        if model_dir.exists() {
-            fs::remove_dir_all(&model_dir)
-                .with_context(|| format!("Failed to remove '{}'", model_dir.display()))?;
-        }
-        Ok(())
+        S3ModelName::parse(model_name)?.remove_from_cache(cache_dir)
     }
 
     fn resolve_model_path(
@@ -434,6 +487,87 @@ mod tests {
         }
         assert!(hf_model.exists());
         assert!(s3_model.exists());
+    }
+
+    /// Write a cached model: one file, and the marker that a complete download leaves.
+    fn write_cached_model(cache_dir: &Path, model_name: &str) -> PathBuf {
+        let model = S3ModelName::parse(model_name).expect("Expected model name parse");
+        let model_dir = model.model_dir(cache_dir);
+        fs::create_dir_all(&model_dir).expect("Failed to create model dir");
+        fs::write(model_dir.join("config.json"), b"{}").expect("Failed to write model file");
+        fs::write(model_dir.join(MODEL_MARKER_FILE_NAME), b"").expect("Failed to write marker");
+        model_dir
+    }
+
+    #[test]
+    fn test_delete_removes_the_model_directory() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let model_dir = write_cached_model(temp_dir.path(), "s3://bucket/org/model");
+        fs::create_dir_all(model_dir.join("nested")).expect("Failed to create nested dir");
+        fs::write(model_dir.join("nested/tokenizer.json"), b"{}").expect("Failed to write file");
+        let sibling = write_cached_model(temp_dir.path(), "s3://bucket/org/other");
+
+        S3ProviderCache
+            .clear_model(temp_dir.path(), "s3://bucket/org/model")
+            .expect("Expected clear to succeed");
+        assert!(!model_dir.exists());
+        assert!(sibling.join("config.json").exists());
+
+        S3ProviderCache
+            .clear_model(temp_dir.path(), "s3://bucket/org/model")
+            .expect("Expected a second clear to succeed");
+    }
+
+    /// The directory of `s3://bucket/models/child` is inside the directory of
+    /// `s3://bucket/models`. A delete of the parent name, cached or not, keeps the child.
+    #[test]
+    fn test_delete_keeps_a_cached_model_with_a_prefix_below() {
+        for parent_is_cached in [false, true] {
+            let temp_dir = TempDir::new().expect("Failed to create temp dir");
+            let child = write_cached_model(temp_dir.path(), "s3://bucket/models/child");
+            let parent = child.parent().expect("Expected parent dir").to_path_buf();
+            if parent_is_cached {
+                write_cached_model(temp_dir.path(), "s3://bucket/models");
+            }
+            fs::create_dir_all(parent.join("partial/deeper")).expect("Failed to create dir");
+            fs::write(parent.join("partial/deeper/config.json"), b"{}")
+                .expect("Failed to write file");
+
+            let runtime = tokio::runtime::Runtime::new().expect("Failed to create runtime");
+            runtime
+                .block_on(S3Provider.delete_model("s3://bucket/models", temp_dir.path().into()))
+                .expect("Expected delete to succeed");
+
+            assert!(child.join("config.json").exists());
+            assert!(child.join(MODEL_MARKER_FILE_NAME).exists());
+            assert!(!parent.join(MODEL_MARKER_FILE_NAME).exists());
+            assert!(!parent.join("config.json").exists());
+            assert!(!parent.join("partial").exists());
+
+            runtime
+                .block_on(
+                    S3Provider.delete_model("s3://bucket/models/child", temp_dir.path().into()),
+                )
+                .expect("Expected delete to succeed");
+            assert!(!child.exists());
+        }
+    }
+
+    /// The download of `s3://bucket/models` also wrote the files below `models/child`.
+    #[test]
+    fn test_delete_keeps_the_files_of_a_cached_model_with_a_parent_prefix() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let parent = write_cached_model(temp_dir.path(), "s3://bucket/models");
+        let child = write_cached_model(temp_dir.path(), "s3://bucket/models/child");
+
+        S3ProviderCache
+            .clear_model(temp_dir.path(), "s3://bucket/models/child")
+            .expect("Expected clear to succeed");
+
+        assert!(child.join("config.json").exists());
+        assert!(!child.join(MODEL_MARKER_FILE_NAME).exists());
+        assert!(parent.join("config.json").exists());
+        assert!(parent.join(MODEL_MARKER_FILE_NAME).exists());
     }
 
     #[test]

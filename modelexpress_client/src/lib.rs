@@ -230,10 +230,13 @@ impl Client {
         Ok(client)
     }
 
-    /// Delete a model's record from the server-side registry. This complements
-    /// removing the model's local files, so a cleared model does not leave behind a
-    /// stale `DOWNLOADED` record that would satisfy a later download request without
-    /// re-fetching the files.
+    /// Delete a model's records from the server-side registry, and the files they
+    /// cover from the server cache. This complements removing the model's local files,
+    /// so a cleared model does not leave behind a stale `DOWNLOADED` record that would
+    /// satisfy a later download request without re-fetching the files.
+    ///
+    /// An error can mean that the records are gone and only the files stay. A second
+    /// call deletes those files.
     pub async fn delete_model_on_server(
         &mut self,
         model_name: &str,
@@ -252,7 +255,7 @@ impl Client {
             Err(modelexpress_common::Error::Server(
                 inner
                     .message
-                    .unwrap_or_else(|| "Failed to delete model from registry".to_string()),
+                    .unwrap_or_else(|| "Failed to delete model on the server".to_string()),
             )
             .into())
         }

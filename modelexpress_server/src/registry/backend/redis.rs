@@ -15,7 +15,7 @@
 //! Mutations run as single atomic EVALs. Multi-key EVALs (e.g. the claim's RENAME) assume
 //! a single Redis instance (`ConnectionManager`, not a cluster) so all keys share a slot.
 
-use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
+use super::{ClaimOutcome, ModelRecord, RECLAIM_MESSAGE, RegistryBackend, RegistryResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
@@ -232,6 +232,36 @@ impl RedisRegistryBackend {
             message: map.remove(fields::MESSAGE),
         })
     }
+
+    /// Flip `from` to DOWNLOADING and make `claim_id` the lease owner. Only the caller
+    /// that wins the CAS starts the download.
+    async fn claim_from_status(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        from: ModelStatus,
+        message: &str,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let mut conn = self.get_conn().await?;
+        // Callers run after a claim observed AlreadyExists (which already migrated any
+        // legacy record), so the CAS targets the provider-scoped key directly.
+        let key = model_key(provider, model_name);
+        let now = Utc::now().to_rfc3339();
+        let won: i32 = redis::Script::new(RETRY_CAS_LUA)
+            .key(&key)
+            .arg(status_str(from))
+            .arg(status_str(ModelStatus::DOWNLOADING))
+            .arg(provider_str(provider))
+            .arg(&now)
+            .arg(message)
+            .arg(claim_id)
+            .arg(lease_duration_millis(lease_duration))
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(won == 1)
+    }
 }
 
 #[async_trait]
@@ -439,25 +469,33 @@ impl RegistryBackend for RedisRegistryBackend {
         claim_id: &str,
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
-        let mut conn = self.get_conn().await?;
-        // Retry only runs after a claim observed AlreadyExists (which already migrated any
-        // legacy record), so the CAS targets the provider-scoped key directly.
-        let key = model_key(provider, model_name);
-        let now = Utc::now().to_rfc3339();
-        // Atomic CAS: flip status from ERROR to DOWNLOADING. Returns 1 on win, 0 on
-        // miss. Only the winner spawns the retry download.
-        let won: i32 = redis::Script::new(RETRY_CAS_LUA)
-            .key(&key)
-            .arg(status_str(ModelStatus::ERROR))
-            .arg(status_str(ModelStatus::DOWNLOADING))
-            .arg(provider_str(provider))
-            .arg(&now)
-            .arg("Retrying download...")
-            .arg(claim_id)
-            .arg(lease_duration_millis(lease_duration))
-            .invoke_async(&mut conn)
-            .await?;
-        Ok(won == 1)
+        self.claim_from_status(
+            model_name,
+            provider,
+            ModelStatus::ERROR,
+            "Retrying download...",
+            claim_id,
+            lease_duration,
+        )
+        .await
+    }
+
+    async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        self.claim_from_status(
+            model_name,
+            provider,
+            ModelStatus::DOWNLOADED,
+            RECLAIM_MESSAGE,
+            claim_id,
+            lease_duration,
+        )
+        .await
     }
 
     async fn refresh_download_claim(

@@ -223,7 +223,9 @@ fn merge_cache_config(
                 match key_str.as_str() {
                     "directory" => {
                         if let serde_yaml::Value::String(dir) = val {
-                            cache.directory = PathBuf::from(dir);
+                            cache.directory = Some(PathBuf::from(dir));
+                        } else if val.is_null() {
+                            cache.directory = None;
                         }
                     }
                     "max_size_bytes" => {

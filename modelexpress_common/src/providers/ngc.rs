@@ -16,8 +16,9 @@ use tracing::{debug, info, warn};
 const NGC_CLI_CONFIG_PATH: &str = ".ngc/config";
 const DEFAULT_NGC_CACHE_SUBDIR: &str = ".cache";
 const PAGE_SIZE: u32 = 500;
+const DEFAULT_ARTIFACT_TYPE: &str = "models";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NgcArtifactId {
     org: String,
     team: Option<String>,
@@ -41,50 +42,84 @@ fn parse_model_name(model_name: &str) -> Result<NgcArtifactId> {
     let model_name = model_name.trim();
     let model_name = model_name.strip_prefix("ngc://").unwrap_or(model_name);
     let parts: Vec<&str> = model_name.split('/').collect();
-    if parts.iter().any(|s| *s == "." || *s == "..") {
-        anyhow::bail!("NGC model name segments must not be '.' or '..'; got '{model_name}'");
-    }
-    match parts.len() {
+    let id = match parts.len() {
         3 => {
             // If the last segment contains a colon it is a `ngc://` URI of the form
             // `catalog/org/name:version` (e.g. `nim/nvidia/nemotron-3-super:v1`).
             // Map it to the team-models format so the correct NGC API path is used.
             if let Some((name, version)) = parts[2].split_once(':') {
-                Ok(NgcArtifactId {
+                NgcArtifactId {
                     org: parts[0].to_string(),
                     team: Some(parts[1].to_string()),
-                    artifact_type: "models".to_string(),
+                    artifact_type: DEFAULT_ARTIFACT_TYPE.to_string(),
                     name: name.to_string(),
                     version: version.to_string(),
-                })
+                }
             } else {
-                Ok(NgcArtifactId {
+                NgcArtifactId {
                     org: parts[0].to_string(),
                     team: None,
-                    artifact_type: "models".to_string(),
+                    artifact_type: DEFAULT_ARTIFACT_TYPE.to_string(),
                     name: parts[1].to_string(),
                     version: parts[2].to_string(),
-                })
+                }
             }
         }
-        4 => Ok(NgcArtifactId {
+        4 => NgcArtifactId {
             org: parts[0].to_string(),
             team: Some(parts[1].to_string()),
-            artifact_type: "models".to_string(),
+            artifact_type: DEFAULT_ARTIFACT_TYPE.to_string(),
             name: parts[2].to_string(),
             version: parts[3].to_string(),
-        }),
-        5 => Ok(NgcArtifactId {
+        },
+        5 => NgcArtifactId {
             org: parts[0].to_string(),
             team: Some(parts[1].to_string()),
             artifact_type: parts[2].to_string(),
             name: parts[3].to_string(),
             version: parts[4].to_string(),
-        }),
+        },
         _ => anyhow::bail!(
             "NGC model name must be 'org/name/version', 'org/team/name/version', or \
              'org/team/type/name/version'; got '{model_name}'"
         ),
+    };
+
+    // Each component becomes one directory level of the cache path. An empty one would
+    // drop a level, and '.' or '..' would move it, so the path would name a directory
+    // that holds other artifacts.
+    let components = [
+        Some(&id.org),
+        id.team.as_ref(),
+        Some(&id.artifact_type),
+        Some(&id.name),
+        Some(&id.version),
+    ];
+    if components
+        .into_iter()
+        .flatten()
+        .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        anyhow::bail!(
+            "NGC model name components must not be empty, '.' or '..'; got '{model_name}'"
+        );
+    }
+    Ok(id)
+}
+
+/// The one spelling the registry stores for an artifact: with the `ngc://` scheme, and
+/// without the artifact type when it is the default. `parse_model_name` reads it back
+/// to the same artifact.
+impl std::fmt::Display for NgcArtifactId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ngc://{}", self.org)?;
+        if let Some(team) = &self.team {
+            write!(f, "/{team}")?;
+            if self.artifact_type != DEFAULT_ARTIFACT_TYPE {
+                write!(f, "/{}", self.artifact_type)?;
+            }
+        }
+        write!(f, "/{}/{}", self.name, self.version)
     }
 }
 
@@ -933,6 +968,12 @@ impl ModelProviderTrait for NgcProvider {
         Ok(path)
     }
 
+    /// Several spellings name one artifact, and so one cache directory. One registry
+    /// record for each artifact needs one spelling.
+    fn canonical_model_name(&self, model_name: &str) -> Result<String> {
+        Ok(parse_model_name(model_name)?.to_string())
+    }
+
     fn provider_name(&self) -> &'static str {
         "NGC"
     }
@@ -999,6 +1040,68 @@ mod tests {
         assert!(parse_model_name("nvidia/../../../etc/1").is_err());
         assert!(parse_model_name("nvidia/./llama/1").is_err());
         assert!(parse_model_name("ngc://nim/../model:v1").is_err());
+    }
+
+    /// An empty component drops one level of the cache path, so the name would point
+    /// at a directory that holds other artifacts, and a delete would remove them all.
+    #[test]
+    fn test_parse_rejects_components_that_change_the_directory_depth() {
+        for name in [
+            "////",
+            "nvidia/model/",
+            "nvidia//1",
+            "/model/1",
+            "nvidia/team/model/",
+            "nvidia/team//model/1",
+            "ngc://nim/nvidia/model:",
+            "ngc://nim/nvidia/:v1",
+            "ngc://nim/nvidia/model:..",
+            "ngc://nim/nvidia/..:v1",
+            "ngc://nim/nvidia/model:.",
+        ] {
+            assert!(parse_model_name(name).is_err(), "{name:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_canonical_model_name_gives_every_spelling_one_name() {
+        let provider = NgcProvider;
+        for (spellings, canonical) in [
+            (
+                vec![
+                    "nvidia/model/1",
+                    "ngc://nvidia/model/1",
+                    "  nvidia/model/1 ",
+                ],
+                "ngc://nvidia/model/1",
+            ),
+            (
+                vec![
+                    "ngc://nim/nvidia/model:v1",
+                    "nim/nvidia/model/v1",
+                    "nim/nvidia/models/model/v1",
+                ],
+                "ngc://nim/nvidia/model/v1",
+            ),
+            (
+                vec!["nvidia/team/resources/tool/2"],
+                "ngc://nvidia/team/resources/tool/2",
+            ),
+        ] {
+            for spelling in spellings {
+                assert_eq!(
+                    provider
+                        .canonical_model_name(spelling)
+                        .expect("valid NGC name"),
+                    canonical,
+                    "{spelling:?}"
+                );
+            }
+            // The canonical name names the same artifact, and is its own canonical name.
+            let id = parse_model_name(canonical).expect("canonical name parses");
+            assert_eq!(id.to_string(), canonical);
+        }
+        assert!(provider.canonical_model_name("////").is_err());
     }
 
     #[test]

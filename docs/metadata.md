@@ -265,7 +265,7 @@ Three types of Redis keys are relevant:
 Global listing uses `SCAN` with pattern `mx:source:????????????????` (exactly 16 hex chars) to enumerate source index keys without a secondary index.
 Model-cache listing uses `SCAN` with pattern `mx:model:*`; LRU ordering and status counts are computed by pipelined reads and Rust-side sorting/tallying.
 
-No Redis TTL is applied to keys. P2P stale detection and cleanup are handled by the server-side reaper (see Source Lifecycle above). Model lifecycle entries are deleted when cache eviction removes a model.
+No Redis TTL is applied to keys. P2P stale detection and cleanup are handled by the server-side reaper (see Source Lifecycle above). Model lifecycle entries are deleted when cache eviction removes a model or `model clear` calls `DeleteModel`; both also delete the files the entry covers in the server cache. Deleting an `mx:model:*` key directly in Redis does not delete files.
 
 #### Example Redis State
 
@@ -366,7 +366,7 @@ cleanup path in those cases.
 
 The name is `mx-cache-` followed by `sanitize("{provider}/{model_name}")`, so each `/` becomes `--` and the sha256 suffix binds the pair `(provider, name)`. For provider `HuggingFace` and model `deepseek-ai/DeepSeek-V3` the CR is named `mx-cache-huggingface--deepseek-ai--deepseek-v3-{hash}`. Pre-0.5.0 deployments carry name-only CRs (`mx-cache-{sanitized-model-name}-{hash}`), which the server still looks up so those records migrate.
 
-`ModelCacheEntry.spec.modelName` preserves the original model name while `status.phase`, `status.createdAt`, `status.lastUsedAt`, and `status.message` track the same lifecycle fields as the Redis `mx:model:*` hash.
+`ModelCacheEntry.spec.modelName` preserves the original model name while `status.phase`, `status.createdAt`, `status.lastUsedAt`, and `status.message` track the same lifecycle fields as the Redis `mx:model:*` hash. Each CR carries the `modelexpress.nvidia.com/cache-files` finalizer: deleting the CR also deletes the files it covers from the server cache, and the CR stays (with a `deletionTimestamp`) until the server has deleted them. Files that another entry of the model still uses stay until that entry is deleted too: an entry of the same commit (a metadata-only entry and a full-weight entry share one snapshot), an entry with no revision, or an entry that is downloading. While the CR waits, the server treats the record as deleted: status reads, listings and counts do not return it.
 
 #### Example P2P CRD
 
@@ -457,6 +457,8 @@ apiVersion: modelexpress.nvidia.com/v1alpha1
 kind: ModelCacheEntry
 metadata:
   name: mx-cache-huggingface--deepseek-ai--deepseek-v3-<hash>
+  finalizers:
+    - modelexpress.nvidia.com/cache-files
 spec:
   modelName: deepseek-ai/DeepSeek-V3
   provider: HuggingFace
@@ -605,5 +607,7 @@ kubectl get configmaps -l modelexpress.nvidia.com/mx-source-id=<source_id> -n <n
 | Target stuck waiting | Source still loading (check source pod logs for progress) |
 | K8s CRs missing | RBAC issue -- check source logs and service account permissions for both `modelmetadatas` and `modelcacheentries` |
 | Stale P2P metadata after redeploy | Reaper marks stale within 90s. For immediate Redis cleanup: delete `mx:source:*` keys or `FLUSHDB` in a dedicated Redis DB |
-| Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents |
+| Stale model lifecycle metadata after redeploy | Inspect `mx:model:*` or `modelcacheentries`; delete the stale lifecycle entry if it no longer matches cache contents. Deleting a `ModelCacheEntry` also deletes its cached files |
+| `kubectl delete mxcache` does not finish | The CR waits on the `modelexpress.nvidia.com/cache-files` finalizer. An entry that is downloading, or that has no status, takes one lease duration (30s). Otherwise check that a server runs in the namespace and its logs; if none will run, remove the finalizer by hand (the files then stay). See [DEPLOYMENT.md](DEPLOYMENT.md) for the uninstall and rollback procedures |
+| `kubectl delete mxcache` finished but disk use did not change | Another entry of the model still uses the files (same commit, no revision, or downloading). The server log has a `Kept the cached files` line. The files go when the last entry of the model is deleted |
 | Transfer failure with address errors | Source pod restarted, so its GPU addresses are invalid. ModelExpress clears the failed NIXL state, reinitializes a potentially mutated target, and tries the next ranked source within the retry budget. If no source succeeds, the strategy chain continues through server cache, InstantTensor, ModelStreamer, GDS, and the native loader. |

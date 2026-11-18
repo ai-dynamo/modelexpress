@@ -21,6 +21,9 @@ pub mod redis;
 /// (Redis, kube) can bubble up without the trait needing to know about them.
 pub type RegistryResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Record message while `try_reclaim_downloaded` owns a download.
+const RECLAIM_MESSAGE: &str = "Cached files are missing, downloading again...";
+
 /// Full model-lifecycle record returned by registry backends.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRecord {
@@ -121,6 +124,21 @@ pub trait RegistryBackend: Send + Sync {
     /// `false` without mutation. Used by the error-retry path so only one replica
     /// spawns the retry even when multiple observe `ERROR`.
     async fn try_reset_error_for_retry(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool>;
+
+    /// Atomic compare-and-set: if the current status is `DOWNLOADED`, flip it to
+    /// `DOWNLOADING`, establish `claim_id` as the lease owner for `lease_duration`, and
+    /// return `true`. Otherwise return `false` without mutation.
+    ///
+    /// Repairs a record whose files are missing from this server's cache. The record
+    /// must not be deleted for that: a delete also deletes the files the entry covers,
+    /// which other servers may still hold.
+    async fn try_reclaim_downloaded(
         &self,
         model_name: &str,
         provider: ModelProvider,
