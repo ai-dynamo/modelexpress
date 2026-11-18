@@ -6,7 +6,7 @@
 Each rank runs the strategy chain on its own, but later strategies
 (InstantTensor, distributed ModelStreamer) and the engine's post-load barrier
 are collective. The chain first keeps only the strategies every rank can run,
-then gathers every rank's outcome after each one:
+then gathers every rank's outcome right after each load(), before finalize():
 
     all loaded           -> every rank publishes and returns
     any rank failed      -> every rank falls back to the next strategy together
@@ -50,6 +50,8 @@ class _Strategy(LoadStrategy):
         self.name = name
         self.error = error
         self.loaded = 0
+        self.finalized = 0
+        self.aborted = 0
         self.rolled_back = 0
 
     def is_available(self, ctx):
@@ -65,10 +67,10 @@ class _Strategy(LoadStrategy):
         return result
 
     def finalize(self, result, ctx):
-        pass
+        self.finalized += 1
 
     def abort(self, result, ctx):
-        pass
+        self.aborted += 1
 
     def rollback(self, ctx):
         self.rolled_back += 1
@@ -113,9 +115,11 @@ def test_a_rank_that_loaded_falls_back_when_another_rank_failed(published):
     assert execute_load_strategies(model, _ctx(adapter), [rdma, disk]) is model
 
     assert adapter.outcomes == [("rdma", "loaded"), ("disk", "loaded")]
-    # The finished rank undoes its RDMA state and rebuilds the model it wrote,
-    # and publishes only once every rank has loaded.
-    assert rdma.rolled_back == 1
+    # The finished rank aborts the attempt before finalize() (no registration),
+    # undoes its RDMA state, rebuilds the model it wrote, and publishes only
+    # once every rank has loaded.
+    assert (rdma.finalized, rdma.aborted, rdma.rolled_back) == (0, 1, 1)
+    assert disk.finalized == 1
     adapter.reinit_for_retry.assert_called_once()
     assert published == [model]
 
@@ -217,4 +221,16 @@ def test_ranks_out_of_step_fail_closed(published):
     with pytest.raises(StrategyRecoveryError, match="Ranks are out of step"):
         execute_load_strategies(MagicMock(), _ctx(adapter), [_Strategy("rdma")])
 
+    assert published == []
+
+
+def test_a_failed_rank_fails_closed_when_another_rank_is_fatal(published):
+    adapter = _PeerRanks({"rdma": "fatal"})
+    rdma = _Strategy("rdma", error=StrategyFailed("source died", mutated=True))
+
+    with pytest.raises(StrategyRecoveryError, match="Another rank could not recover"):
+        execute_load_strategies(MagicMock(), _ctx(adapter), [rdma, _Strategy("disk")])
+
+    assert adapter.outcomes == [("rdma", "failed")]
+    adapter.reinit_for_retry.assert_not_called()
     assert published == []
