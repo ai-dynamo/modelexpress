@@ -84,9 +84,7 @@ class SglangAdapter(EngineAdapter):
 
     def all_gather_state(self, state) -> tuple[object, ...]:
         """Gather rank-local state through SGLang's world CPU process group."""
-        if not (
-            torch.distributed.is_available() and torch.distributed.is_initialized()
-        ):
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
             return (state,)
 
         parallel = _get_sglang_parallel_context()

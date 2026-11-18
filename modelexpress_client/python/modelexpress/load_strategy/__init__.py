@@ -242,9 +242,7 @@ def execute_load_strategies(
             # rank makes the attempt fatal everywhere.
             phase = f"outcome:{strategy.name}"
             state = (phase, outcome)
-            states = (
-                ctx.adapter.all_gather_state(state) if ctx.adapter is not None else (state,)
-            )
+            states = ctx.adapter.all_gather_state(state) if ctx.adapter is not None else (state,)
             for rank, (peer_phase, _peer_outcome) in enumerate(states):
                 if peer_phase != phase:
                     raise StrategyRecoveryError(
