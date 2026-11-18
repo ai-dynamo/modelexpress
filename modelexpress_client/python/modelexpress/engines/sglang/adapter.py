@@ -73,7 +73,14 @@ class SglangAdapter(EngineAdapter):
             torch.distributed.is_available() and torch.distributed.is_initialized()
         ):
             return 0
-        return int(_get_sglang_world_group().local_rank)
+
+        parallel = _get_sglang_parallel_context()
+        if parallel is not None:
+            return int(parallel.world_group.local_rank)
+
+        from sglang.srt.distributed import parallel_state
+
+        return int(parallel_state.get_world_group().local_rank)
 
     def all_gather_state(self, state) -> tuple[object, ...]:
         """Gather rank-local state through SGLang's world CPU process group."""
@@ -81,7 +88,14 @@ class SglangAdapter(EngineAdapter):
             torch.distributed.is_available() and torch.distributed.is_initialized()
         ):
             return (state,)
-        group = _get_sglang_world_group()
+
+        parallel = _get_sglang_parallel_context()
+        if parallel is not None:
+            group = parallel.world_group
+        else:
+            from sglang.srt.distributed import parallel_state
+
+            group = parallel_state.get_world_group()
         states = [None] * group.world_size
         torch.distributed.all_gather_object(states, state, group=group.cpu_group)
         return tuple(states)
@@ -468,17 +482,6 @@ def _get_sglang_parallel_context() -> ParallelContext | None:
             raise
         return None
     return get_parallel()
-
-
-def _get_sglang_world_group():
-    """Return SGLang's world GroupCoordinator from the scoped or global API."""
-    parallel = _get_sglang_parallel_context()
-    if parallel is not None:
-        return parallel.world_group
-
-    from sglang.srt.distributed import parallel_state
-
-    return parallel_state.get_world_group()
 
 
 def _get_parallel_size(name: str) -> int:
