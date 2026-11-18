@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import Any
 
 import torch.nn as nn
 
@@ -155,38 +154,34 @@ _FAILED = "failed"
 _FATAL = "fatal"
 
 
-def _gather(phase: str, value: Any, ctx: LoadContext) -> tuple[Any, ...]:
-    """Gather one value per engine rank, checking every rank is in the same phase."""
-    state = (phase, value)
-    states = ctx.adapter.all_gather_state(state) if ctx.adapter is not None else (state,)
-    for rank, (peer_phase, _peer_value) in enumerate(states):
-        if peer_phase != phase:
-            raise StrategyRecoveryError(
-                f"[Worker {ctx.global_rank}] Ranks are out of step in the loading "
-                f"chain: this rank is at {phase!r}, rank {rank} at {peer_phase!r}"
-            )
-    return tuple(peer_value for _peer_phase, peer_value in states)
-
-
 def _eligible_on_every_rank(
-    eligible: list[LoadStrategy], ctx: LoadContext
+    strategies: list[LoadStrategy], ctx: LoadContext
 ) -> list[LoadStrategy]:
-    """Keep the strategies that every engine rank can run.
+    """Return the available strategies that every engine rank can run.
 
     Availability can depend on the node (GDS hardware, NIXL, local files), but
     the ranks must walk the same strategies to agree on each outcome. A strategy
     that some rank cannot run is skipped on every rank. With nothing eligible on
     any rank, the chain reports that no strategy succeeded, as before.
     """
+    eligible = [strategy for strategy in strategies if strategy.is_available(ctx)]
     names = [strategy.name for strategy in eligible]
-    per_rank = _gather("eligible", names, ctx)
+    state = ("eligible", names)
+    states = ctx.adapter.all_gather_state(state) if ctx.adapter is not None else (state,)
+    for rank, (peer_phase, _peer_names) in enumerate(states):
+        if peer_phase != "eligible":
+            raise StrategyRecoveryError(
+                f"[Worker {ctx.global_rank}] Ranks are out of step in the loading "
+                f"chain: this rank is at 'eligible', rank {rank} at {peer_phase!r}"
+            )
+    per_rank = [peer_names for _peer_phase, peer_names in states]
     common = set(names).intersection(*per_rank)
     shared = [strategy for strategy in eligible if strategy.name in common]
     if not shared and any(per_rank):
         raise RuntimeError(
             f"[Worker {ctx.global_rank}] No loading strategy is eligible on every "
             f"rank for model '{ctx.identity.model_name}'; eligible per rank: "
-            f"{list(per_rank)}"
+            f"{per_rank}"
         )
     if len(shared) < len(eligible):
         logger.warning(
@@ -196,34 +191,13 @@ def _eligible_on_every_rank(
     return shared
 
 
-def _agree_on_outcome(outcome: str, strategy: LoadStrategy, ctx: LoadContext) -> str:
-    """Combine one strategy's outcome across every engine rank.
-
-    Any fatal rank makes the attempt fatal everywhere; otherwise the attempt
-    succeeded only if every rank loaded.
-    """
-    outcomes = _gather(f"outcome:{strategy.name}", outcome, ctx)
-    if _FATAL in outcomes:
-        return _FATAL
-    if set(outcomes) == {_LOADED}:
-        return _LOADED
-    if _LOADED in outcomes:
-        failed = sum(1 for peer_outcome in outcomes if peer_outcome != _LOADED)
-        logger.info(
-            f"[Worker {ctx.global_rank}] Strategy {strategy.name} failed on "
-            f"{failed} of {len(outcomes)} ranks; all ranks fall back together"
-        )
-    return _FAILED
-
-
 def execute_load_strategies(
     model: nn.Module,
     ctx: LoadContext,
     strategies: list[LoadStrategy],
 ) -> nn.Module:
     """Execute an ordered policy using the common fallback lifecycle."""
-    eligible = [strategy for strategy in strategies if strategy.is_available(ctx)]
-    eligible = _eligible_on_every_rank(eligible, ctx)
+    eligible = _eligible_on_every_rank(strategies, ctx)
     logger.info(f"Eligible loaders: {[strategy.name for strategy in eligible]}")
 
     result = LoadResult(value=model, model=model)
@@ -264,23 +238,38 @@ def execute_load_strategies(
             # Every rank leaves this strategy the same way. Later strategies
             # (InstantTensor, distributed ModelStreamer) and the engine's
             # post-load barrier are collective across ranks, so a rank that
-            # loaded must not move on while another rank falls back.
-            agreed = _agree_on_outcome(outcome, strategy, ctx)
-            if agreed == _FATAL:
+            # loaded must not move on while another rank falls back. Any fatal
+            # rank makes the attempt fatal everywhere.
+            phase = f"outcome:{strategy.name}"
+            state = (phase, outcome)
+            states = (
+                ctx.adapter.all_gather_state(state) if ctx.adapter is not None else (state,)
+            )
+            for rank, (peer_phase, _peer_outcome) in enumerate(states):
+                if peer_phase != phase:
+                    raise StrategyRecoveryError(
+                        f"[Worker {ctx.global_rank}] Ranks are out of step in the "
+                        f"loading chain: this rank is at {phase!r}, rank {rank} at "
+                        f"{peer_phase!r}"
+                    )
+            outcomes = [peer_outcome for _peer_phase, peer_outcome in states]
+            if _FATAL in outcomes:
                 if outcome == _FATAL and failure is not None:
                     raise failure
                 raise StrategyRecoveryError(
                     f"[Worker {ctx.global_rank}] Another rank could not recover "
                     f"from strategy {strategy.name}"
                 ) from failure
-            if agreed == _LOADED:
+            if all(peer_outcome == _LOADED for peer_outcome in outcomes):
                 publish_source_if_supported(result, ctx)
                 span.set_attribute("weight_loading_strategy", strategy.name)
                 return result.value
             if outcome == _LOADED:
+                failed = sum(1 for peer_outcome in outcomes if peer_outcome != _LOADED)
                 logger.warning(
                     f"[Worker {ctx.global_rank}] Strategy {strategy.name} succeeded "
-                    "here but failed on another rank; falling back with the other ranks"
+                    f"here but failed on {failed} of {len(outcomes)} ranks; falling "
+                    "back with the other ranks"
                 )
                 strategy.rollback(ctx)
                 mutated = True
