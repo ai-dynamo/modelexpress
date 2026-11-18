@@ -1,11 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Engine ranks leave every strategy the same way.
+"""Engine ranks walk the same strategies and leave each one the same way.
 
 Each rank runs the strategy chain on its own, but later strategies
 (InstantTensor, distributed ModelStreamer) and the engine's post-load barrier
-are collective. After each strategy the chain gathers every rank's outcome:
+are collective. The chain first keeps only the strategies every rank can run,
+then gathers every rank's outcome after each one:
 
     all loaded           -> every rank publishes and returns
     any rank failed      -> every rank falls back to the next strategy together
@@ -25,25 +26,30 @@ from modelexpress.load_strategy.base import LoadStrategy
 
 
 class _PeerRanks:
-    """Adapter stand-in: this rank plus peers whose outcome is fixed per strategy."""
+    """Adapter stand-in: this rank plus one peer with fixed answers."""
 
-    def __init__(self, peer_outcomes, *, peer_strategy=None):
-        self.peer_outcomes = peer_outcomes
-        self.peer_strategy = peer_strategy
-        self.gathered = []
+    def __init__(self, peer_outcomes=None, *, peer_eligible=None, peer_phase=None):
+        self.peer_outcomes = peer_outcomes or {}
+        self.peer_eligible = peer_eligible
+        self.peer_phase = peer_phase
+        self.outcomes = []
         self.reinit_for_retry = MagicMock(side_effect=lambda result: result)
 
     def all_gather_state(self, state):
-        strategy, _outcome = state
-        self.gathered.append(state)
-        peer = (self.peer_strategy or strategy, self.peer_outcomes[strategy])
-        return (state, peer)
+        phase, value = state
+        if phase == "eligible":
+            peer_value = value if self.peer_eligible is None else self.peer_eligible
+        else:
+            self.outcomes.append((phase.removeprefix("outcome:"), value))
+            peer_value = self.peer_outcomes[phase.removeprefix("outcome:")]
+        return (state, (self.peer_phase or phase, peer_value))
 
 
 class _Strategy(LoadStrategy):
     def __init__(self, name, *, error=None):
         self.name = name
         self.error = error
+        self.loaded = 0
         self.rolled_back = 0
 
     def is_available(self, ctx):
@@ -53,6 +59,7 @@ class _Strategy(LoadStrategy):
         pass
 
     def load(self, result, ctx):
+        self.loaded += 1
         if self.error is not None:
             raise self.error
         return result
@@ -105,7 +112,7 @@ def test_a_rank_that_loaded_falls_back_when_another_rank_failed(published):
 
     assert execute_load_strategies(model, _ctx(adapter), [rdma, disk]) is model
 
-    assert [state for state in adapter.gathered] == [("rdma", "loaded"), ("disk", "loaded")]
+    assert adapter.outcomes == [("rdma", "loaded"), ("disk", "loaded")]
     # The finished rank undoes its RDMA state and rebuilds the model it wrote,
     # and publishes only once every rank has loaded.
     assert rdma.rolled_back == 1
@@ -116,11 +123,10 @@ def test_a_rank_that_loaded_falls_back_when_another_rank_failed(published):
 def test_a_failed_rank_falls_back_with_a_rank_that_loaded(published):
     adapter = _PeerRanks({"rdma": "loaded", "disk": "loaded"})
     rdma = _Strategy("rdma", error=StrategyFailed("source died", mutated=True))
-    disk = _Strategy("disk")
 
-    execute_load_strategies(MagicMock(), _ctx(adapter), [rdma, disk])
+    execute_load_strategies(MagicMock(), _ctx(adapter), [rdma, _Strategy("disk")])
 
-    assert adapter.gathered == [("rdma", "failed"), ("disk", "loaded")]
+    assert adapter.outcomes == [("rdma", "failed"), ("disk", "loaded")]
     adapter.reinit_for_retry.assert_called_once()
     assert len(published) == 1
 
@@ -148,12 +154,13 @@ def test_a_reload_falls_back_together_without_reinitializing(published):
 
 def test_every_rank_fails_closed_when_another_rank_is_fatal(published):
     adapter = _PeerRanks({"rdma": "fatal"})
-    disk = _Strategy("disk")
 
     with pytest.raises(StrategyRecoveryError, match="Another rank could not recover"):
-        execute_load_strategies(MagicMock(), _ctx(adapter), [_Strategy("rdma"), disk])
+        execute_load_strategies(
+            MagicMock(), _ctx(adapter), [_Strategy("rdma"), _Strategy("disk")]
+        )
 
-    assert adapter.gathered == [("rdma", "loaded")]
+    assert adapter.outcomes == [("rdma", "loaded")]
     assert published == []
 
 
@@ -167,17 +174,8 @@ def test_a_fatal_rank_still_joins_the_agreement_before_raising(published):
         execute_load_strategies(MagicMock(), _ctx(adapter), [rdma, _Strategy("disk")])
 
     assert raised.value is error
-    assert adapter.gathered == [("rdma", "fatal")]
+    assert adapter.outcomes == [("rdma", "fatal")]
     assert rdma.rolled_back == 1
-
-
-def test_ranks_on_different_strategies_fail_closed(published):
-    adapter = _PeerRanks({"rdma": "loaded"}, peer_strategy="disk")
-
-    with pytest.raises(StrategyRecoveryError, match="Ranks disagree on the loading strategy"):
-        execute_load_strategies(MagicMock(), _ctx(adapter), [_Strategy("rdma")])
-
-    assert published == []
 
 
 def test_no_strategy_succeeds_when_every_rank_fails_everywhere(published):
@@ -186,5 +184,37 @@ def test_no_strategy_succeeds_when_every_rank_fails_everywhere(published):
 
     with pytest.raises(RuntimeError, match="No loading strategy succeeded"):
         execute_load_strategies(MagicMock(), _ctx(adapter), [_Strategy("rdma"), disk])
+
+    assert published == []
+
+
+def test_a_strategy_another_rank_cannot_run_is_skipped_on_every_rank(published):
+    """GDS (or NIXL) can be available on one node and not another."""
+    adapter = _PeerRanks({"disk": "loaded"}, peer_eligible=["rdma", "disk"])
+    gds, disk = _Strategy("gds"), _Strategy("disk")
+
+    execute_load_strategies(MagicMock(), _ctx(adapter), [gds, disk])
+
+    assert gds.loaded == 0
+    assert adapter.outcomes == [("disk", "loaded")]
+    assert len(published) == 1
+
+
+def test_no_strategy_eligible_on_every_rank_aborts_once(published):
+    adapter = _PeerRanks(peer_eligible=["disk"])
+    gds = _Strategy("gds")
+
+    with pytest.raises(RuntimeError, match="No loading strategy is eligible on every rank"):
+        execute_load_strategies(MagicMock(), _ctx(adapter), [gds])
+
+    assert gds.loaded == 0
+    assert adapter.outcomes == []
+
+
+def test_ranks_out_of_step_fail_closed(published):
+    adapter = _PeerRanks({"rdma": "loaded"}, peer_phase="outcome:disk")
+
+    with pytest.raises(StrategyRecoveryError, match="Ranks are out of step"):
+        execute_load_strategies(MagicMock(), _ctx(adapter), [_Strategy("rdma")])
 
     assert published == []
