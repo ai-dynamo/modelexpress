@@ -473,6 +473,14 @@ class LazyWeight(torch.Tensor):
                 # happened, with no device/meta coupling (dest may be meta/cpu/cuda).
                 return dest
 
+        # vLLM's mamba v2 sharded loader assigns ``param.data[a:b] = loaded[c:d].view_as(...)``:
+        # view_as(other) is view(other.shape), and the assignment is a copy_ into dest[a:b].
+        if func is torch.Tensor.view_as and args and isinstance(args[0], cls):
+            return cls._intercept(args[0], torch.Tensor.view, "view", (tuple(args[1].shape),), {})
+        if func is torch.Tensor.__setitem__ and len(args) == 3 and isinstance(args[2], cls):
+            cls.__torch_function__(torch.Tensor.copy_, types, (args[0][args[1]], args[2]))
+            return None
+
         op_name = _SUPPORTED_OPS.get(func)
         if op_name is not None and args and isinstance(args[0], cls):
             return cls._intercept(args[0], func, op_name, tuple(args[1:]), kwargs)

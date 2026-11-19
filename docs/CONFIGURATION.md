@@ -131,7 +131,7 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 |---|---|---|
 | MX_METADATA_BACKEND | empty on client; required on server | redis, kubernetes/k8s/crd, or client-only k8s-service |
 | MX_METADATA_PORT | 5555 | Base NIXL metadata port; worker port is base plus device ID |
-| MX_WORKER_GRPC_PORT | 6555 | Base worker gRPC port for tensor and artifact manifests |
+| MX_WORKER_GRPC_PORT | 6555 | Base worker gRPC port for tensor and artifact manifests; worker port is base plus device ID |
 | MX_WORKER_HOST | auto-detect | Advertised worker host override |
 | MX_MODEL_REVISION | unset | Source-identity revision label; pin an exact revision for decentralized source pools |
 | MX_NIXL_BACKEND | UCX | NIXL backend; LIBFABRIC is used for AWS EFA |
@@ -144,6 +144,8 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_K8S_SOURCE_RETRIES | 5 | Fresh-channel retries for k8s-service revision mismatches |
 | MX_K8S_SOURCE_BACKOFF_SECONDS | 0.5 | Backoff between k8s-service retries |
 
+MX_METADATA_PORT and MX_WORKER_GRPC_PORT each reserve base..base+num_local_devices-1 (5555-5562 for the default NIXL port on an 8-GPU node). Keep both ranges clear of ports used by other services in the pod.
+
 Use a central backend for mixed revisions, live updates, or per-worker addressability. Use k8s-service only for stable, interchangeable source pods; see [Kubernetes Service backend](K8S_SERVICE_BACKEND.md).
 
 ## P2P transport and registration tuning
@@ -155,14 +157,14 @@ Use a central backend for mixed revisions, live updates, or per-worker addressab
 | NIXL_UCX_TLS | unset | NIXL/UCX transport selection |
 | UCX_TLS | unset | UCX transport selection |
 | UCX_NET_DEVICES | unset | Explicit UCX network device selection |
-| MX_POOL_REG | 0 | Register each CUDA allocation once instead of each tensor |
+| MX_POOL_REG | 1 (0 with MX_VMM_ARENA=1) | Register each CUDA allocation once instead of each tensor |
 | MX_VMM_ARENA | 0 | Allocate load-time weights in a CUDA VMM arena for range registration |
 | MX_ARENA_SINGLE_MR | 0 | Keep a single arena memory registration across multiple handles when the transport supports it |
 | UCX_CUDA_COPY_REG_WHOLE_ALLOC | UCX default | UCX CUDA-copy registration behavior; relevant to older UCX VMM combinations |
 | NIXL_LOG_LEVEL | runtime default | NIXL logging level |
 | UCX_LOG_LEVEL | runtime default | UCX logging level |
 
-MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Enable one at a time and qualify the chosen combination on the exact GPU, driver, NIXL, and UCX stack. The older `MX_VMM_ARENA_BYTES` and `MX_VMM_ARENA_CHUNK_BYTES` settings are ignored apart from a deprecation warning.
+MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Pool registration is on unless MX_POOL_REG=0 or MX_VMM_ARENA=1 is set without MX_POOL_REG; qualify the chosen combination on the exact GPU, driver, NIXL, and UCX stack. Pool registration registers the CUDA allocation containing each tensor; a tensor spanning several mappings (PyTorch expandable segments, a VA reservation) is rejected at registration and the worker continues without P2P serving. Serving such a tensor needs its own allocation and registration design; MX_POOL_REG=0 does not support it. The older `MX_VMM_ARENA_BYTES` and `MX_VMM_ARENA_CHUNK_BYTES` settings are ignored apart from a deprecation warning.
 
 ## ModelStreamer and local-load tuning
 
@@ -184,7 +186,7 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 | MX_ARTIFACT_TRANSFER | false | Enable compatible file-backed JIT artifact installation and publication |
 | MX_ARTIFACT_BACKEND | nixl | Artifact transport: `nixl` or `mooncake`; exactly one is selected and there is no fallback |
 | MX_ARTIFACT_BUNDLE_ROOT | $TMPDIR/modelexpress-artifacts | Local staging root for artifact bundles |
-| MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile artifact sources by compile configuration |
+| MX_ARTIFACT_COMPILE_CONFIG_DIGEST | empty | Partitions torch compile and kernel JIT cache artifact sources by compile configuration |
 | MX_ARTIFACT_MOONCAKE_NAMESPACE | modelexpress/artifacts | Key prefix used by the Mooncake artifact backend |
 | MX_ARTIFACT_MOONCAKE_POOL_BYTES | 536870912 bytes | Local buffer-pool size for the process-local Mooncake artifact client; a config-file `local_buffer_size` takes precedence |
 | MX_ARTIFACT_MOONCAKE_DELETE_RETRIES | 10 | Additional attempts when stale-object or repair-marker removal reports an active lease |
@@ -192,7 +194,7 @@ ModelStreamer credentials are third-party settings. See [Load from object storag
 | MX_MOONCAKE_CONFIG_PATH | unset | Optional Mooncake JSON configuration file; `MOONCAKE_CONFIG_PATH` is the fallback |
 | MX_MC_* | unset | Artifact-store Mooncake settings promoted temporarily to the corresponding native `MC_*` names |
 | MX_ETCD_* | unset | Artifact-store etcd settings promoted temporarily to the corresponding native `ETCD_*` names |
-| MX_ARTIFACT_READY_URL | framework default | Readiness endpoint checked before publication |
+| MX_ARTIFACT_READY_URL | engine-specific | Explicit HTTP publication gate; when unset or blank, vLLM uses its resolved serving URL and SGLang uses native startup signaling |
 | MX_ARTIFACT_READY_TIMEOUT_SECS | 1800 | Readiness/publication timeout |
 | MX_ARTIFACT_TRANSFER_CHUNK_SIZE | 67108864 bytes | Artifact transfer chunk size; maximum is 4 GiB |
 

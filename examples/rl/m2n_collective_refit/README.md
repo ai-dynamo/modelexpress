@@ -46,8 +46,10 @@ DIFF=1 ./run_e2e.sh
 | `T` | 4 | trainer ranks, one GPU each |
 | `G` | 4 | generator ranks, one GPU each, vLLM tensor-parallel size |
 | `ROUNDS` | 5 | refits after the first |
-| `TRAINER` | `fsdp2` | `fsdp2` or `deepspeed` |
+| `TRAINER` | `fsdp2` | `fsdp2`, `deepspeed` or `jax` |
+| `SRC` | `dim0` | trainer-side layout: `dim0`, `dim1` or `2d`. Anything but `dim0` needs `TRAINER=jax` |
 | `DST` | `replicate` | `replicate` or `sharded` |
+| `JAX_PORT` | `29566` | JAX coordinator port, `TRAINER=jax` only |
 | `DIFF` | unset | `1` turns on the per-parameter comparison |
 | `PROC_TIMEOUT_S` | `0` (off) | per-process bound in seconds: SIGTERM on expiry, SIGKILL 30 s later, `.rc` file reads 124. Set it for unattended runs: `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` cannot interrupt a reshard blocked in native code |
 
@@ -58,10 +60,18 @@ against. Read `ctypes.CDLL("libnccl.so.2").ncclGetVersion()` instead. Install
 `nccl-extensions[cu12]` or `[cu13]` to match the CUDA major, then the
 ModelExpress Python client.
 
-## Two trainer backends
+`TRAINER=jax` also needs a CUDA-enabled jax 0.7.0 or newer in the trainer
+processes, which means Python 3.11 or newer; `ml_dtypes` comes with it. Each
+trainer process must see exactly one GPU, and `run_e2e.sh` pins one per rank.
+The launcher sets `XLA_PYTHON_CLIENT_PREALLOCATE=false`, since XLA otherwise
+claims most of the device and leaves NCCL's buffers no room. The JAX trainer
+does not need torch, but the ModelExpress client distribution still depends
+on it, so it is installed either way.
 
-A Publisher encodes one framework's storage layout. A second one is here so the engine
-boundary gets tested on more than one layout.
+## Three trainer backends
+
+A Publisher encodes one framework's storage layout. More than one is here so the
+engine boundary gets tested on more than one layout.
 
 `fsdp2` shards with `torch.distributed.fsdp.fully_shard` and hands the wire op
 its DTensor local shard with no staging copy.
@@ -71,6 +81,15 @@ That is not a dim-0 shard and cannot be declared as one, so `start_new_round`
 gathers one parameter at a time into a proxy buffer. Cost measured at 1.14 ms
 per parameter against 1.02 for FSDP2. ZeRO-3 also reads `LOCAL_RANK` and
 `WORLD_SIZE` from the environment; `run_e2e.sh` sets both.
+
+`jax` shards the checkpoint with JAX's own `NamedSharding`, one process per
+device under `jax.distributed`, and passes the tree through a jitted kernel
+each round so the wire op reads XLA-produced buffers. Each rank's piece is
+checked against the slice the plan assigns it before any transfer. It is the
+only backend that takes a `SRC` other than `dim0`: `dim1` splits every matrix
+on its second axis, and `2d` lays the trainers on a `(T / 2, 2)` mesh,
+replicated over the first axis and split on dim 1 over the second, so `T` must
+be even. Tensors a layout cannot split evenly fall back to dim 0.
 
 ## Two destination layouts
 
@@ -96,6 +115,8 @@ artifact both sides share. Everything framework-specific sits behind the SPI
 objects:
 
 - `mx_m2n_e2e/trainer.py` - `FsdpPublisher` and `DeepSpeedPublisher`.
+- `mx_m2n_e2e/jax_trainer.py` - `JaxPublisher`, over
+  `modelexpress_rl.collective.jax_interop`.
 - `mx_m2n_e2e/vllm_loader.py` - `VllmLoader`, plus `MxRefitWorker`, installed as
   vLLM's `worker_extension_cls`. The generator client runs inside the vLLM
   worker processes because the destination storage belongs to the engine.

@@ -14,6 +14,7 @@ pub mod artifact_manifest;
 pub mod cache;
 pub mod client_config;
 pub mod config;
+pub mod digest;
 pub mod download;
 pub mod envs;
 pub mod models;

@@ -71,8 +71,9 @@ class ModelExpressGeneratorConfig:
     staging_buffer_bytes: int | None = None
     # One arena serializes reads and installs; two allow their overlap.
     staging_buffers_count: int = 1
-    # Receive arenas use CUDA memory or pinned host memory.
-    staging_device: Literal["cuda", "cpu"] = "cuda"
+    # Receive arenas use the engine's device (None, or its type: "cuda" or "xpu")
+    # or pinned host memory ("cpu").
+    staging_device: Literal["cuda", "xpu", "cpu"] | None = None
     # Canonical object-storage checkpoint settings.
     object_storage: ObjectStorageGeneratorConfig | None = None
     # Version read from the engine's serving-version API after cold start.
@@ -123,8 +124,8 @@ class ModelExpressGeneratorConfig:
         rl_envs.require_positive_int(
             self.staging_buffers_count, "staging_buffers_count"
         )
-        if self.staging_device not in ("cuda", "cpu"):
-            raise ValueError("staging_device must be 'cuda' or 'cpu'")
+        if self.staging_device not in (None, "cuda", "xpu", "cpu"):
+            raise ValueError("staging_device must be None, 'cuda', 'xpu', or 'cpu'")
         if self.source_order is not None:
             if not isinstance(self.source_order, tuple) or not self.source_order:
                 raise ValueError("source_order must be a non-empty tuple")

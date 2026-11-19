@@ -22,7 +22,7 @@ import torch.distributed as dist
 
 from ... import envs as rl_envs
 from ... import refit_pb2, refit_pb2_grpc
-from ...s3 import S3Client
+from ...object_storage_writer import ObjectStorageWriter
 from ...utils import (
     checksum_factory,
     compress_delta,
@@ -91,7 +91,7 @@ class CanonicalDeltaPublicationMethod:
         rpc_timeout_seconds: float,
         process_group: Any,
         read_seed_tensor: Callable[[str], np.ndarray],
-        s3: S3Client,
+        writer: ObjectStorageWriter,
     ) -> None:
         self._config = config
         self._model_name = model_name
@@ -101,7 +101,10 @@ class CanonicalDeltaPublicationMethod:
         self._rank = dist.get_rank(process_group)
         self._world_size = dist.get_world_size(process_group)
         self._read_seed_tensor = read_seed_tensor
-        self._s3 = s3
+        self._writer = writer
+        self._storage_type = refit_pb2.ObjectStorageType.Value(
+            f"OBJECT_STORAGE_TYPE_{config.storage_type.value}"
+        )
         self._checksum_format = rl_envs.MX_REFIT_CHECKSUM_FORMAT
         checksum_factory(self._checksum_format)
         self.current_base_version_id = config.initial_base_version_id
@@ -243,13 +246,13 @@ class CanonicalDeltaPublicationMethod:
             raise RuntimeError("target weight version belongs to a different model")
         if (
             not target.HasField("object_storage")
-            or target.object_storage.storage_type != refit_pb2.OBJECT_STORAGE_TYPE_S3
+            or target.object_storage.storage_type != self._storage_type
             or not target.object_storage.uri
         ):
-            raise RuntimeError("S3 target is missing its URI")
+            raise RuntimeError("target must have a URI for the configured storage provider")
         uri_prefix = f"{self._config.uri_prefix.rstrip('/')}/"
         if not target.object_storage.uri.startswith(uri_prefix):
-            raise RuntimeError("S3 target URI does not match the configured prefix")
+            raise RuntimeError("target URI does not match the configured prefix")
         if target.payload_format == refit_pb2.WEIGHT_PAYLOAD_FORMAT_FULL_HF_CHECKPOINT:
             if target.HasField("base_version_id"):
                 raise RuntimeError(
@@ -268,7 +271,7 @@ class CanonicalDeltaPublicationMethod:
                 or not target.HasField("base_version_id")
             ):
                 raise RuntimeError(
-                    "S3 publication requires XOR_DELTA or FULL_HF_CHECKPOINT"
+                    "object storage publication requires XOR_DELTA or FULL_HF_CHECKPOINT"
                 )
             if target.base_version_id != self.current_base_version_id:
                 raise RuntimeError(
@@ -342,7 +345,7 @@ class CanonicalDeltaPublicationMethod:
                 self._staged = None
                 self._stage_error = None
 
-    def _publish_full_checkpoint_to_s3(self, staged: StagedFullCheckpoint) -> None:
+    def _publish_full_checkpoint(self, staged: StagedFullCheckpoint) -> None:
         parent_uri = staged.object_storage_uri.rsplit("/", 1)[0]
         batches = list(
             _batch_tensors(
@@ -381,7 +384,7 @@ class CanonicalDeltaPublicationMethod:
                 checksum.update(tensor.reshape(-1).view(torch.uint8).numpy())
                 checksums[name] = checksum.hexdigest()
             data = safetensors.torch.save(tensors, metadata=checksums)
-            self._s3.put(uri=f"{parent_uri}/{filename}", data=data)
+            self._writer.put(uri=f"{parent_uri}/{filename}", data=data)
             return dict.fromkeys(tensors, filename), len(data)
 
         local_map: dict[str, str] = {}
@@ -389,7 +392,7 @@ class CanonicalDeltaPublicationMethod:
         for batch_map, wire_bytes in threadpool_map(
             uploads,
             upload,
-            max_workers=rl_envs.MX_S3_UPLOAD_WORKERS,
+            max_workers=rl_envs.MX_REFIT_UPLOAD_WORKERS,
             thread_name_prefix="modelexpress-full-hf-upload",
         ):
             local_map.update(batch_map)
@@ -426,7 +429,7 @@ class CanonicalDeltaPublicationMethod:
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
-        self._s3.put(uri=staged.object_storage_uri, data=index)
+        self._writer.put(uri=staged.object_storage_uri, data=index)
 
     def publish(self, *, version: WeightVersionRef, staged: object) -> None:
         if not isinstance(staged, (StagedCanonicalDelta, StagedFullCheckpoint)):
@@ -439,7 +442,7 @@ class CanonicalDeltaPublicationMethod:
 
         if isinstance(staged, StagedFullCheckpoint):
             started = perf_counter()
-            self._publish_full_checkpoint_to_s3(staged)
+            self._publish_full_checkpoint(staged)
             staged.publish_object_storage_time = perf_counter() - started
             self.snapshot = {
                 name: tensor.reshape(-1).view(torch.uint8).numpy()
@@ -470,7 +473,7 @@ class CanonicalDeltaPublicationMethod:
                 staged.encoded_deltas, metadata=staged.checksums
             )
             filename = f"model-{offset:05d}-of-{total:05d}.safetensors"
-            self._s3.put(uri=f"{parent_uri}/{filename}", data=shard)
+            self._writer.put(uri=f"{parent_uri}/{filename}", data=shard)
             shard_size = len(shard)
             staged.wire_bytes = shard_size
             local_map = dict.fromkeys(staged.encoded_deltas, filename)
@@ -508,8 +511,8 @@ class CanonicalDeltaPublicationMethod:
                 separators=(",", ":"),
             ).encode()
             try:
-                self._s3.put(uri=staged.object_storage_uri, data=index)
-            except Exception as error:  # noqa: BLE001 - synchronize S3 failures.
+                self._writer.put(uri=staged.object_storage_uri, data=index)
+            except Exception as error:  # noqa: BLE001 - synchronize index failures.
                 index_error = error
                 index_error_message = f"{type(error).__name__}: {error}"
 
@@ -553,7 +556,7 @@ class CanonicalDeltaPublicationMethod:
         self._finish_staging(discard=True)
         self.snapshot = {}
         self._metric_delta = None
-        self._s3.close()
+        self._writer.close()
 
 
 __all__ = [

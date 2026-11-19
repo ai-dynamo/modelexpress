@@ -29,8 +29,11 @@ local state = redis.call('HGET', KEYS[1], 'state')
 if state ~= ARGV[5] and state ~= ARGV[6] then
   return 'VERSION_NOT_WRITABLE'
 end
-local s3_uri = redis.call('HGET', KEYS[1], 's3_uri')
-if s3_uri and s3_uri ~= '' then
+local uri = redis.call('HGET', KEYS[1], 'object_storage_uri')
+if not uri then
+  uri = redis.call('HGET', KEYS[1], 's3_uri')
+end
+if uri and uri ~= '' then
   return 'VERSION_NOT_WRITABLE'
 end
 if redis.call('EXISTS', KEYS[4]) == 0 then

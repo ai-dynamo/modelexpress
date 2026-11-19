@@ -118,7 +118,8 @@ def publish_metadata_and_ready(
 
         host = _get_worker_host()
 
-        worker_grpc_port = envs.MX_WORKER_GRPC_PORT + device_id
+        base_port = envs.MX_WORKER_GRPC_PORT
+        worker_grpc_port = base_port + device_id
 
         grpc_server = WorkerGrpcServer(
             tensor_protos=tensor_protos,
@@ -130,7 +131,16 @@ def publish_metadata_and_ready(
             accelerator=accelerator,
             worker_id=worker_id,
         )
-        actual_port = grpc_server.start()
+        try:
+            actual_port = grpc_server.start()
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"Cannot listen on worker gRPC port {worker_grpc_port} = "
+                f"MX_WORKER_GRPC_PORT ({base_port}) + device_id ({device_id}); "
+                "it may collide with another service on this host. Choose an "
+                "MX_WORKER_GRPC_PORT whose range base..base+num_local_devices-1 "
+                f"is free: {e}"
+            ) from e
         _worker_servers[device_id] = grpc_server
         _central_manifests.pop(device_id, None)
 
