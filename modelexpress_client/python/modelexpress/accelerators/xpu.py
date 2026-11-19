@@ -71,7 +71,9 @@ class XpuAcceleratorBackend:
     def tensor_mem_type(self, tensor: torch.Tensor) -> int:
         if self.is_accel_tensor(tensor):
             return p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
-        return p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        if tensor.device.type == "cpu":
+            return p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        raise ValueError(f"Cannot register a tensor on {tensor.device} for transfer")
 
     def supports_rdma_p2p(self) -> bool:
         return True

@@ -320,18 +320,18 @@ def register_tensors(
                 )
                 return
 
-            # Only accelerator tensors are transferred, so a peer would keep
-            # dummy values for host parameters. Raise instead of returning so
-            # the handler below also releases a manager that artifact install
-            # already created.
-            host_params = host_resident_parameters(
-                result.model, ctx.accelerator_backend
-            )
-            if host_params:
-                raise RuntimeError(
-                    f"{len(host_params)} parameters are outside accelerator "
-                    f"memory (first: {host_params[0]})"
+            # When discovery skips host parameters, a peer would keep dummy
+            # values for them. Raise instead of returning so the handler below
+            # also releases a manager that artifact install already created.
+            if not ctx.adapter.discovers_host_parameters():
+                host_params = host_resident_parameters(
+                    result.model, ctx.accelerator_backend
                 )
+                if host_params:
+                    raise RuntimeError(
+                        f"{len(host_params)} parameters are outside accelerator "
+                        f"memory (first: {host_params[0]})"
+                    )
 
             ctx.tensors = ctx.adapter.discover_tensors(result)
             if ctx.p2p_role == "draft":

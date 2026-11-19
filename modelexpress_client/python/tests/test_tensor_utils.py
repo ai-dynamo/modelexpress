@@ -5,6 +5,7 @@
 
 import types
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -413,6 +414,23 @@ class TestCollectModuleTensors:
         tensors = collect_module_tensors(model, backend)
 
         assert set(tensors) == {"a", "b"}
+
+    @pytest.mark.parametrize("include_host_parameters", [False, True])
+    def test_host_parameters_only_when_requested(
+        self, mock_accelerator_backend_cls, include_host_parameters
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_accel = nn.Parameter(torch.empty(4, device="meta"))
+        model.on_host = nn.Parameter(torch.zeros(4))
+        model.register_buffer("host_buffer", torch.zeros(4))
+
+        tensors = collect_module_tensors(
+            model, backend, include_host_parameters=include_host_parameters
+        )
+
+        expected = {"on_accel", "on_host"} if include_host_parameters else {"on_accel"}
+        assert set(tensors) == expected
 
     def test_non_contiguous_registered_as_storage(self, mock_accelerator_backend_cls):
         backend = mock_accelerator_backend_cls(torch_device_type="cpu")

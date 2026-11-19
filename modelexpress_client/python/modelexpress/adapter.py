@@ -190,6 +190,14 @@ class EngineAdapter:
         """Return whether RDMA must cover every source and target tensor."""
         return False
 
+    def discovers_host_parameters(self) -> bool:
+        """Return whether tensor discovery includes parameters in host memory.
+
+        When False, a model with parameters in host memory is not served or
+        received over RDMA.
+        """
+        return False
+
     def begin_streaming_reload(self, result: LoadResult) -> None:
         """Enter the engine's layerwise reload before a streaming reload.
 

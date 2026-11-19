@@ -584,7 +584,9 @@ class NixlTransferManager:
             f"get_metadata={metadata_time:.3f}s [{len(self._metadata)} bytes])"
         )
         logger.info(
-            f"Registered {reg_count} regions from {len(tensor_descriptors)} tensors "
+            f"Registered {reg_count} regions "
+            f"({reg_count - len(dram_descriptors)} VRAM, {len(dram_descriptors)} DRAM) "
+            f"from {len(tensor_descriptors)} tensors "
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB total"
         )
 
@@ -923,11 +925,13 @@ class NixlTransferManager:
         reduction = (1 - 1 / len(tensor_descriptors)) * 100 if tensor_descriptors else 0
         logger.info(
             f"[TIMING] register_arena: {nixl_reg_time + metadata_time:.3f}s total "
-            f"(nixl_register={nixl_reg_time:.3f}s [1 region, {used / 1e9:.2f} GB], "
+            f"(nixl_register={nixl_reg_time:.3f}s "
+            f"[1 arena region, {used / 1e9:.2f} GB, {len(dram_descriptors)} DRAM], "
             f"get_metadata={metadata_time:.3f}s [{len(self._metadata)} bytes])"
         )
         logger.info(
-            f"Registered arena as 1 region from {len(tensor_descriptors)} tensors "
+            f"Registered arena as 1 region ({len(dram_descriptors)} DRAM regions "
+            f"beside it) from {len(tensor_descriptors)} tensors "
             f"({reduction:.1f}% reduction), {total_bytes / 1e9:.2f} GB live in "
             f"{used / 1e9:.2f} GB arena bump range"
         )
