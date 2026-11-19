@@ -55,6 +55,10 @@ class AcceleratorBackend(Protocol):
         """Return whether ``tensor`` lives on this backend's accelerator memory."""
         ...
 
+    def tensor_mem_type(self, tensor: torch.Tensor) -> int:
+        """Return the ``p2p_pb2.TensorMemoryType`` NIXL registers ``tensor`` as."""
+        ...
+
     def supports_rdma_p2p(self) -> bool:
         """Return whether this backend supports NIXL RDMA P2P transfers."""
         ...

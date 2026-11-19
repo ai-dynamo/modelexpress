@@ -453,6 +453,7 @@ def publish_metadata(ctx: LoadContext) -> None:
                 ctx.tensors,
                 device_id=ctx.device_id,
                 worker_rank=ctx.worker_rank,
+                accelerator_backend=ctx.accelerator_backend,
             )
         except Exception as e:
             logger.warning(
@@ -474,6 +475,7 @@ def publish_metadata(ctx: LoadContext) -> None:
             ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
             accelerator=ctx.accelerator_backend.name,
             ready_fn=ctx.source_ready_fn,
+            accelerator_backend=ctx.accelerator_backend,
         )
     except Exception as e:
         logger.warning(

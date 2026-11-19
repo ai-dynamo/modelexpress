@@ -18,6 +18,7 @@ from .publisher import PublisherThread
 from .payload import tensor_source_metadata
 from ..client import MxClient
 from .. import p2p_pb2
+from ..accelerators import AcceleratorBackend
 
 if TYPE_CHECKING:
     from ..nixl_transfer import NixlTransferManager
@@ -59,19 +60,28 @@ def build_tensor_protos(
     tensors: dict[str, torch.Tensor],
     device_id: int,
     global_rank: int,
+    *,
+    accelerator_backend: AcceleratorBackend,
 ) -> list["p2p_pb2.TensorDescriptor"]:
     """Build per-tensor descriptor protos from registered tensors."""
     del global_rank  # unused, kept for caller-symmetry with publish_metadata_and_ready
-    return [
-        p2p_pb2.TensorDescriptor(
-            name=name,
-            addr=t.data_ptr(),
-            size=t.numel() * t.element_size(),
-            device_id=device_id,
-            dtype=str(t.dtype),
+    protos = []
+    for name, t in tensors.items():
+        mem_type = accelerator_backend.tensor_mem_type(t)
+        protos.append(
+            p2p_pb2.TensorDescriptor(
+                name=name,
+                addr=t.data_ptr(),
+                size=t.numel() * t.element_size(),
+                # NIXL registers host memory under device 0.
+                device_id=(
+                    0 if mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM else device_id
+                ),
+                dtype=str(t.dtype),
+                mem_type=mem_type,
+            )
         )
-        for name, t in tensors.items()
-    ]
+    return protos
 
 
 def publish_metadata_and_ready(
@@ -84,6 +94,8 @@ def publish_metadata_and_ready(
     worker_id: str,
     accelerator: str = "cuda",
     ready_fn: Callable[[], bool] | None = None,
+    *,
+    accelerator_backend: AcceleratorBackend,
 ) -> None:
     """Prepare tensor metadata publication and start the publisher thread.
 
@@ -94,7 +106,9 @@ def publish_metadata_and_ready(
         f"[Worker {worker_rank}] Preparing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
-    tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
+    tensor_protos = build_tensor_protos(
+        tensors, device_id, worker_rank, accelerator_backend=accelerator_backend
+    )
 
     # This node's RDMA-fabric location, published once so the topology_aware
     # selector can rank sources by locality. Empty when unconfigured. With a
@@ -232,6 +246,8 @@ def extend_published_tensors(
     tensors: dict[str, torch.Tensor],
     device_id: int,
     worker_rank: int,
+    *,
+    accelerator_backend: AcceleratorBackend,
 ) -> bool:
     """Add tensors to this device's existing publication.
 
@@ -243,7 +259,9 @@ def extend_published_tensors(
 
     Returns False when the device has no publication to extend.
     """
-    tensor_protos = build_tensor_protos(tensors, device_id, worker_rank)
+    tensor_protos = build_tensor_protos(
+        tensors, device_id, worker_rank, accelerator_backend=accelerator_backend
+    )
 
     server = _get_worker_server(device_id)
     if server is not None:

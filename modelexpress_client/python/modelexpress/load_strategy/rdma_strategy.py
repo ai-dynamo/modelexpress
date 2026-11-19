@@ -776,6 +776,7 @@ class RdmaStrategy(LoadStrategy):
                         size=t.size,
                         device_id=t.device_id,
                         dtype=t.dtype,
+                        mem_type=t.mem_type,
                     )
                     for t in tensor_protos
                 ]
@@ -787,6 +788,7 @@ class RdmaStrategy(LoadStrategy):
                         size=t.size,
                         device_id=t.device_id,
                         dtype=t.dtype,
+                        mem_type=t.mem_type,
                     )
                     for t in worker_tensor_descriptors(source_worker)
                 ]
