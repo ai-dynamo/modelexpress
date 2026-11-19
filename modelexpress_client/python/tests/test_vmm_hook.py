@@ -10,6 +10,8 @@ CUDAPluggableAllocator + MemPool require CUDA and skip otherwise.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 
@@ -466,6 +468,51 @@ class TestOptionalExtension:
 
         with pytest.raises(ArenaUnavailableError, match="not available"):
             vmm_hook._ensure_callbacks_initialized()
+
+    @pytest.mark.parametrize(
+        ("version", "supported"),
+        [
+            ("2.6.0+cu124", False),
+            ("2.7.1", False),
+            ("2.8.0", True),
+            ("2.14.0+cu130", True),
+        ],
+    )
+    def test_ensure_callbacks_refuses_torch_below_2_8(
+        self, monkeypatch, version, supported
+    ):
+        """Below torch 2.8 the init path raises before building any
+        allocator; from 2.8 it does not refuse on version."""
+        torch = pytest.importorskip("torch")
+        from torch.torch_version import TorchVersion
+
+        from modelexpress.vmm import hook as vmm_hook
+        from modelexpress.vmm.hook import ArenaUnavailableError
+
+        monkeypatch.setattr(torch, "__version__", TorchVersion(version))
+        monkeypatch.setattr(vmm_hook, "_callbacks_initialized", False)
+        monkeypatch.setattr(vmm_hook, "ARENA_AVAILABLE", True)
+        monkeypatch.setattr(
+            vmm_hook, "_vmm_alloc_ext", types.SimpleNamespace(__file__="ext.so")
+        )
+
+        built = []
+
+        def fake_allocator(*args):
+            built.append(args)
+            raise RuntimeError("stop after version gate")
+
+        monkeypatch.setattr(torch.cuda, "CUDAPluggableAllocator", fake_allocator)
+
+        assert vmm_hook.arena_supported_torch() is supported
+        if supported:
+            with pytest.raises(RuntimeError, match="stop after version gate"):
+                vmm_hook._ensure_callbacks_initialized()
+            assert len(built) == 1
+        else:
+            with pytest.raises(ArenaUnavailableError, match="2.8"):
+                vmm_hook._ensure_callbacks_initialized()
+            assert built == []
 
     def test_vllm_loader_falls_back_to_nullcontext(self, monkeypatch, caplog):
         """When MX_VMM_ARENA=1 but ARENA_AVAILABLE=False, the arena

@@ -177,7 +177,7 @@ def maybe_enter_vmm_arena(
     # the .so is absent and the arena machinery cannot be installed.
     # Fall back to the non-arena path with a clear warning rather than
     # crashing the load.
-    from .hook import ARENA_AVAILABLE
+    from .hook import ARENA_AVAILABLE, arena_supported_torch
 
     if not ARENA_AVAILABLE:
         logger.warning(
@@ -186,6 +186,17 @@ def maybe_enter_vmm_arena(
             "path. Pool-reg (MX_POOL_REG=1) still works. Reinstall "
             "modelexpress with a working C++ compiler to enable the arena "
             "fast path.",
+            ctx.global_rank,
+        )
+        yield
+        return
+
+    if not arena_supported_torch():
+        logger.warning(
+            "[Worker %d] MX_VMM_ARENA=1 set but the installed torch is older "
+            "than 2.8, where empty_cache() can free arena memory with "
+            "cudaFree instead of the arena's allocator; falling back to the "
+            "non-arena load path. Upgrade torch to enable the arena.",
             ctx.global_rank,
         )
         yield

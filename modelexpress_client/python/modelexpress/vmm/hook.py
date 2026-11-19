@@ -90,10 +90,23 @@ def pool_release_safe_in_pool_scope() -> bool:
     return torch.__version__ >= (2, 13)
 
 
+def arena_supported_torch() -> bool:
+    """Whether this torch routes cached-segment frees to the owning allocator.
+
+    Before torch 2.8, release_block frees a segment with cudaFree once its
+    MemPool is destroyed, so an empty_cache() outside a MemPoolContext
+    would cudaFree arena memory that mx_free must unmap. From torch 2.8
+    the free is dispatched to the allocator that owns the segment.
+    """
+    import torch
+
+    return torch.__version__ >= (2, 8)
+
+
 class ArenaUnavailableError(RuntimeError):
     """Raised when arena machinery is requested but _vmm_alloc_ext failed
-    to build or import. Catch this in callers that want a graceful
-    fallback to the non-arena path."""
+    to build or import, or the installed torch is older than 2.8. Catch
+    this in callers that want a graceful fallback to the non-arena path."""
 
 
 def _mx_malloc(size: int, device: int, stream: int) -> int:
@@ -134,8 +147,8 @@ def _ensure_callbacks_initialized() -> None:
     without acquiring the lock.
 
     Raises ArenaUnavailableError if the _vmm_alloc_ext C extension is
-    not importable. Callers should catch this and fall back to the
-    non-arena path rather than crashing.
+    not importable or torch is older than 2.8. Callers should catch this
+    and fall back to the non-arena path rather than crashing.
     """
     global _pluggable_alloc, _callbacks_initialized
     if _callbacks_initialized:
@@ -153,6 +166,16 @@ def _ensure_callbacks_initialized() -> None:
                 f"(import failed: {_import_error}). The arena allocator "
                 "fast path is disabled. Install a C++ compiler and reinstall "
                 "modelexpress, or unset MX_VMM_ARENA to use the pool-reg path."
+            )
+
+        if not arena_supported_torch():
+            import torch
+
+            raise ArenaUnavailableError(
+                f"The VMM arena requires torch >= 2.8 (found {torch.__version__}): "
+                "on older torch, empty_cache() can free arena memory with "
+                "cudaFree instead of the arena's allocator. Upgrade torch, or "
+                "unset MX_VMM_ARENA to use the pool-reg path."
             )
 
         cumem = _vmm_alloc_ext  # set by _probe_extension at import time
