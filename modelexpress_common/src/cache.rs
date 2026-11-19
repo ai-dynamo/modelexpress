@@ -301,6 +301,43 @@ pub struct ModelInfo {
     pub name: String,
     pub size: u64,
     pub path: PathBuf,
+    /// False when the model directory could not be read, e.g. because of its permissions.
+    /// The size of an inaccessible model is reported as zero.
+    pub accessible: bool,
+}
+
+impl ModelInfo {
+    /// Builds a model entry from a size measurement. A model whose directory cannot be
+    /// read is flagged as inaccessible instead of failing the whole cache listing.
+    pub(crate) fn measured(
+        provider: ModelProvider,
+        name: String,
+        path: PathBuf,
+        size: Result<u64>,
+    ) -> Self {
+        match size {
+            Ok(size) => Self {
+                provider,
+                name,
+                size,
+                path,
+                accessible: true,
+            },
+            Err(err) => {
+                warn!(
+                    "Model '{name}' at '{}' is inaccessible: {err:#}",
+                    path.display()
+                );
+                Self {
+                    provider,
+                    name,
+                    size: 0,
+                    path,
+                    accessible: false,
+                }
+            }
+        }
+    }
 }
 
 impl CacheStats {
@@ -356,6 +393,22 @@ pub fn resolve_model_path(
     revision: Option<&str>,
 ) -> Result<PathBuf> {
     cache_for_provider(provider).resolve_model_path(cache_root, model_name, revision)
+}
+
+/// Opens a directory below a provider's cache root for a listing walk. A directory that
+/// cannot be read is skipped with a warning so one bad entry does not abort the listing.
+#[cfg(any(feature = "s3", feature = "gcs"))]
+pub(crate) fn read_dir_for_listing(path: &Path) -> Option<fs::ReadDir> {
+    match fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(err) => {
+            warn!(
+                "Skipping unreadable cache directory '{}': {err}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 pub(crate) fn directory_size(path: &Path) -> Result<u64> {
@@ -445,12 +498,14 @@ mod tests {
                     name: "model1".to_string(),
                     size: 1024 * 1024 * 2, // 2 MB
                     path: PathBuf::from("/test/model1"),
+                    accessible: true,
                 },
                 ModelInfo {
                     provider: ModelProvider::Gcs,
                     name: "gs://bucket/model2".to_string(),
                     size: 1024 * 1024 * 3, // 3 MB
                     path: PathBuf::from("/test/model2"),
+                    accessible: true,
                 },
             ],
         };
@@ -621,6 +676,190 @@ mod tests {
         assert_eq!(stats.models[1].size, 6);
         assert_eq!(stats.models[1].path, gcs_model_dir);
         assert!(stats.models.iter().all(|model| model.name != "tmp"));
+    }
+
+    /// Restores a directory's permissions on drop so `TempDir` can clean it up.
+    #[cfg(unix)]
+    struct RestorePermissions(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[cfg(unix)]
+    fn lock_directory(path: &Path) -> Option<RestorePermissions> {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000))
+            .expect("Failed to chmod directory");
+        let guard = RestorePermissions(path.to_path_buf());
+        // Root ignores directory permissions, so the scenario cannot be reproduced.
+        if fs::read_dir(path).is_ok() {
+            return None;
+        }
+        Some(guard)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_cache_stats_flags_inaccessible_models_and_keeps_going() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+
+        let good_hf = cache_path.join("models--google--t5-small");
+        fs::create_dir_all(&good_hf).expect("Failed to create HF model directory");
+        fs::write(good_hf.join("config.json"), b"{}").expect("Failed to write HF file");
+
+        let bad_hf = cache_path.join("models--private--locked");
+        fs::create_dir_all(&bad_hf).expect("Failed to create HF model directory");
+        fs::write(bad_hf.join("config.json"), b"{}").expect("Failed to write HF file");
+
+        let Some(_bad_hf_guard) = lock_directory(&bad_hf) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+
+        let stats = create_test_cache_config(cache_path)
+            .get_cache_stats()
+            .expect("an unreadable model directory must not fail the whole listing");
+
+        let names: Vec<&str> = stats.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["google/t5-small", "private/locked"]);
+        assert_eq!(stats.total_models, 2);
+
+        assert!(stats.models[0].accessible);
+        assert_eq!(stats.models[0].size, 2);
+        assert!(!stats.models[1].accessible);
+        assert_eq!(stats.models[1].size, 0);
+        assert_eq!(stats.models[1].path, bad_hf);
+        assert_eq!(stats.total_size, 2);
+    }
+
+    #[cfg(all(unix, feature = "s3"))]
+    #[test]
+    fn test_get_cache_stats_flags_inaccessible_models_across_hf_and_s3() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+
+        let good_hf = cache_path.join("models--google--t5-small");
+        fs::create_dir_all(&good_hf).expect("Failed to create HF model directory");
+        fs::write(good_hf.join("config.json"), b"{}").expect("Failed to write HF file");
+
+        let bad_hf = cache_path.join("models--private--locked");
+        fs::create_dir_all(&bad_hf).expect("Failed to create HF model directory");
+        fs::write(bad_hf.join("config.json"), b"{}").expect("Failed to write HF file");
+
+        let s3_model = cache_path.join("s3/bucket/team/model");
+        fs::create_dir_all(&s3_model).expect("Failed to create S3 model directory");
+        fs::write(s3_model.join(".mx-model"), b"").expect("Failed to write S3 marker");
+        fs::write(s3_model.join("weights.bin"), b"abcd").expect("Failed to write S3 weights");
+
+        let s3_locked = cache_path.join("s3/bucket/locked");
+        fs::create_dir_all(&s3_locked).expect("Failed to create locked S3 directory");
+
+        let Some(_bad_hf_guard) = lock_directory(&bad_hf) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+        let Some(_s3_guard) = lock_directory(&s3_locked) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+
+        let stats = create_test_cache_config(cache_path)
+            .get_cache_stats()
+            .expect("an unreadable model directory must not fail the whole listing");
+
+        let names: Vec<&str> = stats.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "google/t5-small",
+                "private/locked",
+                "s3://bucket/team/model"
+            ]
+        );
+        assert_eq!(stats.total_models, 3);
+
+        assert!(stats.models[0].accessible);
+        assert_eq!(stats.models[0].size, 2);
+        assert!(!stats.models[1].accessible);
+        assert_eq!(stats.models[1].size, 0);
+        assert_eq!(stats.models[1].path, bad_hf);
+        assert!(stats.models[2].accessible);
+        assert_eq!(stats.models[2].size, 4);
+        assert_eq!(stats.total_size, 6);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_get_cache_stats_flags_inaccessible_ngc_models() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+
+        let good = cache_path.join("ngc/org/models/good/1");
+        fs::create_dir_all(&good).expect("Failed to create NGC model directory");
+        fs::write(good.join("weights.bin"), b"ab").expect("Failed to write NGC file");
+
+        let locked = cache_path.join("ngc/org/team/models/locked/2");
+        fs::create_dir_all(&locked).expect("Failed to create NGC model directory");
+        fs::write(locked.join("weights.bin"), b"abc").expect("Failed to write NGC file");
+
+        let other_org = cache_path.join("ngc/other");
+        fs::create_dir_all(&other_org).expect("Failed to create NGC org directory");
+
+        let Some(_locked_guard) = lock_directory(&locked) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+        let Some(_org_guard) = lock_directory(&other_org) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+
+        let stats = create_test_cache_config(cache_path)
+            .get_cache_stats()
+            .expect("an unreadable NGC directory must not fail the whole listing");
+
+        let mut ngc: Vec<(&str, bool, u64)> = stats
+            .models
+            .iter()
+            .filter(|m| m.provider == ModelProvider::Ngc)
+            .map(|m| (m.name.as_str(), m.accessible, m.size))
+            .collect();
+        ngc.sort();
+        assert_eq!(
+            ngc,
+            vec![
+                ("org/good/1", true, 2),
+                ("org/team/models/locked/2", false, 0)
+            ]
+        );
+    }
+
+    #[cfg(all(unix, feature = "s3"))]
+    #[test]
+    fn test_get_cache_stats_fails_on_unreadable_s3_root() {
+        let temp_dir = TempDir::new().expect("Failed to create temp directory");
+        let cache_path = temp_dir.path().join("cache");
+
+        let s3_model = cache_path.join("s3/bucket/model");
+        fs::create_dir_all(&s3_model).expect("Failed to create S3 model directory");
+        fs::write(s3_model.join(".mx-model"), b"").expect("Failed to write S3 marker");
+
+        let Some(_s3_guard) = lock_directory(&cache_path.join("s3")) else {
+            eprintln!("skipping: directory permissions are not enforced (running as root?)");
+            return;
+        };
+
+        assert!(
+            create_test_cache_config(cache_path)
+                .get_cache_stats()
+                .is_err()
+        );
     }
 
     #[cfg(feature = "gcs")]

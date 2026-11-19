@@ -18,7 +18,7 @@
 ARG SGLANG_IMAGE=lmsysorg/sglang:v0.5.13.post1
 FROM ${SGLANG_IMAGE}
 
-RUN pip install mooncake-transfer-engine-cuda13
+RUN pip install 'mooncake-transfer-engine-cuda13>=0.3.14'
 
 # Install ModelExpress Python client from this repository.
 # Proto stubs (p2p_pb2.py, p2p_pb2_grpc.py) are checked-in source artifacts;

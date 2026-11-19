@@ -70,7 +70,10 @@ pub enum RpcOutcome {
     /// metadata-store outage. `mx_backend_ops_total` disambiguates: a real store
     /// outage lights that family up too.
     BackendError,
-    /// Rejected by the ServiceAccount auth layer.
+    /// Rejected on identity grounds: by the ServiceAccount auth layer, or by a
+    /// handler that refused what an authenticated caller asserted about itself.
+    /// `from_code` already folds `PermissionDenied` in here, so authentication
+    /// and authorization failures share one label by design.
     Unauthenticated,
     /// The caller went away before the handler finished: client disconnect,
     /// `RST_STREAM`, or a deadline. Recorded from a drop guard, never from a
@@ -256,6 +259,7 @@ pub fn method_label(path: &str) -> &'static str {
         "/model_express.p2p.P2pService/ListSources" => "P2pService/ListSources",
         "/model_express.p2p.P2pService/GetMetadata" => "P2pService/GetMetadata",
         "/model_express.p2p.P2pService/UpdateStatus" => "P2pService/UpdateStatus",
+        "/model_express.p2p.P2pService/DonorLease" => "P2pService/DonorLease",
 
         "/model_express.refit.RefitService/CreateTrainerMesh" => "RefitService/CreateTrainerMesh",
         "/model_express.refit.RefitService/GetTrainerMesh" => "RefitService/GetTrainerMesh",
@@ -684,8 +688,8 @@ mod tests {
         // Guards the parser itself: a change that stopped matching `rpc` lines
         // would otherwise make this test pass by checking nothing.
         assert_eq!(
-            checked, 25,
-            "expected 25 routed server RPCs, parsed {checked}"
+            checked, 26,
+            "expected 26 routed server RPCs, parsed {checked}"
         );
     }
 

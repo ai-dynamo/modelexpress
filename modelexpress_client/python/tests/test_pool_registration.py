@@ -18,6 +18,7 @@ from modelexpress.nixl_transfer import (
     _arena_single_mr_forced,
     NixlTransferManager,
     _pool_reg_enabled,
+    _spanning_descriptors,
 )
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
 
@@ -88,9 +89,10 @@ def fake_driver(monkeypatch):
 
 
 class TestPoolRegEnabled:
-    def test_default_is_off(self, monkeypatch):
+    def test_default_is_on(self, monkeypatch):
         monkeypatch.delenv("MX_POOL_REG", raising=False)
-        assert _pool_reg_enabled() is False
+        monkeypatch.delenv("MX_VMM_ARENA", raising=False)
+        assert _pool_reg_enabled() is True
 
     def test_explicit_zero_is_off(self, monkeypatch):
         monkeypatch.setenv("MX_POOL_REG", "0")
@@ -179,6 +181,12 @@ class TestFindCudaAllocations:
         result = NixlTransferManager._find_cuda_allocations(descriptors)
         assert result == [(0x1000, 0x1000), (0x2000, 0x1000)]
 
+    def test_tensor_past_allocation_end_raises(self, fake_driver):
+        # One VA range backed by two mappings reads as two allocations.
+        fake_driver([(0x1000, 0x1000), (0x2000, 0x1000)])
+        with pytest.raises(RuntimeError, match="'w' at 0x1f00 .* extends past"):
+            NixlTransferManager._find_cuda_allocations([_desc("w", 0x1F00, 0x200)])
+
     def test_driver_error_raises_runtime_error(self, fake_driver):
         from cuda.bindings import driver
 
@@ -194,6 +202,21 @@ class TestFindCudaAllocations:
         )
         with pytest.raises(RuntimeError, match="'w_named'"):
             NixlTransferManager._find_cuda_allocations([_desc("w_named", 0x1000, 64)])
+
+
+class TestSpanningDescriptors:
+    def test_tensors_inside_allocations_are_not_reported(self):
+        allocations = [(0x1000, 0x1000), (0x2000, 0x1000)]
+        descriptors = [_desc("w0", 0x1000, 0x1000), _desc("w1", 0x2800, 0x800)]
+        assert _spanning_descriptors(descriptors, allocations) == []
+
+    def test_tensor_past_allocation_end_is_reported_with_its_allocation(self):
+        allocations = [(0x1000, 0x1000), (0x2000, 0x1000)]
+        inside = _desc("inside", 0x1000, 0x100)
+        spanning = _desc("spanning", 0x1f00, 0x200)
+        assert _spanning_descriptors([inside, spanning], allocations) == [
+            (spanning, 0x1000, 0x1000)
+        ]
 
 
 class TestRawDescriptorMemType:
@@ -217,6 +240,45 @@ class TestRawDescriptorMemType:
             mem_type=NIXL_ACCELERATOR_MEM_TYPE,
             backends=["UCX"],
         )
+
+    def test_pool_registration_keeps_allocations_when_tensors_fit(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        backing = torch.zeros(8, dtype=torch.float32)
+        first = MagicMock(wraps=backing[:4])
+        first.is_cuda = True
+        second = MagicMock(wraps=backing[4:])
+        second.is_cuda = True
+        base = backing.data_ptr()
+        mgr = self._make_manager()
+        # Each tensor ends exactly at the end of its own allocation.
+        mgr._find_cuda_allocations = MagicMock(
+            return_value=[(base, 16), (base + 16, 16)]
+        )
+        mgr.register_tensors({"a": first, "b": second})
+
+        mgr._agent.register_memory.assert_called_once_with(
+            [(base, 16, 0, ""), (base + 16, 16, 0, "")],
+            mem_type=NIXL_ACCELERATOR_MEM_TYPE,
+            backends=["UCX"],
+        )
+
+    def test_pool_registration_rejects_tensor_spanning_allocations(self, monkeypatch):
+        monkeypatch.setenv("MX_POOL_REG", "1")
+        backing = torch.zeros(4, dtype=torch.float32)
+        tensor = MagicMock(wraps=backing)
+        tensor.is_cuda = True
+        base = backing.data_ptr()
+        mgr = self._make_manager()
+        # One VA range backed by two separately mapped segments.
+        mgr._find_cuda_allocations = MagicMock(return_value=[(base, 8), (base + 8, 8)])
+
+        with pytest.raises(RuntimeError) as exc_info:
+            mgr.register_tensors({"workspace": tensor})
+
+        message = str(exc_info.value)
+        assert "First: workspace" in message
+        assert f"[0x{base:x}, 0x{base + 8:x})" in message
+        mgr._agent.register_memory.assert_not_called()
 
     def test_draft_view_inside_registered_pool_reuses_main_registration(
         self, monkeypatch
@@ -1106,6 +1168,138 @@ class _MetricsSpy:
 
     def __getattr__(self, _name):
         return lambda *args, **kwargs: None
+
+
+class TestAddresslessTensorTransfers:
+    def _manager(self, monkeypatch, tensors):
+        monkeypatch.setenv("MX_POOL_REG", "0")
+        monkeypatch.setattr(torch.cuda, "set_device", lambda *a, **k: None)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
+        manager = NixlTransferManager(agent_name="test", device_id=0)
+        manager._agent = MagicMock()
+        manager._agent.get_agent_metadata.return_value = b"metadata"
+        manager.register_tensors(tensors)
+        manager._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        manager._agent.make_prepped_xfer.return_value = "handle"
+        manager._agent.check_xfer_state.return_value = "DONE"
+        return manager
+
+    def _outcomes(self, monkeypatch):
+        outcomes = []
+        monkeypatch.setattr(
+            nixl_transfer.transfer_metrics, "record_nixl_receive", outcomes.append
+        )
+        return outcomes
+
+    @pytest.mark.parametrize("strict", [False, True])
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_unallocated_source_is_partial_or_rejected(
+        self, monkeypatch, strict, mixed
+    ):
+        source_tensors = {"w": torch.empty(1, device="meta")}
+        local_tensors = {"w": torch.full((1,), 7.0)}
+        if mixed:
+            source_tensors["live"] = torch.ones(2)
+            local_tensors["live"] = torch.zeros(2)
+        source = self._manager(monkeypatch, source_tensors)
+        target = self._manager(monkeypatch, local_tensors)
+        outcomes = self._outcomes(monkeypatch)
+        kwargs = dict(
+            source_metadata=b"metadata",
+            source_tensors=source.tensor_descriptors,
+            remote_agent_name="source",
+            require_exact_match=strict,
+        )
+
+        if strict:
+            with pytest.raises(ManifestMismatchError, match="w.*source.*address"):
+                target.receive_from_source(**kwargs)
+            target._agent.prep_xfer_dlist.assert_not_called()
+            assert outcomes == ["rejected"]
+        else:
+            result = target.receive_from_source(**kwargs)
+            assert result[:2] == (8 if mixed else 0, 2 if mixed else 1)
+            assert outcomes == ["partial"]
+            if mixed:
+                assert target._agent.prep_xfer_dlist.call_args_list[0].kwargs[
+                    "xfer_list"
+                ] == [(source_tensors["live"].data_ptr(), 8, 0)]
+            else:
+                target._agent.prep_xfer_dlist.assert_not_called()
+            assert local_tensors["w"].item() == 7.0
+
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_unallocated_destination_is_rejected(self, monkeypatch, strict):
+        source = self._manager(monkeypatch, {"w": torch.ones(1)})
+        target = self._manager(monkeypatch, {"w": torch.empty(1, device="meta")})
+        outcomes = self._outcomes(monkeypatch)
+
+        with pytest.raises(ManifestMismatchError, match="w.*local.*address"):
+            target.receive_from_source(
+                source_metadata=b"metadata",
+                source_tensors=source.tensor_descriptors,
+                remote_agent_name="source",
+                require_exact_match=strict,
+            )
+
+        target._agent.prep_xfer_dlist.assert_not_called()
+        assert outcomes == ["rejected"]
+
+    def test_registered_empty_tensors_still_complete_in_strict_mode(self, monkeypatch):
+        tensors = {"a": torch.empty(0), "b": torch.empty(0, dtype=torch.int32)}
+        source = self._manager(monkeypatch, tensors)
+        target = self._manager(monkeypatch, tensors)
+        outcomes = self._outcomes(monkeypatch)
+
+        assert target.receive_from_source(
+            source_metadata=b"metadata",
+            source_tensors=source.tensor_descriptors,
+            remote_agent_name="source",
+            require_exact_match=True,
+        ) == (0, 2, 0.0)
+
+        target._agent.prep_xfer_dlist.assert_not_called()
+        assert outcomes == ["complete"]
+
+    @pytest.mark.parametrize("kind", ["empty", "meta", "noncontiguous_meta"])
+    def test_appended_no_payload_tensor_needs_no_registration(self, monkeypatch, kind):
+        tensors = {
+            "empty": torch.empty(0),
+            "meta": torch.empty(1, device="meta"),
+            "noncontiguous_meta": torch.empty((2, 3), device="meta").T,
+        }
+        tensor = tensors[kind]
+        target = self._manager(monkeypatch, {"main": torch.ones(1)})
+        target._agent.register_memory.reset_mock()
+
+        assert target.register_additional_tensors({"draft": tensor}) == b"metadata"
+
+        target._agent.register_memory.assert_not_called()
+        assert target._tensors["draft"] is tensor
+        assert target.tensor_descriptors[-1] == TensorDescriptor(
+            name="draft",
+            addr=tensor.data_ptr(),
+            size=tensor.numel() * tensor.element_size(),
+            device_id=0,
+            dtype=str(tensor.dtype),
+        )
+        assert target._appended_registrations["draft"] is None
+        target.deregister_tensors(["draft"])
+        target._agent.deregister_memory.assert_not_called()
+        assert list(target._tensors) == ["main"]
+
+    def test_appending_mixed_tensors_registers_only_allocated_storage(self, monkeypatch):
+        target = self._manager(monkeypatch, {"main": torch.ones(1)})
+        target._agent.register_memory.reset_mock()
+        live = torch.ones(2)
+
+        target.register_additional_tensors(
+            {"unallocated": torch.empty(1, device="meta"), "live": live}
+        )
+
+        target._agent.register_memory.assert_called_once_with([live], backends=["UCX"])
+        assert target._appended_registrations["unallocated"] is None
+        assert list(target._tensors) == ["main", "unallocated", "live"]
 
 
 class TestReceiveOutcomeLabelsAtTheCallSite:

@@ -131,6 +131,33 @@ class TestParamPlanValidation:
                 dst_placements=(Placement.replicate(),),
             )
 
+    def test_a_source_split_on_two_tensor_dims_is_rejected(self):
+        """The collective refuses it at reshard time; the plan says so first."""
+        with pytest.raises(ValueError, match="one sharded dim per source tensor"):
+            ParamPlan(
+                name="w",
+                global_shape=(8, 4),
+                dtype="bfloat16",
+                partition_id=0,
+                src_mesh=MeshSpec(shape=(2, 2)),
+                src_placements=(Placement.shard(0), Placement.shard(1)),
+                dst_mesh=MeshSpec(shape=(2,)),
+                dst_placements=(Placement.replicate(),),
+            )
+
+    def test_a_2d_source_with_one_axis_replicated_is_accepted(self):
+        entry = ParamPlan(
+            name="w",
+            global_shape=(8, 4),
+            dtype="bfloat16",
+            partition_id=0,
+            src_mesh=MeshSpec(shape=(2, 2)),
+            src_placements=(Placement.replicate(), Placement.shard(1)),
+            dst_mesh=MeshSpec(shape=(2,), rank_offset=4),
+            dst_placements=(Placement.shard(0),),
+        )
+        assert entry.src_placements[1].dim == 1
+
     def test_a_valid_plan_is_accepted(self):
         assert param().name == "w"
 

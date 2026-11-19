@@ -318,6 +318,11 @@ def initialize_generator_runtime(
                     rl_envs.MX_REFIT_FULL_STREAMING
                     and engine.installer.capabilities.streamed_checkpoints
                 ),
+                # With generator P2P, object-storage updates replay from the full
+                # root, so a working copy of the cache head is rarely used.
+                background_seed_copy=(
+                    WeightSource.GENERATOR not in resolved_source_order
+                ),
             )
             methods.append(canonical_method)
         if any(

@@ -17,7 +17,7 @@ import torch.nn as nn
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import log_tensor_summary
+from ..tensor_utils import host_resident_parameters, log_tensor_summary
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
@@ -320,6 +320,19 @@ def register_tensors(
                 )
                 return
 
+            # Only accelerator tensors are transferred, so a peer would keep
+            # dummy values for host parameters. Raise instead of returning so
+            # the handler below also releases a manager that artifact install
+            # already created.
+            host_params = host_resident_parameters(
+                result.model, ctx.accelerator_backend
+            )
+            if host_params:
+                raise RuntimeError(
+                    f"{len(host_params)} parameters are outside accelerator "
+                    f"memory (first: {host_params[0]})"
+                )
+
             ctx.tensors = ctx.adapter.discover_tensors(result)
             if ctx.p2p_role == "draft":
                 ctx.tensors = {
@@ -337,13 +350,21 @@ def register_tensors(
             else:
                 base_port = envs.MX_METADATA_PORT
                 listen_port = base_port + ctx.device_id
-                ctx.nixl_manager = _init_nixl_manager(
-                    ctx.global_rank,
-                    ctx.device_id,
-                    "auto",
-                    listen_port,
-                    ctx.accelerator_backend,
-                )
+                try:
+                    ctx.nixl_manager = _init_nixl_manager(
+                        ctx.global_rank,
+                        ctx.device_id,
+                        "auto",
+                        listen_port,
+                        ctx.accelerator_backend,
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"NIXL agent with listen port {listen_port} = "
+                        f"MX_METADATA_PORT ({base_port}) + device_id "
+                        f"({ctx.device_id}) failed to start; if the port is "
+                        f"taken by another service, change MX_METADATA_PORT: {e}"
+                    ) from e
 
         if ctx.p2p_role == "draft":
             # Reusing the target's manager means tensor_descriptors is already
