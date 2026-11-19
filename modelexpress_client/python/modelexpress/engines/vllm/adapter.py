@@ -11,8 +11,10 @@ import inspect
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Iterator
 
 import torch
@@ -89,6 +91,36 @@ def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
         if isinstance(counter, torch.Tensor):
             tensors.append(counter)
     return tensors
+
+
+@contextmanager
+def _instanttensor_allocator_context() -> Iterator[None]:
+    """Keep 20 MiB allocator segments reusable while loading InstantTensor weights."""
+    if (
+        not torch.cuda.is_initialized()
+        or torch.cuda.memory.get_allocator_backend() != "native"
+    ):
+        yield
+        return
+
+    getter = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+    if getter is not None:
+        original = getter()
+    else:
+        original = torch.cuda.memory._snapshot().get("allocator_settings", {}).get(
+            "PYTORCH_CUDA_ALLOC_CONF", ""
+        )
+    match = re.search(r"\bmax_split_size_mb\s*:\s*(\d+)", original)
+    if match is None or int(match.group(1)) != 20:
+        yield
+        return
+
+    settings = original[: match.start(1)] + "21" + original[match.end(1) :]
+    torch.cuda.memory._set_allocator_settings(settings)
+    try:
+        yield
+    finally:
+        torch.cuda.memory._set_allocator_settings(original)
 
 
 def _is_speculative_draft(vllm_config, model_config) -> bool:
@@ -570,7 +602,12 @@ class VllmAdapter(EngineAdapter):
             object.__setattr__(load_config, "load_format", "instanttensor")
 
         loader = DefaultModelLoader(load_config)
-        return loader.get_all_weights(self.model_config, model)
+
+        def weights():
+            with _instanttensor_allocator_context():
+                yield from loader.get_all_weights(self.model_config, model)
+
+        return weights()
 
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:

@@ -1446,6 +1446,8 @@ The strategy is enabled by default. The `instanttensor` package is a core depend
 
 InstantTensor also honors its own `INSTANTTENSOR_BACKEND` environment variable (`URING`, `AIO`, `CUFILE` for GDS, `MMAP`) for selecting the I/O backend; ModelExpress passes it through unchanged.
 
+When a vLLM image sets `max_split_size_mb=20` during loading, ModelExpress temporarily uses 21 MiB while consuming InstantTensor weights and restores all runtime allocator settings afterward. Images already using 21 MiB are unchanged. This avoids accumulation of unused 20 MiB blocks during InstantTensor loading without requiring an updated vLLM image.
+
 ### ModelStreamer (Object Storage & Local Disk)
 
 ModelStreamer reads safetensor ranges concurrently through a bounded CPU staging buffer and pipelines completed tensors into the inference engine while later reads continue. It supports S3, GCS, Azure Blob Storage, and local filesystem (PVC) paths. This storage-loading path does not require P2P by itself. If the same deployment also enables ModelExpress P2P metadata and RDMA resources, later replicas can receive weights from an already-loaded source instead of streaming from storage again.
