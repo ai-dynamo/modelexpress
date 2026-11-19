@@ -104,9 +104,14 @@ def test_http_success_with_worker_error_is_rejected(orchestrator, monkeypatch):
 @pytest.mark.parametrize("scenario,failure", [
     ("blob", ""), ("p2p", ""), ("p2p", "no-peer-update"), ("p2p", "fallback"),
     ("p2p", "unexpected-fallback"),
+    ("blob", "active-job-failure"), ("blob", "restart-job-failure"),
 ])
 def test_runner_checks_sources_and_retries_replacement_lookup(tmp_path, scenario, failure):
     """Run the actual shell workflow with local command doubles, never Kubernetes."""
+    failed_job = {
+        "active-job-failure": "mx-azure-refit-active",
+        "restart-job-failure": "mx-azure-refit-restart-verify",
+    }.get(failure, "")
     commands = r'''
 import os, re, sys
 from pathlib import Path
@@ -134,6 +139,13 @@ elif args[:2] == ["create", "configmap"]:
     print("kind: ConfigMap\nmetadata: {name: mx-azure-refit-scripts}")
 elif args[:2] == ["get", "configmap"]:
     print("review-v3")
+elif args[:1] == ["get"] and args[1].startswith("job/"):
+    job = args[1][4:]
+    polled = root / (job + ".polled")
+    if not polled.exists():
+        polled.touch()
+    else:
+        print("Failed" if job == os.environ["TEST_FAILED_JOB"] else "Complete")
 elif args[:2] == ["get", "pods"]:
     if (root / "deleted").exists():
         print("worker-b\ngone\nterminating\nreplacement")
@@ -146,8 +158,10 @@ elif args[:2] == ["get", "pod"]:
         print("pod disappeared", file=sys.stderr)
         sys.exit(1)
     print("now|True" if args[2] in {"terminating", "worker-b"} else "|True")
-elif args[:1] == ["logs"] and not args[1].startswith("job/"):
-    if args[1] == "replacement":
+elif args[:1] == ["logs"]:
+    if args[1].startswith("job/"):
+        print("diagnostics for " + args[1])
+    elif args[1] == "replacement":
         strategy = "desired_version_p2p" if count == 2 else "desired_version_object_storage"
         print("Trying strategy: " + strategy)
         if failure in {"fallback", "unexpected-fallback"}:
@@ -169,6 +183,7 @@ elif args[:1] == ["logs"] and not args[1].startswith("job/"):
         ["bash", str(EXAMPLE / "run.sh")], capture_output=True, text=True, timeout=20,
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}",
              "TEST_COMMAND_DIR": str(tmp_path), "TEST_FAILURE": failure,
+             "TEST_FAILED_JOB": failed_job,
              "NAMESPACE": "review", "SCENARIO": scenario, "RUN_ID": "review",
              "WORKER_IMAGE": "example/worker:test", "DYNAMO_FRONTEND_IMAGE": "example/frontend:test"},
     )
@@ -176,12 +191,22 @@ elif args[:1] == ["logs"] and not args[1].startswith("job/"):
     if failure:
         assert result.returncode != 0
         assert "E2E PASS" not in result.stdout
-        assert "wait --for=condition=complete job/mx-azure-refit-restart-verify" not in calls
+        if failed_job:
+            assert f"Job {failed_job} failed" in result.stderr
+            assert f"diagnostics for job/{failed_job}" in result.stderr
+            assert f"logs job/{failed_job} --all-containers --prefix" in calls
+            assert calls.count(f"get job/{failed_job} ") == 2
+        if failure != "restart-job-failure":
+            assert "get job/mx-azure-refit-restart-verify" not in calls
+        if failure == "active-job-failure":
+            assert "delete pod" not in calls
         return
     assert result.returncode == 0, result.stderr
     assert f"{scenario} replacement recovery" in result.stdout
     assert "get pod gone" in calls and "get pod terminating" in calls
     assert "logs terminating" not in calls and "logs replacement" in calls
+    for job in ("mx-azure-refit-active", "mx-azure-refit-restart-verify"):
+        assert calls.count(f"get job/{job} ") == 2
     resources = list(yaml.safe_load_all((tmp_path / "manifests").read_text()))
     dgd = next(r for r in resources if r["kind"] == "DynamoGraphDeployment")
     worker = dgd["spec"]["components"][1]

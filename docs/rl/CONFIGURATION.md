@@ -152,6 +152,10 @@ tokenizer files. The example mounts this checkpoint read-only. Its default model
 is `Qwen/Qwen3-0.6B`, the small model used by the existing S3 example. Changing
 models can require larger memory, GPU, and cache limits in the manifests.
 
+The model PVC must support concurrent mounts from all nodes running the
+generators and publication Job. Use a `ReadWriteMany` claim for this layout;
+the example mounts the checkpoint read-only.
+
 Install `kubectl` and `envsubst`. Prepare the namespace, secrets, and model PVC
 before running the example. Resource names are fixed; use a fresh namespace for
 each run.

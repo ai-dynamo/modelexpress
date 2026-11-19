@@ -54,6 +54,30 @@ if [[ ! "$RUN_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$ ]]; then
   exit 1
 fi
 k=(kubectl --namespace "$namespace")
+
+wait_for_job() {
+  local job=$1 deadline=$((SECONDS + $2)) conditions
+  local job_error="Timed out waiting for job $1"
+  while (( SECONDS < deadline )); do
+    if ! conditions=$("${k[@]}" get "job/$job" --request-timeout=30s \
+      -o jsonpath='{range .status.conditions[?(@.status=="True")]}{.type}{"\n"}{end}'); then
+      job_error="Could not read status for job $job"
+      break
+    fi
+    if grep -Fxq Failed <<< "$conditions"; then
+      job_error="Job $job failed"
+      break
+    fi
+    if grep -Fxq Complete <<< "$conditions"; then
+      return 0
+    fi
+    sleep 5
+  done
+  echo "$job_error" >&2
+  "${k[@]}" logs "job/$job" --all-containers --prefix --ignore-errors --request-timeout=30s >&2 || true
+  return 1
+}
+
 echo "Using context $(kubectl config current-context), namespace $namespace"
 "${k[@]}" get secret hf-token-secret nvcr-imagepullsecret >/dev/null
 "${k[@]}" get persistentvolumeclaim shared-model-cache >/dev/null
@@ -77,7 +101,7 @@ envsubst "$variables" < "$here/stack.yaml" | "${k[@]}" apply -f -
 "${k[@]}" wait --for=condition=Ready dynamographdeployment/mx-azure-refit --timeout=20m
 
 envsubst "$variables" < "$here/test-job.yaml" | "${k[@]}" apply -f -
-"${k[@]}" wait --for=condition=complete job/mx-azure-refit-active --timeout=30m
+wait_for_job mx-azure-refit-active 1800
 "${k[@]}" logs job/mx-azure-refit-active -c publish-versions
 "${k[@]}" logs job/mx-azure-refit-active -c orchestrate
 desired=$("${k[@]}" get configmap mx-azure-refit-desired-version -o jsonpath='{.data.desired_version_uid}')
@@ -137,6 +161,6 @@ if ! grep -F "Trying strategy: $restart_strategy" <<< "$logs" >/dev/null || \
   exit 1
 fi
 envsubst "$variables" < "$here/verify-job.yaml" | "${k[@]}" apply -f -
-"${k[@]}" wait --for=condition=complete job/mx-azure-refit-restart-verify --timeout=20m
+wait_for_job mx-azure-refit-restart-verify 1200
 "${k[@]}" logs job/mx-azure-refit-restart-verify
 echo "E2E PASS: Azure full checkpoint, two deltas, and $scenario replacement recovery"
