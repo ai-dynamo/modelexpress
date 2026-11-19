@@ -18,7 +18,7 @@
       "question": "Before I launch the collective refit, check that this generator container has a usable NCCL and that my MX_NCCL_REFIT settings are valid. The MX server is at mx-server:8001.",
       "expected_skill": "modelexpress-rl-refit",
       "expected_script": "scripts/refit_preflight.py",
-      "ground_truth": "Run scripts/refit_preflight.py --path m2n --endpoint mx-server:8001 inside the container, report the mapped libnccl version against the 2.30.7 floor, nccl and nccl.m2n importability, NCCL_COMM_BLOCKING, and any invalid MX_NCCL_REFIT_* value, and fix every failed check first.",
+      "ground_truth": "From the installed skill directory, run scripts/refit_preflight.py --path m2n --endpoint mx-server:8001 inside the container, report the mapped libnccl version against the 2.30.7 floor, nccl and nccl.m2n importability, NCCL_COMM_BLOCKING, and any invalid MX_NCCL_REFIT_* value, and fix every failed check first.",
       "expected_behavior": [
         "Run the preflight script with --path m2n and the endpoint",
         "Read the mapped libnccl version, not torch.cuda.nccl.version()",
@@ -65,7 +65,7 @@
       "id": "wedged-communicator",
       "question": "My generator process logged CommunicatorWedgedError during update_weights. Can I just call compute_plan again?",
       "expected_skill": "modelexpress-rl-refit",
-      "ground_truth": "No. CommunicatorWedgedError is fatal to the process: catch it at top level and terminate with a non-zero os._exit. The round is already reported FAILED so peers re-form at a new epoch; restart the generator with a new worker_id. Bound each worker process externally because MX_NCCL_REFIT_TRANSFER_TIMEOUT_S cannot interrupt a blocked native reshard.",
+      "ground_truth": "No. CommunicatorWedgedError is fatal to the process: catch it at top level and terminate with a non-zero os._exit. Failure reporting is best effort, so confirm an accepted FAILED report or membership change advances the epoch before peers resume; restart the generator with a new worker_id. Bound each worker process externally because MX_NCCL_REFIT_TRANSFER_TIMEOUT_S cannot interrupt a blocked native reshard.",
       "expected_behavior": [
         "Refuse in-process recovery",
         "Require a non-zero os._exit and a restart with a new worker_id",
@@ -87,7 +87,7 @@
       "id": "wire-fsdp-vllm-nixl",
       "question": "Show me the calls to publish an FSDP model's weights through ModelExpress and have a vLLM worker install them with the modelexpress weight-transfer backend.",
       "expected_skill": "modelexpress-rl-refit",
-      "ground_truth": "Trainer: ModelExpressTrainerClient.initialize with FSDPTrainerContext, bind_tensors(model.state_dict()), ModelExpressControlClient.create_trainer_mesh, create_weight_version with FULL_TENSOR and the mesh id, publish_version, check READY. vLLM started with --weight-transfer-config '{\"backend\":\"modelexpress\"}': pause generation, init_weight_transfer_engine, start_weight_update, update_weights with update_info.version_id, finish_weight_update, verify installed version, resume.",
+      "ground_truth": "Trainer: ModelExpressTrainerClient.initialize with FSDPTrainerContext, bind_tensors(model.state_dict()), ModelExpressControlClient.create_trainer_mesh with every worker binding, create_weight_version with FULL_TENSOR and the mesh id, publish_version on each worker, then check global READY after all publications finish. vLLM started with --weight-transfer-config '{\"backend\":\"modelexpress\"}': initialize each worker once with init_weight_transfer_engine; per refit pause generation, start_weight_update, update_weights with update_info.version_id, finish_weight_update, verify installed version, resume.",
       "expected_behavior": [
         "Give the trainer, control, and generator calls in order",
         "Pause generation before installing and verify before resuming",
@@ -147,7 +147,7 @@
       "id": "s3-replay-chain-limit",
       "question": "A vLLM generator that was down for a while fails refit with: replay exceeds maximum chain length 64 before revision 'v37'. We only publish deltas.",
       "expected_skill": "modelexpress-rl-refit",
-      "ground_truth": "Delta lineage and checkpoint cache: with only deltas, the generator would replay more than max_replay_chain_length (default 64) revisions to reach the target. The chain is resolved before any download or installation, so the cache and live weights are unchanged. Publish full HF checkpoints periodically (full_hf_checkpoint_interval in Miles) so chains reset, then request the target again; raising max_replay_chain_length in the receiver config is only a stopgap.",
+      "ground_truth": "Delta lineage and checkpoint cache: with only deltas, the generator would replay more than max_replay_chain_length (default 64) revisions to reach the target. The chain is resolved before any download or installation, so the cache and live weights are unchanged. Publish full HF checkpoints periodically (full_hf_checkpoint_interval in Miles) then request the new full checkpoint or a bounded descendant, since the original target's immutable ancestry does not change; if that exact older target is required, increase max_replay_chain_length enough for its existing chain.",
       "expected_behavior": [
         "Classify as delta lineage or replay chain limit",
         "Name the default limit of 64 and max_replay_chain_length",
@@ -249,6 +249,49 @@
         "Check NIC capacity alongside GPU capacity",
         "Do not claim pinning grants missing devices",
         "Report the provisioning limit before making bandwidth claims"
+      ]
+    },
+    {
+      "id": "choose-path-sglang-with-rdma",
+      "question": "Our Megatron trainer and SGLang generators have RDMA connectivity across two nodes; which shipped ModelExpress refit path should we use?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Use S3 delta with the shipped SGLang refit adapter: SglangGeneratorContext has no full_tensor capability, so the Megatron or multi-node NIXL selection rule does not apply. This is a refit-adapter restriction, not a statement that SGLang initial loading cannot use P2P.",
+      "expected_behavior": [
+        "Select S3 delta before the Megatron or multi-node rule",
+        "Identify the missing full_tensor capability",
+        "Keep initial loading separate from refit"
+      ]
+    },
+    {
+      "id": "m2n-success-report-pending",
+      "question": "All weight transfers finished, but finish_weight_update exhausted transient success-report retries; should we call compute_plan to recover?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "Call retry_report() using the existing operation binding after control-plane connectivity recovers. The data plane already completed; compute_plan would fail the still-bound round. Do not start another round until reporting succeeds.",
+      "expected_behavior": [
+        "Distinguish report delivery from transfer failure",
+        "Use retry_report rather than compute_plan",
+        "Retain the existing operation binding"
+      ]
+    },
+    {
+      "id": "m2n-partial-install-and-lost-failure-report",
+      "question": "A generator failed after installing some layer groups and MX was unavailable for the FAILED report; is compute_plan enough before resuming generation?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. Keep generation paused and restart the affected engine because the live weights may contain multiple versions. Local abort/reset does not prove the server ended the operation. Confirm the failure report or an epoch change, retry report_failure from a trainer using the saved round identity if needed, and re-form the group before a new operation.",
+      "expected_behavior": [
+        "Keep generation paused and require engine restart after partial installation",
+        "Do not assume the failure report reached MX",
+        "Confirm operation termination or epoch change before a new round"
+      ]
+    },
+    {
+      "id": "s3-bucket-buffer-reuse",
+      "question": "stage_shard(tensors=bucket) returned; can our bucket callback reuse that tensor storage before calling publish?",
+      "expected_skill": "modelexpress-rl-refit",
+      "ground_truth": "No. Bucket staging runs asynchronously, so keep submitted tensors unchanged until publication finishes. Returning from stage_shard does not establish that every submitted bucket has been read.",
+      "expected_behavior": [
+        "Require immutable submitted bucket tensors through publication",
+        "Distinguish bucket submission from completion"
       ]
     },
     {

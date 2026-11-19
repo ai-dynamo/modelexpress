@@ -91,6 +91,8 @@ Per update, in this order:
    full checkpoint use `FULL_HF_CHECKPOINT` and no `base_version_id`. Barrier.
 2. Every rank in `refit_group`: `staged = trainer.stage_shard(version=WeightVersionRef("vN"), tensor_iter=...)`
    or one `stage_shard(..., tensors=bucket)` per bucket, then `staged.publish()`.
+   Keep submitted bucket tensors unchanged until publication finishes: bucket
+   staging is asynchronous and may still be reading them.
    A rank with no tensors still submits `tensors=[]` once and publishes. Barrier.
 3. Rank 0: `update_weight_version_state("vN", WeightVersionState.READY)`.
 4. Apply on the generators (below). Publish `vN` before staging `vN+1`.

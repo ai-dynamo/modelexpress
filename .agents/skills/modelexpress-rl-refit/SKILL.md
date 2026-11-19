@@ -53,7 +53,9 @@ and, when a refit fails, name the failing layer and the exact recovery action.
 
 ### 1. Preflight The Worker Environment
 
-Run inside the trainer or generator container with the worker's environment:
+Run inside the trainer or generator container with the worker's environment.
+The shell examples below use this skill's directory as the working directory
+(`.agents/skills/modelexpress-rl-refit` in a repository checkout):
 
 ```bash
 python3 scripts/refit_preflight.py --path m2n --endpoint "${MX_ENDPOINT}"
@@ -75,7 +77,7 @@ The three paths are siblings; none imports another.
 | Question | NCCL M2N collective (`modelexpress_rl.collective`) | NIXL reshard (`modelexpress_rl`, `modelexpress_rl.refit.reshard`) | S3 delta (`modelexpress_rl`, `WRITE_TO_STORAGE`) |
 |---|---|---|---|
 | Transfer model | Trainer and generator ranks enter one `nccl.m2n.reshard` collective per round; MX brokers rendezvous, admission, rank assignment, and the NCCL unique id | Trainer publishes an immutable `WeightVersion`; generators pull one-sided over NIXL when they choose | Trainer uploads XOR deltas (periodically a full HF checkpoint) to S3 as immutable versions; generators download, apply them to a local checkpoint cache, and reload |
-| Engine adapters | Integrator supplies `Publisher` and `Loader`. No Megatron `Publisher` exists; the vLLM `Loader` and FSDP2/DeepSpeed `Publisher`s are reference code under `examples/` | Shipped: `MegatronTrainerContext`, `FSDPTrainerContext`, vLLM and SGLang plugins | Trainer: any framework that yields canonical HF tensor buckets; Miles' `modelexpress` mode. Generator: vLLM plugin, SGLang `--modelexpress-config` |
+| Engine adapters | Integrator supplies `Publisher` and `Loader`. No Megatron `Publisher` exists; the vLLM `Loader` and FSDP2/DeepSpeed `Publisher`s are reference code under `examples/` | Shipped: `MegatronTrainerContext`, `FSDPTrainerContext`, and the vLLM plugin; generator contexts require `full_tensor` capability | Trainer: any framework that yields canonical HF tensor buckets; Miles' `modelexpress` mode. Generator: vLLM plugin, SGLang `--modelexpress-config` |
 | Topology | Single node only; a cross-node reshard has failed inside NCCL's transport | No single-node restriction documented; Kubernetes and Dynamo examples | No network path between trainer and generator needed; both reach S3 and the MX server |
 | Extra features | Layer-group pipelining, plan-digest agreement | Exact-version cold start, generator-to-generator peer reads, version leases | Durable, replayable versions; multi-revision catch-up; vLLM peer fallback; full checkpoints reset the chain |
 
@@ -85,14 +87,16 @@ prepared checkpoint.
 
 Decide with these rules, in order:
 
-1. Trainer and generators have no RDMA path between them (separate clusters,
+1. The generator uses the shipped SGLang refit adapter: use **S3 delta**;
+   this adapter has no `full_tensor` capability for NIXL trainer reads.
+2. Trainer and generators have no RDMA path between them (separate clusters,
    clouds, or networks), each version must be durable in object storage, or
    the trainer is Miles, whose only ModelExpress transfer mode
    (`--update-weight-transfer-mode modelexpress`) is S3 delta: use **S3 delta**.
-2. Trainer is Megatron, deployment is multi-node, or generators must refit on
+3. Trainer is Megatron, deployment is multi-node, or generators must refit on
    their own schedule: use **NIXL**.
-3. Exact-version cold start or generator peer reads are needed: use **NIXL**.
-4. Trainer and generator ranks can run each round in lockstep on one node, the
+4. Exact-version cold start or generator peer reads are needed: use **NIXL**.
+5. Trainer and generator ranks can run each round in lockstep on one node, the
    NCCL requirements hold, and you will own the `Publisher`/`Loader`: **M2N**
    is an option. Validate it with `DIFF=1` before relying on it.
 
@@ -111,9 +115,9 @@ NIXL path (full detail: `references/nixl-reshard-refit.md`):
    `create_weight_version(..., trainer_mesh_id=...)`.
 3. Trainer: `publish_version(version=...)`; the version becomes `READY` when
    every logical shard is published.
-4. vLLM: start with `--weight-transfer-config '{"backend":"modelexpress"}'`,
-   pause generation, then drive `init_weight_transfer_engine`,
-   `start_weight_update`, `update_weights` with
+4. vLLM: start with `--weight-transfer-config '{"backend":"modelexpress"}'`
+   and call `init_weight_transfer_engine` once on every worker.
+   Per refit, pause generation, then drive `start_weight_update`, `update_weights` with
    `{"update_info": {"version_id": ...}}`, and `finish_weight_update` on every
    worker; verify the installed version before resuming.
 5. Retire: `delete_weight_version`, `release_version`, `delete_trainer_mesh`.
@@ -141,7 +145,8 @@ S3 delta path (full detail: `references/s3-delta-refit.md`):
    `--modelexpress-config`. Same model name, base id, and seed as the trainer.
 4. Per update: rank 0 `create_weight_version(uid="vN", base_version_id="vN-1", state=STAGING)`
    (or `FULL_HF_CHECKPOINT` with no base); every publishing rank
-   `stage_shard(...)` then `publish()`; rank 0 marks `vN` READY.
+   `stage_shard(...)` then `publish()`; keep submitted bucket tensors unchanged
+   until publication finishes, then rank 0 marks `vN` READY.
 5. Pause generation, apply `vN` (vLLM: `start_weight_update`, `update_weights`
    with `{"update_info": {"version_id": "vN"}}`, `finish_weight_update`;
    SGLang: `update_weights_from_modelexpress`), resume.
@@ -208,9 +213,11 @@ Classify into one bucket with `references/failure-decision-tree.md`:
 - delta lineage and checkpoint cache (S3: base mismatch, checksum mismatch,
   replay chain limit, cache capacity, failed install)
 
-Recover in this order: fix the layer, re-run `compute_plan` (M2N), re-stage
-(NIXL), or re-publish or re-request the version (S3), and restart any worker
-whose engine state is uncertain.
+For M2N, retry an undelivered success report with `retry_report()`; otherwise
+confirm the failed operation ended or the epoch changed before re-running
+`compute_plan`. After a partial M2N or NIXL install, keep generation paused
+and restart affected engines. Re-stage NIXL or follow S3's cache/install
+recovery procedure only after fixing the failing layer.
 
 ## Available Scripts
 
@@ -280,7 +287,7 @@ Return:
 | Network refit is correct but slow with multiple readers | NIC convergence or unsuitable/inaccessible rails | Inventory both endpoints and follow `references/rdma-rails.md`; verify the effective mapping and traffic |
 | Trainer: `target base ... does not match retained base ...` | The new version's `base_version_id` is not the version this trainer client last published (client recreated, or a publish was skipped) | Publish the next version as a `FULL_HF_CHECKPOINT` (no base) to start a new chain |
 | Generator: `canonical target checksum differs for ...` | Trainer and generator seeds differ, or the published tensors are not canonical HF tensors | Point both sides at the same seed snapshot; publish a full checkpoint to recover |
-| Generator: `replay exceeds maximum chain length 64 ...` | Too many deltas since the last full checkpoint: the generator is far behind, cold-starting, or replays from the full root on every refit (vLLM with peers) | Set `full_hf_checkpoint_interval` (Miles) or publish full checkpoints; raise `max_replay_chain_length` only as a stopgap |
+| Generator: `replay exceeds maximum chain length 64 ...` | Too many deltas since the last full checkpoint: the generator is far behind, cold-starting, or replays from the full root on every refit (vLLM with peers) | Publish and request a new full checkpoint or its bounded descendant; use `full_hf_checkpoint_interval` (Miles) to prevent recurrence; an exact older target still needs its original chain |
 
 ## References
 

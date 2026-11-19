@@ -16,8 +16,8 @@ or hang instead of failing at startup:
   the RL load-strategy settings.
 
 Both paths optionally probe TCP reachability of the ModelExpress server.
-Nothing is written, no RPC is issued, and no environment value other than the
-ones named above is read or printed. Output is one JSON document on stdout.
+It imports the worker's libraries but does not initialize communicators or
+issue RPCs. Output is one JSON document on stdout.
 Exit code is 0 when no check failed, 1 otherwise.
 """
 
@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import importlib
-import importlib.util
 import json
 import math
 import os
@@ -113,11 +112,14 @@ def loaded_nccl_version() -> tuple[int, int, int] | None:
     return (value // 10000, (value // 100) % 100, value % 100)
 
 
-def _module_present(name: str) -> bool:
+def _module_importable(name: str, required_symbol: str | None = None) -> bool:
     try:
-        return importlib.util.find_spec(name) is not None
-    except (ImportError, ValueError):
+        module = importlib.import_module(name)
+        if required_symbol is not None:
+            getattr(module, required_symbol)
+    except (ImportError, OSError, AttributeError):
         return False
+    return True
 
 
 def check_m2n() -> list[Check]:
@@ -142,9 +144,9 @@ def check_m2n() -> list[Check]:
         ("nccl.m2n", "install nccl-extensions[cu12] or nccl-extensions[cu13] to match CUDA"),
         ("modelexpress_rl.collective", "install the modelexpress distribution"),
     ):
-        present = _module_present(module)
+        present = _module_importable(module, "reshard" if module == "nccl.m2n" else None)
         checks.append(
-            Check(f"import:{module}", "pass" if present else "fail", "found" if present else hint)
+            Check(f"import:{module}", "pass" if present else "fail", "imported" if present else hint)
         )
     blocking = os.environ.get("NCCL_COMM_BLOCKING")
     if blocking in (None, "", "0"):
@@ -181,8 +183,8 @@ def check_m2n() -> list[Check]:
 
 def check_nixl() -> list[Check]:
     checks = []
-    if _module_present("modelexpress_rl"):
-        checks.append(Check("import:modelexpress_rl", "pass", "found"))
+    if _module_importable("modelexpress_rl"):
+        checks.append(Check("import:modelexpress_rl", "pass", "imported"))
         try:
             nixl_transfer = importlib.import_module("modelexpress.nixl_transfer")
             available = bool(nixl_transfer.is_nixl_available())
@@ -222,14 +224,26 @@ def check_nixl() -> list[Check]:
         )
     strategy = os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     desired = os.environ.get("MX_REFIT_DESIRED_VERSION_UID", "").strip()
-    order = os.environ.get("MX_GENERATOR_SOURCE_ORDER", "").upper()
+    order = os.environ.get("MX_GENERATOR_SOURCE_ORDER")
     detail = f"MX_LOAD_STRATEGY_CHAIN={strategy}; desired UID {'set' if desired else 'unset'}"
     status = "pass"
-    if strategy == "RL" and desired and "TRAINER" in order:
-        status = "fail"
-        detail += (
-            "; TRAINER in MX_GENERATOR_SOURCE_ORDER is rejected for desired-version cold start"
-        )
+    if order is not None:
+        try:
+            from modelexpress_rl.inference.plan import WeightSource, parse_weight_source_order
+
+            sources = parse_weight_source_order(order)
+        except (ImportError, OSError) as error:
+            status = "fail"
+            detail += f"; source-order validation unavailable: {type(error).__name__}"
+        except ValueError as error:
+            status = "fail"
+            detail += f"; {error}"
+        else:
+            if strategy == "RL" and desired and WeightSource.TRAINER in sources:
+                status = "fail"
+                detail += (
+                    "; TRAINER in MX_GENERATOR_SOURCE_ORDER is rejected for desired-version cold start"
+                )
     checks.append(Check("load-strategy", status, detail))
     return checks
 
@@ -253,6 +267,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--endpoint", help="ModelExpress server host:port to probe over TCP")
     parser.add_argument("--timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT_S)
     args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("--timeout must be finite and positive")
 
     checks = check_m2n() if args.path == "m2n" else check_nixl()
     if args.endpoint:

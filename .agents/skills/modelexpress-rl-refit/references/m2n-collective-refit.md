@@ -76,7 +76,8 @@ Rules that must hold on every participant:
 
 If `finish_weight_update` cannot deliver its success report (retried on
 UNAVAILABLE and DEADLINE_EXCEEDED, 3 attempts), call `retry_report()`; the next
-`start_weight_update` is refused until it succeeds.
+`start_weight_update` is refused until it succeeds. Do not call `compute_plan()`
+for this case: it fails the still-bound round instead of retrying its report.
 
 ## Engine SPI
 
@@ -109,15 +110,29 @@ class Loader(Protocol):
 | `GroupNotReadyError` (`.missing`) | `compute_plan` | Fix or restart the missing slots; retry `compute_plan` |
 | `EpochChangedError` (`.disagreeing`) | `compute_plan`, `start_weight_update` | Re-run `compute_plan`; fix the plan first if `.disagreeing` is set |
 | `TransferBindingError` | `start_weight_update` | Create a new operation at the current epoch |
-| `RendezvousError` | any call | Re-run `compute_plan` |
+| `RendezvousError` | any call | Follow the round-recovery checks below before re-running `compute_plan` |
 | `PlanCoverageError` | `initialize`, `compute_plan` | Fix the `Publisher`/`Loader` so the plan covers the parameter set |
 | `NcclUnavailableError` | `compute_plan` | Install `nccl4py` and `nccl-extensions`; libnccl >= 2.30.7 |
 | `CommunicatorWedgedError` | round calls, `cleanup` | Terminate the process with a non-zero `os._exit` |
 
-The first three subclass `RendezvousError`. Any other exception from a round
-call is a transport or timeout failure: the round is already aborted and
-reported FAILED, so re-run `compute_plan`. A failure while `compute_plan`
-bootstraps communicators is fatal for the worker: restart the process.
+The first three subclass `RendezvousError`. Recover a failed round according
+to what completed:
+
+- If the data plane completed but its success report exhausted transient
+  retries, call `retry_report()` against the existing binding.
+- For a transport or timeout failure, local abort and reset do not prove that
+  MX received the best-effort FAILED report. Confirm the operation ended or the
+  group epoch changed before starting another operation. If it is still in
+  flight, the trainer can retry `report_failure(operation_id, error,
+  membership=admitted_membership)` using the saved round identity, or restart
+  workers with new IDs and wait for the resulting epoch change; then re-run
+  `compute_plan()` on all participants.
+- If installation may have overwritten live weights, keep generation paused
+  and restart the affected generator engines before serving again. Rebuilding
+  the plan does not roll back a partial install.
+
+A failure while `compute_plan` bootstraps communicators is fatal for the
+worker: restart the process.
 
 ## Configuration
 
@@ -142,8 +157,8 @@ raises (the two window sizes accept `0` to disable the bound).
 ## Runner Contract
 
 - Catch `CommunicatorWedgedError` at top level and exit with a non-zero
-  `os._exit`. The round is already reported FAILED, so peers re-form at a new
-  epoch without this worker.
+  `os._exit`. Failure reporting is best effort; peers re-form after an accepted
+  failure report or a membership change advances the epoch.
 - A reshard or grouped submission can block the host inside native code, where
   `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` cannot fire. Bound every trainer and
   generator process from outside. `run_e2e.sh` does this with `PROC_TIMEOUT_S`

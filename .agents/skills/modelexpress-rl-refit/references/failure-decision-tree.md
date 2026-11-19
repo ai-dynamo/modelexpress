@@ -17,7 +17,8 @@ Signals:
 - `ValueError` naming an `MX_NCCL_REFIT_*` variable at client construction
 - vLLM refit routes missing, or the weight-transfer backend not found
 
-Checks:
+Checks (run from this skill's directory, `.agents/skills/modelexpress-rl-refit`
+in a repository checkout):
 
 ```bash
 python3 scripts/refit_preflight.py --path m2n --endpoint "${MX_ENDPOINT}"
@@ -77,13 +78,17 @@ Next action:
   groupings, `m2n_abi_version`, `MX_NCCL_REFIT_BLOCKING_DATA_PLANE`,
   `MX_NCCL_REFIT_GROUPED_SUBMISSION`) on the named slots first.
 - Operation still in flight: let it finish, or report it FAILED
-  (`report_failure` on the trainer); the next epoch change also clears it.
+  (`report_failure` on the trainer, with the saved operation and membership);
+  confirm the report was accepted or a new epoch cleared it before retrying.
+- Data plane completed but `finish_weight_update` exhausted transient success
+  report retries: call `retry_report()` first; `compute_plan()` would fail the
+  still-bound round.
 
 ## Deadline Expiry And Wedged Communicators (M2N)
 
 Signals:
 
-- a round call raises after `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`; the operation is FAILED
+- a round call raises after `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S`; a FAILED report is attempted
 - `CommunicatorWedgedError` carrying `group_id`, `epoch`, `version`, `lane_id`
 - the log repeats that a reshard call is still blocking, with no error
 - `run_e2e.sh` `.rc` files read `124` or `137`
@@ -99,6 +104,9 @@ the process with a non-zero `os._exit` and restart it with a new `worker_id`;
 peers re-form at the next epoch. Bound every process from outside
 (`PROC_TIMEOUT_S` in the example). Raise `MX_NCCL_REFIT_ABORT_TIMEOUT_S` only if
 a healthy abort on the deployed libnccl needs longer than 10 s.
+For other transfer failures, confirm the FAILED report or an epoch change
+before re-running `compute_plan`. Keep generation paused and restart any
+generator whose live weights may have been partially overwritten.
 
 ## Plan Coverage And Correctness
 
@@ -221,7 +229,10 @@ download, apply, or checksum resets the cache to the initial base, so in
 S3-only mode the next delta fails with an exact-base mismatch; publish a
 `FULL_HF_CHECKPOINT` (or reinitialize the generator). For a seed or base
 mismatch, align the seeds and publish a full checkpoint to start a new chain.
-For long chains, publish full checkpoints periodically
+For long chains, publish and request a new full checkpoint or a bounded
+descendant; publishing a new root does not change an older target's ancestry.
+If that exact older target is required, raise the replay limit enough for its
+existing chain. Publish full checkpoints periodically
 (`full_hf_checkpoint_interval` in Miles); with vLLM peers enabled every refit
 replays from the last full checkpoint. For capacity, enlarge the quota or move
 the cache to a larger node-local disk. Use a fresh model name, base id, and S3
