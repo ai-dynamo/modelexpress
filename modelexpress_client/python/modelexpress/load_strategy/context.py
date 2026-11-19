@@ -80,6 +80,7 @@ class LoadContext:
     mx_client: MxClientBase
     worker_id: str
     mx_server_url: str | None = None
+    donor_lease: Any = None
     node_rank: int = 0
     # Head address from the engine's own distributed config (for vLLM,
     # parallel_config.master_addr). Non-head nodes rewrite a pod-local
@@ -93,10 +94,16 @@ class LoadContext:
     # on the same worker. The draft shares the main load's NIXL agent,
     # metadata port and SourceIdentity rather than publishing its own.
     p2p_role: str = "main"
+    # A separate draft is advertised within its main model's publication.
+    p2p_source_identity: p2p_pb2.SourceIdentity | None = None
+    # Independent drafts must not inherit the main checkpoint's MX_MODEL_URI.
+    model_streamer_uri: str | None = None
     # Draft manifests can refine this to a compatibility-digested namespace.
     draft_tensor_namespace: str = DRAFT_TENSOR_PREFIX
     # False keeps a load out of P2P entirely (no registration, no RDMA).
     p2p_enabled: bool = True
+    # Replica-wide cold-start fallback skips peer reads but still publishes.
+    skip_rdma: bool = False
     # Draft pass only: the main load's already-initialized NIXL manager. The
     # draft registers into it instead of binding MX_METADATA_PORT + device_id
     # a second time.
@@ -107,6 +114,8 @@ class LoadContext:
     desired_version_uid: str | None = None
     # Optional engine-level gate checked before weight metadata is advertised.
     source_ready_fn: Callable[[], bool] | None = None
+    # Optional engine gate checked before artifact cache settling.
+    artifact_ready_fn: Callable[[], bool] | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     # When MX_VMM_ARENA=1, maybe_enter_vmm_arena populates this with the
@@ -123,3 +132,6 @@ class LoadContext:
     # when unknown. RDMA reloads skip the target-side post-processing, so they
     # are only correct when restoring these same weights.
     loaded_identity: p2p_pb2.SourceIdentity | None = None
+    # Reload only: refuse a peer catalog that does not name every target
+    # tensor before any write, instead of warning and refilling a subset.
+    require_exact_tensor_catalog: bool = False

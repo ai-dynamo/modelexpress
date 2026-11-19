@@ -673,6 +673,27 @@ async fn download_files(
 
 pub(crate) struct NgcProviderCache;
 
+fn ngc_relative_parts(ngc_root: &Path, dir: &Path) -> Result<Vec<String>> {
+    let rel = dir
+        .strip_prefix(ngc_root)
+        .with_context(|| format!("Failed to strip prefix {ngc_root:?} from {dir:?}"))?;
+    Ok(rel
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(str::to_owned))
+        .collect())
+}
+
+/// Name of the model stored at `parts` when the path has a model's shape: either
+/// `org/models/name/version` or `org/team/artifact_type/name/version`. Used for a
+/// directory that cannot be read, so its contents cannot tell us whether it is a model.
+fn ngc_model_name_at(parts: &[String]) -> Option<String> {
+    match parts.len() {
+        4 if parts[1] == "models" => Some(format!("{}/{}/{}", parts[0], parts[2], parts[3])),
+        5 => Some(parts.join("/")),
+        _ => None,
+    }
+}
+
 /// Recursively walk `dir`, collecting leaf directories (those containing at
 /// least one file) as NGC model entries. The model name is reconstructed from
 /// the path relative to `ngc_root` using the inverse of `model_dir`:
@@ -689,7 +710,29 @@ fn collect_ngc_models(ngc_root: &Path, dir: &Path, models: &mut Vec<ModelInfo>) 
     let mut has_files = false;
     let mut subdirs: Vec<PathBuf> = Vec::new();
 
-    for entry in fs::read_dir(dir).with_context(|| format!("Failed to read directory {dir:?}"))? {
+    let entries = if dir == ngc_root {
+        fs::read_dir(dir).with_context(|| format!("Failed to read directory {dir:?}"))?
+    } else {
+        match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(err) => {
+                let parts = ngc_relative_parts(ngc_root, dir)?;
+                if let Some(name) = ngc_model_name_at(&parts) {
+                    models.push(ModelInfo::measured(
+                        ModelProvider::Ngc,
+                        name,
+                        dir.to_path_buf(),
+                        Err(err.into()),
+                    ));
+                    return Ok(());
+                }
+                warn!("Skipping unreadable cache directory {dir:?}: {err}");
+                return Ok(());
+            }
+        }
+    };
+
+    for entry in entries {
         let entry = entry.with_context(|| format!("Failed to read entry in {dir:?}"))?;
         let path = entry.path();
         if path.is_file() {
@@ -700,13 +743,7 @@ fn collect_ngc_models(ngc_root: &Path, dir: &Path, models: &mut Vec<ModelInfo>) 
     }
 
     if has_files {
-        let rel = dir
-            .strip_prefix(ngc_root)
-            .with_context(|| format!("Failed to strip prefix {ngc_root:?} from {dir:?}"))?;
-        let parts: Vec<&str> = rel
-            .components()
-            .filter_map(|c| c.as_os_str().to_str())
-            .collect();
+        let parts = ngc_relative_parts(ngc_root, dir)?;
         // Depth 4 = org/artifact_type/name/version (no team): emit org/name/version
         // to match the 3-segment input format (artifact_type is always "models" here).
         // All other depths fall through to a plain join, which handles depth 5 correctly.
@@ -715,12 +752,12 @@ fn collect_ngc_models(ngc_root: &Path, dir: &Path, models: &mut Vec<ModelInfo>) 
         } else {
             parts.join("/")
         };
-        models.push(ModelInfo {
-            provider: ModelProvider::Ngc,
+        models.push(ModelInfo::measured(
+            ModelProvider::Ngc,
             name,
-            size: directory_size(dir)?,
-            path: dir.to_path_buf(),
-        });
+            dir.to_path_buf(),
+            directory_size(dir),
+        ));
     } else {
         for subdir in subdirs {
             collect_ngc_models(ngc_root, &subdir, models)?;

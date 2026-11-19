@@ -12,9 +12,11 @@ from modelexpress import tensor_utils
 from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.tensor_utils import (
     _find_hidden_accel_tensors,
+    adopt_bare_tensors,
     adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
+    host_resident_parameters,
     safe_checksum,
     storage_view,
 )
@@ -210,6 +212,27 @@ class TestAdoptHiddenTensors:
         assert any(name.endswith("_0") for name in buf_names)
 
 
+class TestAdoptBareTensors:
+    def test_promotes_bare_backend_tensors_only(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        module = nn.Module()
+        module.child = nn.Module()
+        module.child.W_UV = torch.randn(4)
+        module.param = nn.Parameter(torch.randn(4))
+        module.register_buffer("buf", torch.randn(4))
+        module.kv_cache = torch.randn(4)
+
+        assert adopt_bare_tensors(module, backend) == 1
+        assert set(dict(module.named_buffers())) == {"buf", "child.W_UV"}
+        assert set(dict(module.named_parameters())) == {"param"}
+        assert "kv_cache" not in dict(module.named_buffers())
+
+    def test_cpu_tensors_ignored(self):
+        module = nn.Module()
+        module.W_UV = torch.randn(4)
+        assert adopt_bare_tensors(module) == 0
+
+
 # ---------------------------------------------------------------------------
 # capture_tensor_attrs
 # ---------------------------------------------------------------------------
@@ -332,6 +355,30 @@ class TestStorageView:
         view = base.T  # non-contiguous
         sv = storage_view(view)
         assert sv.numel() == base.numel() * base.element_size()
+
+
+# ---------------------------------------------------------------------------
+# host_resident_parameters
+# ---------------------------------------------------------------------------
+
+
+class TestHostResidentParameters:
+    def test_lists_non_empty_parameters_outside_accelerator(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_accel = nn.Parameter(torch.empty(4, device="meta"))
+        model.on_host = nn.Parameter(torch.empty(4))
+        model.empty_on_host = nn.Parameter(torch.empty(0))
+        model.register_buffer("host_buffer", torch.empty(4))
+        assert host_resident_parameters(model, backend) == ["on_host"]
+
+    def test_empty_when_all_parameters_on_accelerator(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        assert host_resident_parameters(nn.Linear(4, 4), backend) == []
 
 
 # ---------------------------------------------------------------------------
