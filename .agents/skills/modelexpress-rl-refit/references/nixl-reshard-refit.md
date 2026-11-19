@@ -24,6 +24,8 @@ Reference integration: `examples/rl/dynamo_vllm_reshard_refit/`.
 
 ## Trainer Side
 
+Each trainer worker initializes its client and binds its local state:
+
 ```python
 from modelexpress_rl import (
     FSDPTrainerContext,
@@ -42,13 +44,18 @@ trainer = ModelExpressTrainerClient.initialize(
         server_url=mx_server,
     )
 )
-control = ModelExpressControlClient.connect(server_url=mx_server)
-
 binding = trainer.bind_tensors(model.state_dict())
+```
+
+The orchestrator collects `{worker_id: binding}` from **every** trainer worker
+as `worker_bindings`, then creates one mesh and version:
+
+```python
+control = ModelExpressControlClient.connect(server_url=mx_server)
 mesh = control.create_trainer_mesh(
     model_name=model_name,
     idempotency_key=mesh_key,
-    workers={trainer.worker_id: binding},     # every trainer worker's binding
+    workers=worker_bindings,
 )
 version = control.create_weight_version(
     model_name=model_name,
@@ -56,7 +63,19 @@ version = control.create_weight_version(
     payload_format=WeightPayloadFormat.FULL_TENSOR,
     trainer_mesh_id=mesh.mesh_id,
 )
+```
+
+Distribute `version.ref` to every trainer worker and publish on each:
+
+```python
 trainer.publish_version(version=version.ref)
+```
+
+After all publication calls complete, the orchestrator checks global readiness
+before starting generator reads; an earlier worker may return while the version
+is still `STAGING`:
+
+```python
 assert control.get_weight_version(version.version_id).state is WeightVersionState.READY
 ```
 
@@ -112,12 +131,14 @@ together with `--load-format modelexpress` for the initial load).
 - `MX_MODEL_NAME_OVERRIDE` sets the MX model identity when it differs from
   vLLM's model path; use the same name for trainers and versions.
 
+Once per generator worker, call `init_weight_transfer_engine` with
+`{"init_info": {...}}` (empty selects the NIXL path).
+
 Per refit, on every generator worker, with generation paused:
 
-1. `init_weight_transfer_engine` with `{"init_info": {...}}` (empty selects the NIXL path).
-2. `start_weight_update`.
-3. `update_weights` with `{"update_info": {"version_id": "<WeightVersion id>"}}`.
-4. `finish_weight_update`.
+1. `start_weight_update`.
+2. `update_weights` with `{"update_info": {"version_id": "<WeightVersion id>"}}`.
+3. `finish_weight_update`.
 
 Then read back the installed version on every worker before resuming
 generation (`examples/rl/dynamo_vllm_reshard_refit/rl_coordinator.py` does this
