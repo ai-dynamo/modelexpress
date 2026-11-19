@@ -336,7 +336,8 @@ struct TensorRecordJson {
     pub device_id: u32,
     pub dtype: String,
     // Absent in records written before host-memory tensors were published.
-    #[serde(default)]
+    // VRAM is not written, so VRAM-only records keep their previous size.
+    #[serde(default, skip_serializing_if = "super::is_vram_mem_type")]
     pub mem_type: i32,
 }
 
@@ -1340,6 +1341,13 @@ mod tests {
         let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
         let t: TensorRecordJson = serde_json::from_str(json).expect("parse legacy record");
         assert_eq!(t.mem_type, TensorMemoryType::Vram as i32);
+    }
+
+    #[test]
+    fn test_tensor_record_json_omits_vram_mem_type() {
+        let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
+        let t: TensorRecordJson = serde_json::from_str(json).expect("parse legacy record");
+        assert_eq!(serde_json::to_string(&t).expect("serialize"), json);
     }
 
     #[test]

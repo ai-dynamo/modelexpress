@@ -1433,7 +1433,7 @@ class NixlTransferManager:
             self._wait_for_xfers(handles, timeout_seconds, "Transfer")
         finally:
             for handle in handles:
-                self._agent.release_xfer_handle(handle)
+                self._release_xfer_handle(handle)
 
         # CRITICAL: Synchronize the device to ensure RDMA writes are visible.
         # GPUDirect RDMA writes bypass torch streams, so we must sync.

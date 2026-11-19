@@ -324,7 +324,9 @@ pub struct TensorDescriptorJson {
     pub device_id: u32,
     pub dtype: String,
     /// Absent in ConfigMaps written before host-memory tensors were published.
-    #[serde(default)]
+    /// VRAM is not written: a ConfigMap holds a worker's whole manifest and is
+    /// capped at 1 MiB, so VRAM-only manifests keep their previous size.
+    #[serde(default, skip_serializing_if = "crate::p2p::backend::is_vram_mem_type")]
     pub mem_type: i32,
 }
 
@@ -520,6 +522,14 @@ mod tests {
         let parsed: TensorDescriptorJson =
             serde_json::from_str(json).expect("parse legacy descriptor");
         assert_eq!(parsed.mem_type, TensorMemoryType::Vram as i32);
+    }
+
+    #[test]
+    fn test_tensor_descriptor_json_omits_vram_mem_type() {
+        let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
+        let parsed: TensorDescriptorJson =
+            serde_json::from_str(json).expect("parse legacy descriptor");
+        assert_eq!(serde_json::to_string(&parsed).expect("serialize"), json);
     }
 
     #[test]

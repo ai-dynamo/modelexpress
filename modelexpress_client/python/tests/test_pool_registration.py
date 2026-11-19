@@ -777,6 +777,33 @@ class TestHostMemoryRegistration:
         mgr._agent.transfer.assert_not_called()
         mgr._agent.release_xfer_handle.assert_called_once_with("vram-handle")
 
+    def test_receive_release_failure_keeps_releasing_and_original_error(
+        self, monkeypatch
+    ):
+        gpu = self._gpu_stand_in()
+        host = torch.zeros(2, dtype=torch.float32)
+        mgr = self._make_manager()
+        self._receiving(monkeypatch, mgr)
+        mgr._tensors = {"gpu": gpu, "host": host}
+        mgr._agent.make_prepped_xfer.side_effect = ["vram-handle", "dram-handle"]
+        mgr._agent.check_xfer_state.return_value = "ERR"
+        mgr._agent.release_xfer_handle.side_effect = [RuntimeError("busy"), None]
+
+        with pytest.raises(RuntimeError, match="Transfer failed with status ERR"):
+            mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    self._source("gpu", gpu, p2p_pb2.TENSOR_MEMORY_TYPE_VRAM),
+                    self._source("host", host, p2p_pb2.TENSOR_MEMORY_TYPE_DRAM),
+                ],
+                remote_agent_name="source",
+            )
+
+        assert mgr._agent.release_xfer_handle.call_args_list == [
+            call("vram-handle"),
+            call("dram-handle"),
+        ]
+
     def test_descriptors_record_memory_type_and_host_device(self):
         mgr = self._make_manager()
         descriptors = mgr._build_tensor_descriptors(
