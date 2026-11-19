@@ -5,7 +5,8 @@
 
 Each rank runs the strategy chain on its own, but later strategies
 (InstantTensor, distributed ModelStreamer) and the engine's post-load barrier
-are collective. The chain first keeps only the strategies every rank can run.
+are collective. The chain first keeps only the strategies every rank can run,
+in the same order, and stops every rank if one could not check its own.
 For each strategy it then gathers every rank's outcome after prepare(), before
 any rank loads (a rank that could not recover from the previous strategy
 reports that here instead):
@@ -42,17 +43,29 @@ from modelexpress.load_strategy.base import LoadStrategy
 class _PeerRanks:
     """Adapter stand-in: this rank plus one peer with fixed answers."""
 
-    def __init__(self, peer_outcomes=None, *, peer_eligible=None, peer_phase=None):
+    def __init__(
+        self,
+        peer_outcomes=None,
+        *,
+        peer_eligible=None,
+        peer_availability_error=None,
+        peer_phase=None,
+    ):
         self.peer_outcomes = peer_outcomes or {}
         self.peer_eligible = peer_eligible
+        self.peer_availability_error = peer_availability_error
         self.peer_phase = peer_phase
+        self.eligibility = []
         self.outcomes = []
         self.reinit_for_retry = MagicMock(side_effect=lambda result: result)
 
     def all_gather_state(self, state):
         phase, value = state
         if phase == "eligible":
-            peer_value = value if self.peer_eligible is None else self.peer_eligible
+            self.eligibility.append(value)
+            names, _error = value
+            peer_names = names if self.peer_eligible is None else self.peer_eligible
+            peer_value = (peer_names, self.peer_availability_error)
         else:
             self.outcomes.append((phase, value))
             # A peer prepares and finalizes unless the test says otherwise.
@@ -411,3 +424,54 @@ def test_a_rank_whose_prepare_was_fatal_does_not_abort(published):
 
     assert adapter.outcomes == [("prepare:disk", "fatal")]
     assert (disk.prepared, disk.loaded, disk.aborted) == (1, 0, 0)
+
+
+class _Unavailable(_Strategy):
+    def is_available(self, ctx):
+        raise RuntimeError("cannot reach the MX server")
+
+
+def test_an_availability_error_reaches_every_rank_before_loading(published):
+    """A rank whose check raised still joins the eligibility gather first."""
+    adapter = _PeerRanks()
+    broken, disk = _Unavailable("broken"), _Strategy("disk")
+
+    with pytest.raises(RuntimeError, match="cannot reach the MX server"):
+        execute_load_strategies(MagicMock(), _ctx(adapter), [broken, disk])
+
+    assert adapter.eligibility == [(["disk"], "broken: cannot reach the MX server")]
+    assert (disk.prepared, disk.loaded) == (0, 0)
+    assert adapter.outcomes == []
+
+
+def test_a_peer_availability_error_stops_every_rank_before_loading(published):
+    adapter = _PeerRanks(peer_availability_error="gds: driver missing")
+    disk = _Strategy("disk")
+
+    with pytest.raises(RuntimeError, match="Rank 1 could not check .*gds: driver missing"):
+        execute_load_strategies(MagicMock(), _ctx(adapter), [disk])
+
+    assert (disk.prepared, disk.loaded) == (0, 0)
+    assert adapter.outcomes == []
+
+
+def test_ranks_that_order_the_loaders_differently_stop_before_loading(published):
+    """MX_LOAD_PLUGIN_BEFORE set differently per node reorders the chain."""
+    adapter = _PeerRanks(peer_eligible=["disk", "plugin"])
+    plugin, disk = _Strategy("plugin"), _Strategy("disk")
+
+    with pytest.raises(RuntimeError, match="order the loading strategies differently"):
+        execute_load_strategies(MagicMock(), _ctx(adapter), [plugin, disk])
+
+    assert (plugin.prepared, disk.prepared) == (0, 0)
+    assert adapter.outcomes == []
+
+
+def test_rank_local_loaders_do_not_change_the_shared_order(published):
+    adapter = _PeerRanks({"load:rdma": "succeeded"}, peer_eligible=["rdma", "gds", "disk"])
+    rdma, disk = _Strategy("rdma"), _Strategy("disk")
+
+    execute_load_strategies(MagicMock(), _ctx(adapter), [rdma, disk])
+
+    assert rdma.loaded == 1
+    assert len(published) == 1

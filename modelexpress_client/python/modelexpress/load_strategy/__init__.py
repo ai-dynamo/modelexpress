@@ -183,23 +183,56 @@ def _gather_all_ranks(phase: str, value: Any, ctx: LoadContext) -> list[Any]:
 def _eligible_on_every_rank(
     strategies: list[LoadStrategy], ctx: LoadContext
 ) -> list[LoadStrategy]:
-    """Return the available strategies that every engine rank can run.
+    """Return the available strategies that every engine rank can run, in order.
 
     Availability can depend on the node (GDS hardware, NIXL, local files), but
     the ranks must walk the same strategies to agree on each outcome. A strategy
     that some rank cannot run is skipped on every rank. With nothing eligible on
     any rank, the chain reports that no strategy succeeded, as before.
+
+    Every rank stops before loading if a rank's availability check raised, or if
+    the ranks order the shared strategies differently (MX_LOAD_PLUGIN_BEFORE set
+    differently per node), which would pair one rank's load with another's.
     """
-    eligible = [strategy for strategy in strategies if strategy.is_available(ctx)]
+    eligible: list[LoadStrategy] = []
+    failure: Exception | None = None
+    error: str | None = None
+    # Hold an availability error until the other ranks have heard of it; raising
+    # here would leave them waiting in the gather below. Check the remaining
+    # strategies anyway: an availability check can gather across ranks itself.
+    for strategy in strategies:
+        try:
+            if strategy.is_available(ctx):
+                eligible.append(strategy)
+        except Exception as e:
+            if failure is None:
+                failure, error = e, f"{strategy.name}: {e}"
     names = [strategy.name for strategy in eligible]
-    per_rank = _gather_all_ranks("eligible", names, ctx)
-    common = set(names).intersection(*per_rank)
+    per_rank = _gather_all_ranks("eligible", (names, error), ctx)
+
+    if failure is not None:
+        raise failure
+    for rank, (_peer_names, peer_error) in enumerate(per_rank):
+        if peer_error is not None:
+            raise RuntimeError(
+                f"[Worker {ctx.global_rank}] Rank {rank} could not check which "
+                f"loading strategies it can run: {peer_error}"
+            )
+    names_per_rank = [peer_names for peer_names, _peer_error in per_rank]
+    common = set(names).intersection(*names_per_rank)
+    order = [name for name in names if name in common]
+    for rank, peer_names in enumerate(names_per_rank):
+        if [name for name in peer_names if name in common] != order:
+            raise RuntimeError(
+                f"[Worker {ctx.global_rank}] Ranks order the loading strategies "
+                f"differently: this rank has {names}, rank {rank} has {peer_names}"
+            )
     shared = [strategy for strategy in eligible if strategy.name in common]
-    if not shared and any(per_rank):
+    if not shared and any(names_per_rank):
         raise RuntimeError(
             f"[Worker {ctx.global_rank}] No loading strategy is eligible on every "
             f"rank for model '{ctx.identity.model_name}'; eligible per rank: "
-            f"{per_rank}"
+            f"{names_per_rank}"
         )
     if len(shared) < len(eligible):
         logger.warning(
