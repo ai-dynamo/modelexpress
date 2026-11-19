@@ -220,13 +220,12 @@ def _eligible_on_every_rank(
             )
     names_per_rank = [peer_names for peer_names, _peer_error in per_rank]
     common = set(names).intersection(*names_per_rank)
-    order = [name for name in names if name in common]
-    for rank, peer_names in enumerate(names_per_rank):
-        if [name for name in peer_names if name in common] != order:
-            raise RuntimeError(
-                f"[Worker {ctx.global_rank}] Ranks order the loading strategies "
-                f"differently: this rank has {names}, rank {rank} has {peer_names}"
-            )
+    orders = {tuple(name for name in peer if name in common) for peer in names_per_rank}
+    if len(orders) > 1:
+        raise RuntimeError(
+            f"[Worker {ctx.global_rank}] Ranks order the loading strategies "
+            f"differently; eligible per rank: {names_per_rank}"
+        )
     shared = [strategy for strategy in eligible if strategy.name in common]
     if not shared and any(names_per_rank):
         raise RuntimeError(
