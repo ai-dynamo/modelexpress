@@ -178,8 +178,16 @@ class SglangAdapter(EngineAdapter):
     ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("SGLang weight iterator loading requires result.model")
+        load_weights_only = _sglang_load_weights_only()
         with capture_tensor_attrs(self.accelerator_backend):
-            result.model.load_weights(weights_iter)
+            if load_weights_only is None:
+                result.model.load_weights(weights_iter)
+            else:
+                # SGLang's own loaders go through load_weights_only, which
+                # renames checkpoint tensors the model expects under another
+                # name (MXFP8 .weight_scale -> .weight_scale_inv) before
+                # model.load_weights.
+                load_weights_only(result.model, weights_iter, self.target_device)
         return result
 
     def build_model_streamer_weight_iter(
@@ -245,6 +253,17 @@ class SglangAdapter(EngineAdapter):
         # safetensors and the iterator loads them across the TP group.
         it_config = copy.copy(self.load_config)
         _set_load_config_attr(it_config, "load_format", instanttensor_format)
+        # SGLang hands model_loader_extra_config to InstantTensor unchecked, so
+        # drop the options meant for the safetensors loader the engine was
+        # configured with; InstantTensor would reject them.
+        extra_config = {
+            key: value
+            for key, value in (
+                getattr(it_config, "model_loader_extra_config", None) or {}
+            ).items()
+            if key not in _DEFAULT_LOADER_ONLY_OPTIONS
+        }
+        _set_load_config_attr(it_config, "model_loader_extra_config", extra_config)
         return DefaultModelLoader(it_config)._get_all_weights(self.model_config, model)
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
@@ -378,6 +397,22 @@ class SglangAdapter(EngineAdapter):
             and self.is_cuda_alike()
             and envs.MX_MS_DISTRIBUTED
         )
+
+
+# model_loader_extra_config options that only SGLang's safetensors loaders read
+# (DefaultModelLoader with AUTO/SAFETENSORS/FASTSAFETENSORS).
+_DEFAULT_LOADER_ONLY_OPTIONS = frozenset(
+    {"enable_multithread_load", "num_threads", "enable_gds"}
+)
+
+
+def _sglang_load_weights_only():
+    """Return DefaultModelLoader.load_weights_only, or None before SGLang 0.5.20."""
+    try:
+        from sglang.srt.model_loader.loader import DefaultModelLoader
+    except ImportError:
+        return None
+    return getattr(DefaultModelLoader, "load_weights_only", None)
 
 
 def _set_load_config_attr(obj, name: str, value) -> None:
