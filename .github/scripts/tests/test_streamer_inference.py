@@ -16,8 +16,6 @@ import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
-import yaml
-
 spec = importlib.util.spec_from_file_location(
     "check_streamer_inference", Path(__file__).resolve().parents[1] / "check_streamer_inference.py"
 )
@@ -77,10 +75,13 @@ class StreamerInferenceTests(unittest.TestCase):
 
 
 class StreamerLaunchTests(unittest.TestCase):
+    script = Path(__file__).resolve().parents[1] / "run-mx-streamer-test.sh"
+
+    def shell_function(self, name):
+        return f'source "{self.script}"\n{name}\n'
+
     def test_load_wait_requires_the_selected_loading_path(self):
-        action = Path(__file__).resolve().parents[2] / "actions/run-mx-streamer-test/action.yml"
-        steps = yaml.safe_load(action.read_text())["runs"]["steps"]
-        script = next(step["run"] for step in steps if step["name"] == "Wait for model load to complete")
+        script = self.shell_function("wait_for_load")
         for fallback, logs, expected in [
             ("false", "Model streamer weight loading complete", 0),
             ("true", "Strategy model_streamer failed\nWeights loaded from disk", 0),
@@ -102,12 +103,10 @@ class StreamerLaunchTests(unittest.TestCase):
                     self.assertIn(logs, result.stdout)
 
     def test_launches_engines_in_job_container_and_cleans_up(self):
-        action = Path(__file__).resolve().parents[2] / "actions/run-mx-streamer-test/action.yml"
-        steps = yaml.safe_load(action.read_text())["runs"]["steps"]
-        cleanup = next(step["run"] for step in steps if step["name"] == "Cleanup server")
+        cleanup = self.shell_function("cleanup")
         for framework in ["vllm", "sglang"]:
-            launch = next(step["run"] for step in steps
-                          if step.get("if") == f"inputs.framework == '{framework}'")
+            launch = self.shell_function(f"start_{framework}")
+            launch += 'echo "STREAMER_PID=$STREAMER_PID" > "$CAPTURE_PID"\n'
             for fallback in ["false", "true"]:
                 with self.subTest(framework=framework, fallback=fallback), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -125,7 +124,7 @@ class StreamerLaunchTests(unittest.TestCase):
                     python.chmod(0o755)
                     environment = {
                         **os.environ, "PATH": f"{directory}:{os.environ['PATH']}",
-                        "CAPTURE": str(root / "capture.json"), "GITHUB_ENV": str(root / "env"),
+                        "CAPTURE": str(root / "capture.json"), "CAPTURE_PID": str(root / "env"),
                         "STREAMER_LOG": str(root / "server.log"), "MODEL": "test/model",
                         "MODEL_S3_URI": "s3://bucket/models/test/model", "PORT": "18888",
                         "S3_REGION": "us-west-2", "STREAMER_CONCURRENCY": "16",

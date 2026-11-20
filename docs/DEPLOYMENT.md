@@ -464,6 +464,8 @@ Every job runs on the velonix self-hosted runners. The runner override reaches
 the child workflows' control jobs. Model-streamer tests use the `ai-dynamo-gpu`
 organization runner group with the `ai-dynamo-gpu-1-amd64-v1` label. Each test
 runs directly in its worker image, authenticated through `container.credentials`.
+The workflow calls `.github/scripts/run-mx-streamer-test.sh` inside the GPU pod
+because local composite actions are unavailable to the separate runner coordinator.
 The tests use GitHub OpenID Connect (OIDC), which supplies short-lived AWS credentials,
 to assume `arn:aws:iam::210086341041:role/modelexpress-ci-s3` for S3 access.
 Only the model-streamer jobs receive OIDC token permission in the inference workflow.

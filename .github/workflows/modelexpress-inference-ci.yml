@@ -434,14 +434,14 @@ jobs:
           unset-current-credentials: true
 
       - name: Run model streamer test
-        uses: ./.github/actions/run-mx-streamer-test
-        with:
-          framework: ${{ env.FRAMEWORK }}
-          model: ${{ env.MX_CI_MODEL }}
-          s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
-          s3_region: ${{ env.MX_CI_S3_REGION }}
-          hf_token: ${{ secrets.HF_TOKEN }}
-          test_model_streamer_fallback: ${{ matrix.test_model_streamer_fallback }}
+        shell: bash
+        env:
+          MODEL: ${{ env.MX_CI_MODEL }}
+          S3_BUCKET: ${{ env.MX_CI_S3_BUCKET }}
+          S3_REGION: ${{ env.MX_CI_S3_REGION }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TEST_MODEL_STREAMER_FALLBACK: ${{ matrix.test_model_streamer_fallback }}
+        run: bash .github/scripts/run-mx-streamer-test.sh
 
   model-streamer-sglang:
     name: Model Streamer ${{ matrix.mode }} test (sglang, S3)
