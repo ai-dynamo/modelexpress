@@ -17,7 +17,7 @@ from typing import Iterator
 import torch
 
 from .. import envs
-from ..adapter import EngineAdapter, StrategyFailed
+from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from .base import LoadContext, WeightsIteratorLoadStrategy, _as_load_result
 from .context import LoadResult
 
@@ -97,6 +97,17 @@ class ModelStreamerStrategy(WeightsIteratorLoadStrategy):
         try:
             result = ctx.adapter.apply_weight_iter(result, weights_iter)
         except Exception as e:
+            # The failed loader's traceback can keep staging buffers alive
+            # until after the next strategy allocates its model.
+            close = getattr(weights_iter, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as cleanup_error:
+                    raise StrategyRecoveryError(
+                        f"[Worker {ctx.global_rank}] Failed to close ModelStreamer "
+                        "weight iterator before retry"
+                    ) from cleanup_error
             logger.warning(
                 f"[Worker {ctx.global_rank}] Model streamer loading failed, falling through: {e}"
             )
