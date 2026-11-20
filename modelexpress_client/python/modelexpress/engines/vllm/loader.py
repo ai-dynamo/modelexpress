@@ -29,14 +29,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
+from contextlib import nullcontext
+from itertools import chain
 
 import torch
 import torch.nn as nn
 
 from ... import configure_vllm_logging, envs, model_prefetch, p2p_pb2
+from ...adapter import StrategyRecoveryError
 from ...load_strategy import (
     LoadContext,
+    _gather_all_ranks,
     drain_tensor_readers,
     publish_metadata,
     register_tensors,
@@ -45,6 +50,8 @@ from ...load_strategy import (
     unpublish_metadata,
 )
 from ...load_strategy.draft_gate import DraftPublicationGate
+from ...load_strategy.base import _init_nixl_manager, clear_exception_tracebacks
+from ...load_strategy.context import is_draft_tensor_name
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
 from ...tensor_utils import adopt_bare_tensors
@@ -61,6 +68,8 @@ from .artifacts import (
     _vllm_health_ready,
     _vllm_version,
     install_vllm_cache_artifacts,
+    pause_vllm_cache_artifact_publish,
+    release_vllm_cache_artifact_buffers,
     schedule_vllm_cache_artifact_publish,
 )
 from .source_identity import build_source_identity, is_pinned_revision
@@ -162,6 +171,31 @@ def get_model_loader(device_id: int) -> MxModelLoader | None:
     return _loader_registry.get(device_id)
 
 
+def _shares_main_storage(model: nn.Module, main_tensors) -> bool:
+    ranges = []
+    for is_main, tensors in (
+        (True, main_tensors),
+        (False, chain(model.parameters(), model.buffers())),
+    ):
+        for tensor in tensors:
+            if tensor.device.type == "meta" or not tensor.numel():
+                continue
+            extent = 1 + sum(
+                (size - 1) * stride
+                for size, stride in zip(tensor.shape, tensor.stride())
+            )
+            ranges.append((
+                str(tensor.device), tensor.data_ptr(),
+                tensor.data_ptr() + extent * tensor.element_size(), is_main,
+            ))
+    ends = {}
+    for device, start, end, is_main in sorted(ranges):
+        if start < ends.get((device, not is_main), 0):
+            return True
+        ends[device, is_main] = max(end, ends.get((device, is_main), 0))
+    return False
+
+
 class MxModelLoader(BaseModelLoader):
     """
     Auto-detecting model loader for ModelExpress.
@@ -181,6 +215,9 @@ class MxModelLoader(BaseModelLoader):
         # you most need to diagnose. No-op unless enabled; never raises.
         enable_metrics()
         self._ctx: LoadContext | None = None
+        self._draft_ctx: LoadContext | None = None
+        self._draft_publication_pending = False
+        self._reload_lock = threading.Lock()
         # Set by on_sleep(), consulted by on_wake_up(): wake_up(tags) doesn't
         # carry the preceding sleep's level, so this loader remembers it.
         self._last_sleep_level: int | None = None
@@ -231,11 +268,19 @@ class MxModelLoader(BaseModelLoader):
         """
         if envs.MX_P2P_COLD_START:
             raise RuntimeError("MX cold start does not support model reload")
-        if self._last_sleep_level is None:
-            self._stop_serving()
-        return self._load_or_reload_model(
-            vllm_config, model_config, prefix, model, restore
-        )
+        if not self._reload_lock.acquire(blocking=False):
+            raise RuntimeError("ModelExpress reload is already in progress")
+        try:
+            if (
+                self._last_sleep_level is None
+                and not _is_speculative_draft(vllm_config, model_config)
+            ):
+                self._stop_serving()
+            return self._load_or_reload_model(
+                vllm_config, model_config, prefix, model, restore
+            )
+        finally:
+            self._reload_lock.release()
 
     def _load_or_reload_model(
         self,
@@ -259,10 +304,11 @@ class MxModelLoader(BaseModelLoader):
         ctx = build_vllm_load_context(vllm_config, model_config)
         ctx.p2p_role = "draft" if is_speculative_draft else "main"
         ctx.is_reload = model is not None
-        if ctx.is_reload and self._ctx is not None:
+        loaded_ctx = self._draft_ctx if is_speculative_draft else self._ctx
+        if ctx.is_reload and loaded_ctx is not None:
             # Snapshot: a refit rewrites the live identity's revision in place.
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
-            ctx.loaded_identity.CopyFrom(self._ctx.identity)
+            ctx.loaded_identity.CopyFrom(loaded_ctx.identity)
         elif ctx.is_reload and restore and not is_pinned_revision(model_config):
             logger.info(
                 f"[Worker {ctx.global_rank}] Restore needs a revision that pins "
@@ -301,7 +347,7 @@ class MxModelLoader(BaseModelLoader):
             ):
                 ctx.p2p_enabled = False
             elif not separate_draft or namespace is not None:
-                ctx.shared_nixl_manager = _nixl_managers.get(ctx.device_id)
+                ctx.shared_nixl_manager = main_ctx.nixl_manager
                 if separate_draft:
                     ctx.p2p_source_identity = main_ctx.identity
                     ctx.draft_tensor_namespace = namespace
@@ -325,17 +371,111 @@ class MxModelLoader(BaseModelLoader):
             f"(model={ctx.identity.model_name}, p2p_enabled={ctx.p2p_enabled}, "
             f"p2p_role={ctx.p2p_role})"
         )
+        reload_owner = None
+        draft_prepared = False
         try:
+            if ctx.is_reload and is_speculative_draft:
+                preparation_failure: Exception | None = None
+                try:
+                    if main_ctx is not None and main_ctx.p2p_enabled and (
+                        main_ctx.nixl_manager is not None
+                        or main_loader._draft_publication_pending
+                        or (
+                            loaded_ctx is not None
+                            and loaded_ctx.shared_nixl_manager is not None
+                        )
+                    ):
+                        if (
+                            main_loader is not self
+                            and not main_loader._reload_lock.acquire(blocking=False)
+                        ):
+                            raise RuntimeError("Main publication is already being reloaded")
+                        reload_owner = main_loader
+                        if (
+                            main_loader._ctx is not main_ctx
+                            or _loader_registry.get(ctx.device_id) is not main_loader
+                        ):
+                            raise RuntimeError("Main publication changed before draft reload")
+                        if loaded_ctx is None and any(
+                            is_draft_tensor_name(name) for name in main_ctx.tensors
+                        ):
+                            raise RuntimeError("Cannot reload without the previous draft catalog")
+                        draft_names = loaded_ctx.tensors if loaded_ctx is not None else {}
+                        main_tensors = (
+                            tensor for name, tensor in main_ctx.tensors.items()
+                            if name not in draft_names
+                        )
+                        if _shares_main_storage(model, main_tensors):
+                            raise RuntimeError("Draft reload shares storage with the main model")
+                        reload_owner._prepare_draft_reload(loaded_ctx, main_ctx)
+                        draft_prepared = True
+                        ctx.shared_nixl_manager = main_ctx.nixl_manager
+                except Exception as exc:
+                    preparation_failure = exc
+                errors = _gather_all_ranks(
+                    "prepare:draft_reload",
+                    str(preparation_failure) if preparation_failure is not None else None,
+                    ctx,
+                )
+                if preparation_failure is not None:
+                    raise preparation_failure
+                for rank, error in enumerate(errors):
+                    if error is not None:
+                        raise StrategyRecoveryError(
+                            f"[Worker {ctx.global_rank}] Rank {rank} could not "
+                            f"prepare draft reload: {error}"
+                        )
+                self._draft_ctx = None
             model = self._load_model(
                 vllm_config, model_config, prefix, ctx, is_speculative_draft, model
             )
-        except BaseException:
+            if is_speculative_draft:
+                self._draft_ctx = ctx
+                if reload_owner is not None and main_ctx.nixl_manager is not None:
+                    # Publish only draft tensors that were registered. When the
+                    # draft's registration fails, the main tensors are
+                    # republished alone, as in initial loading.
+                    if ctx.nixl_manager is not None:
+                        main_ctx.tensors.update(ctx.tensors)
+                    elif ctx.p2p_enabled:
+                        logger.warning(
+                            "Draft tensors were not registered; republishing "
+                            "the main model without draft descriptors"
+                        )
+                    _tensor_registry[ctx.device_id] = main_ctx.tensors
+                    publish_metadata(main_ctx)
+                    reload_owner._draft_publication_pending = False
+                    try:
+                        schedule_vllm_cache_artifact_publish(main_ctx)
+                    except Exception:
+                        logger.warning("Failed to resume vLLM cache publication", exc_info=True)
+        except BaseException as exc:
+            if draft_prepared:
+                clear_exception_tracebacks(exc)
+                manager = main_ctx.nixl_manager
+                if manager is not None:
+                    try:
+                        manager.shutdown()
+                    except Exception:
+                        # Report the load failure itself. Keep the reference
+                        # so the next strict stop retries the shutdown.
+                        logger.exception(
+                            "Failed to shut down the unpublished shared NIXL "
+                            "manager after a failed draft reload"
+                        )
+                    else:
+                        main_ctx.nixl_manager = None
+                _nixl_managers.pop(ctx.device_id, None)
+                ctx.nixl_manager = None
+                ctx.shared_nixl_manager = None
             if ctx.donor_lease is not None:
                 ctx.donor_lease.stop()
             if main_ctx is not None and main_ctx.donor_lease is not None:
                 main_ctx.donor_lease.stop()
             raise
         finally:
+            if reload_owner is not None and reload_owner is not self:
+                reload_owner._reload_lock.release()
             if draft_gate is not None:
                 draft_gate.release()
             main_gate_pending = _draft_publication_gates.get(ctx.device_id)
@@ -410,6 +550,7 @@ class MxModelLoader(BaseModelLoader):
                             )
                     elif ctx.p2p_enabled:
                         _loader_registry[ctx.device_id] = self
+                        self._draft_publication_pending = False
                         _tensor_registry[ctx.device_id] = ctx.tensors
                         if ctx.nixl_manager is not None:
                             _nixl_managers[ctx.device_id] = ctx.nixl_manager
@@ -495,18 +636,62 @@ class MxModelLoader(BaseModelLoader):
             register_tensors(None, self._ctx, reuse_discovered=True)
         publish_metadata(self._ctx)
 
-    def _stop_serving(self) -> None:
+    def _stop_serving(self, *, strict: bool = False) -> None:
         """Withdraw the publication and release the NIXL agent, if serving."""
-        if self._ctx is None:
+        ctx = self._ctx
+        if ctx is None:
             return
 
-        unpublish_metadata(self._ctx)
-        if self._ctx.donor_lease is not None:
-            self._ctx.donor_lease.stop()
-            self._ctx.donor_lease = None
-        if self._ctx.nixl_manager is not None:
-            self._ctx.nixl_manager.shutdown()
-            self._ctx.nixl_manager = None
+        if strict:
+            drain_tensor_readers(ctx, timeout=envs.MX_TRANSFER_TIMEOUT)
+        with pause_vllm_cache_artifact_publish(ctx) if strict else nullcontext():
+            unpublish_metadata(ctx, **({"strict": True} if strict else {}))
+            if ctx.donor_lease is not None:
+                ctx.donor_lease.stop()
+                ctx.donor_lease = None
+            if strict:
+                release_vllm_cache_artifact_buffers(ctx.device_id)
+            if ctx.nixl_manager is not None:
+                ctx.nixl_manager.shutdown()
+                ctx.nixl_manager = None
+
+    def _prepare_draft_reload(
+        self, draft_ctx: LoadContext | None, ctx: LoadContext,
+    ) -> None:
+        self._stop_serving(strict=True)
+        self._draft_publication_pending = True
+        _nixl_managers.pop(ctx.device_id, None)
+        if draft_ctx is not None:
+            for name in draft_ctx.tensors:
+                ctx.tensors.pop(name, None)
+            draft_ctx.nixl_manager = None
+            draft_ctx.shared_nixl_manager = None
+        manager = None
+        try:
+            manager = _init_nixl_manager(
+                ctx.global_rank, ctx.device_id, "auto",
+                envs.MX_METADATA_PORT + ctx.device_id, ctx.accelerator_backend,
+            )
+            manager.register_tensors(ctx.tensors, force_per_tensor=True)
+        except BaseException as exc:
+            if manager is not None:
+                try:
+                    manager.shutdown()
+                except Exception as cleanup_error:
+                    raise StrategyRecoveryError(
+                        f"Failed to clean up shared NIXL manager: {cleanup_error}"
+                    ) from cleanup_error
+            if not isinstance(exc, Exception) or isinstance(exc, StrategyRecoveryError):
+                raise
+            clear_exception_tracebacks(exc)
+            logger.warning(
+                "Failed to rebuild shared NIXL registration; continuing reload without P2P: %s",
+                exc,
+            )
+            return
+        ctx.nixl_manager = manager
+        _nixl_managers[ctx.device_id] = manager
+        _tensor_registry[ctx.device_id] = ctx.tensors
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:

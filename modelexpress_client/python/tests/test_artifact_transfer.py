@@ -51,6 +51,27 @@ from modelexpress.metadata.worker_server import (
 )
 
 
+@pytest.mark.parametrize("retain_buffers", [False, True])
+def test_artifact_deregistration_failure_retains_the_slot_for_retry(retain_buffers):
+    manager = MagicMock()
+    chunks = artifact_transfer_module.NixlArtifactChunkManager(manager, max_buffers=1)
+    slot = chunks._slots[chunks._reserve_slot(16)]
+    registered = slot.registered
+    manager.deregister_memory.side_effect = RuntimeError("registration busy")
+
+    chunks.close(retain_buffers=retain_buffers)
+    assert slot.registered is registered
+    assert slot in chunks._slots
+
+    manager.deregister_memory.side_effect = None
+    chunks.close()
+    assert slot.registered is None
+    assert manager.deregister_memory.call_args_list == [
+        ((registered,), {}), ((registered,), {}),
+    ]
+    assert not chunks._slots
+
+
 def test_transfer_artifact_from_worker_reconstructs_file_and_releases_leases(tmp_path):
     artifact_file = tmp_path / "cache.bin"
     artifact_file.write_bytes(b"0123456789abcdef")

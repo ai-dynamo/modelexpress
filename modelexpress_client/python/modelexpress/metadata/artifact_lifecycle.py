@@ -20,6 +20,7 @@ from getpass import getuser
 from hashlib import sha256
 from importlib.metadata import version as pkg_version
 from pathlib import Path
+from threading import Lock
 from typing import Callable, Iterator, TextIO
 
 import torch
@@ -57,6 +58,7 @@ CACHE_SETTLE_SECS = 5
 ArtifactEntry = tuple[ArtifactTransfer, p2p_pb2.SourceIdentity]
 InstallCompleted = Callable[[ArtifactTransfer, p2p_pb2.SourceIdentity], None]
 _publish_leases: dict[Path, TextIO] = {}
+_publish_leases_lock = Lock()
 
 
 def install_artifacts(
@@ -234,6 +236,8 @@ def schedule_artifact_publish(
         marker_path = mark_publish_scheduled(ctx, transfer, identity)
         if marker_path is None:
             continue
+        with _publish_leases_lock:
+            lease = _publish_leases.get(marker_path)
 
         key = (ctx.device_id, transfer.mx_source_type)
         previous = scheduled_publishers.pop(key, None)
@@ -255,8 +259,10 @@ def schedule_artifact_publish(
             interval_secs=READY_POLL_SECS,
             heartbeat_after_publish=False,
             retry_publish_on_failure=transport.retry_publish_on_failure,
-            cleanup_fn=lambda marker_path=marker_path, publisher_ref=publisher_ref: (
-                clear_publish_scheduled(publisher_ref[0], marker_path)
+            cleanup_fn=lambda marker_path=marker_path, publisher_ref=publisher_ref, lease=lease, force=False: (
+                clear_publish_scheduled(
+                    publisher_ref[0], marker_path, force=force, expected_lease=lease,
+                )
             ),
         )
         publisher_ref[0] = publisher
@@ -541,7 +547,8 @@ def mark_publish_scheduled(
     except BlockingIOError:
         lease.close()
         return None
-    _publish_leases[lease_path] = lease
+    with _publish_leases_lock:
+        _publish_leases[lease_path] = lease
     logger.debug(
         "[Worker %s] Acquired artifact publish lease: name=%s",
         ctx.global_rank,
@@ -553,10 +560,16 @@ def mark_publish_scheduled(
 def clear_publish_scheduled(
     publisher: PublisherThread | None,
     lease_path: Path,
+    *,
+    force: bool = False,
+    expected_lease: TextIO | None = None,
 ) -> None:
-    if publisher is None or publisher.mx_source_id is not None:
+    if not force and (publisher is None or publisher.mx_source_id is not None):
         return
-    lease = _publish_leases.pop(lease_path, None)
+    with _publish_leases_lock:
+        if expected_lease is not None and _publish_leases.get(lease_path) is not expected_lease:
+            return
+        lease = _publish_leases.pop(lease_path, None)
     if lease is not None:
         lease.close()
 

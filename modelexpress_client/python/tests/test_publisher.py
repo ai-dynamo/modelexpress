@@ -40,6 +40,30 @@ def heartbeat(mx_client, nixl_manager):
     hb.stop()
 
 
+@pytest.mark.parametrize("failure", [False, RuntimeError("coordinator unavailable")])
+def test_strict_stop_retries_failed_stale_demotion(monkeypatch, failure):
+    from modelexpress.load_strategy.base import unpublish_metadata_for_worker
+    from modelexpress.metadata import publish
+
+    client = MagicMock()
+    client.update_status.side_effect = [failure, True]
+    heartbeat = PublisherThread(
+        client, mx_source_id="source", worker_id="worker", worker_rank=0,
+    )
+    heartbeat._started = True
+    monkeypatch.setattr(publish, "_worker_servers", {})
+    monkeypatch.setattr(publish, "_heartbeat_threads", {0: heartbeat})
+
+    with pytest.raises(RuntimeError):
+        unpublish_metadata_for_worker(worker_rank=0, device_id=0, strict=True)
+    assert heartbeat._started
+    assert publish._heartbeat_threads[0] is heartbeat
+
+    unpublish_metadata_for_worker(worker_rank=0, device_id=0, strict=True)
+    assert not heartbeat._started
+    assert not publish._heartbeat_threads
+
+
 class TestHeartbeatSendsReady:
     def test_sends_ready_when_healthy(self, heartbeat, mx_client, nixl_manager):
         heartbeat.start()

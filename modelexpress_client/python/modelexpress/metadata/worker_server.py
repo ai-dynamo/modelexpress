@@ -22,7 +22,7 @@ from concurrent import futures
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Condition, Lock
+from threading import Condition, Lock, RLock
 from typing import Any
 
 import grpc
@@ -487,6 +487,31 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             )
 
 
+class _WorkerExecutor(futures.ThreadPoolExecutor):
+    def __init__(self, max_workers: int):
+        super().__init__(max_workers=max_workers)
+        self._pending = set()
+        self._pending_lock = RLock()
+
+    def submit(self, fn, /, *args, **kwargs):
+        with self._pending_lock:
+            future = super().submit(fn, *args, **kwargs)
+            self._pending.add(future)
+        future.add_done_callback(self._finished)
+        return future
+
+    def _finished(self, future):
+        with self._pending_lock:
+            self._pending.discard(future)
+
+    def drain(self, timeout: float) -> None:
+        with self._pending_lock:
+            self.shutdown(wait=False, cancel_futures=True)
+            pending = tuple(future for future in self._pending if not future.done())
+        if pending and futures.wait(pending, timeout=timeout).not_done:
+            raise RuntimeError("Worker gRPC handlers failed to stop")
+
+
 class WorkerGrpcServer:
     """Manages a gRPC WorkerService on a source worker."""
 
@@ -518,6 +543,7 @@ class WorkerGrpcServer:
         self._max_workers = max_workers
         self._worker_id = worker_id
         self._server: grpc.Server | None = None
+        self._executor: _WorkerExecutor | None = None
         self._servicer: WorkerServiceServicer | None = None
         self._port: int | None = None
 
@@ -572,8 +598,9 @@ class WorkerGrpcServer:
         """Start the gRPC server. Returns the actual bound port."""
         # Without SO_REUSEPORT a second server on this port fails to bind
         # instead of silently sharing it.
+        self._executor = _WorkerExecutor(max_workers=self._max_workers)
         self._server = grpc.server(
-            futures.ThreadPoolExecutor(max_workers=self._max_workers),
+            self._executor,
             options=[("grpc.so_reuseport", 0)],
         )
         self._servicer = WorkerServiceServicer(
@@ -596,6 +623,8 @@ class WorkerGrpcServer:
         except RuntimeError as e:
             port, bind_error = 0, e
         if port == 0 or (self._requested_port and port != self._requested_port):
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            self._executor = None
             self._server = None
             self._servicer = None
             raise RuntimeError(
@@ -612,13 +641,18 @@ class WorkerGrpcServer:
         )
         return self._port
 
-    def stop(self, grace: float = 5.0) -> None:
+    def stop(self, grace: float = 5.0, *, strict: bool = False) -> None:
         if self._server is not None:
             server = self._server
+            stopped = server.stop(grace)
+            if strict and not stopped.wait(timeout=(grace or 0) + 5):
+                raise RuntimeError("Worker gRPC server failed to stop")
+            if strict and self._executor is not None:
+                self._executor.drain(timeout=(grace or 0) + 5)
+            self._executor = None
             self._server = None
             self._servicer = None
             self._port = None
-            server.stop(grace)
             logger.info("WorkerGrpcServer stopped")
 
     def drain_tensor_reads(self, timeout: float) -> None:

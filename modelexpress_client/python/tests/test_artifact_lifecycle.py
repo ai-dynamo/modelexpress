@@ -1212,6 +1212,45 @@ def _publish_context():
     )
 
 
+def test_stale_scheduler_does_not_release_another_devices_lease(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "nixl")
+    monkeypatch.setattr(artifact_lifecycle.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(artifact_lifecycle, "_publish_leases", {})
+    monkeypatch.setattr(
+        artifact_lifecycle, "_create_artifact_transport",
+        lambda *args: artifact_lifecycle.NixlArtifactTransport(),
+    )
+    monkeypatch.setattr(artifact_lifecycle.PublisherThread, "start", lambda self: None)
+    transfer = SimpleNamespace(
+        name="cache", mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE, roots=(),
+    )
+    identity = _identity()
+    scheduled = {}
+
+    def schedule(device):
+        ctx = _publish_context()
+        ctx.device_id = device
+        artifact_lifecycle.schedule_artifact_publish(
+            ctx, lambda: [(transfer, identity)], engine_label="vLLM",
+            ready_fn_factory=lambda roots: lambda: True,
+            artifact_publish_fn=MagicMock(), scheduled_publishers=scheduled,
+        )
+        return scheduled[device, transfer.mx_source_type]
+
+    first = schedule(0)
+    first.stop()
+    second = schedule(1)
+    path = artifact_lifecycle.artifact_marker_path(transfer, identity, "publish-scheduled")
+    lease = artifact_lifecycle._publish_leases[path]
+    try:
+        first.force_cleanup()
+        assert artifact_lifecycle._publish_leases.get(path) is lease
+        assert not lease.closed
+    finally:
+        second.stop()
+
+
 def test_nixl_publish_retries_unknown_domain_without_preparing_cache(monkeypatch, tmp_path):
     monkeypatch.setenv("MX_ARTIFACT_BACKEND", "nixl")
     monkeypatch.setenv("MX_P2P_TOPOLOGY_DOMAIN", "site")
