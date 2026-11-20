@@ -244,6 +244,9 @@ jobs:
     name: Inference test suite
     needs: [preflight]
     if: ${{ needs.preflight.outputs.run_tests == 'true' }}
+    permissions:
+      contents: read
+      id-token: write
     uses: ./.github/workflows/modelexpress-inference-ci.yml
     with:
       runs_on: prod-modelexpress-builder-amd-v1
