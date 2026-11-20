@@ -135,7 +135,6 @@ impl DownloadProgress {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::super::{
         download_task::DownloadTask, model_dir::INTERNAL_METADATA_DIR_NAME, model_name::BucketName,

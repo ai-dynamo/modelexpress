@@ -405,7 +405,6 @@ fn env_secs_ceil(name: &str, default: u64) -> u64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::test_support::{EnvVarGuard, acquire_env_mutex};

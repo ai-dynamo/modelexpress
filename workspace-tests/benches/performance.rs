@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(
-    clippy::expect_used,
-    clippy::unwrap_used,
-    clippy::arithmetic_side_effects
-)]
+#![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use modelexpress_common::models::{ModelProvider, ModelStatus, Status};

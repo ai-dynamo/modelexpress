@@ -946,7 +946,6 @@ impl Client {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use futures::Stream;
@@ -2073,7 +2072,6 @@ mod tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod integration_tests {
     use super::*;
     use modelexpress_common::constants;
