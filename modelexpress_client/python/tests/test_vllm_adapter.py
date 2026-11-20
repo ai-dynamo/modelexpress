@@ -833,6 +833,79 @@ def test_after_weight_iter_load_does_not_rerun_model_specific_finalizers(monkeyp
     assert events == [("process", torch.device("cpu"))]
 
 
+@pytest.mark.parametrize("online_quant", (True, False))
+@pytest.mark.parametrize(
+    "hook_name",
+    ("after_native_load", "after_weight_iter_load", "before_rdma_receive"),
+)
+def test_load_hooks_finalize_online_quant_before_postprocessing(
+    monkeypatch, hook_name, online_quant
+):
+    """Check that load hooks finalize layerwise loading only for online quant.
+
+    Online-quantized checkpoint hooks release the allocator cache before
+    finalization; other loads and RDMA target preparation leave it untouched.
+    """
+    events = []
+
+    def process_weights_after_loading(model, model_config, target_device):
+        if online_quant:
+            assert not model.weight.is_meta
+            torch.testing.assert_close(model.weight, torch.ones(2, 2))
+        events.append(("process", model, model_config, target_device))
+
+    _stub_vllm_process_weights_after_loading(monkeypatch, process_weights_after_loading)
+
+    def has_online_quant(model):
+        return online_quant
+
+    def finalize(model, config):
+        assert model.weight.is_meta
+        model.weight = nn.Parameter(torch.ones(2, 2))
+        events.append(("layerwise", model, config))
+
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.base_loader"],
+        "_has_online_quant",
+        has_online_quant,
+    )
+    monkeypatch.setattr(
+        sys.modules["vllm.model_executor.model_loader.reload"],
+        "finalize_layerwise_processing",
+        finalize,
+    )
+
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    monkeypatch.setattr(
+        "modelexpress.engines.vllm.adapter.gc.collect",
+        lambda: events.append("gc"),
+    )
+    monkeypatch.setattr(
+        adapter.accelerator_backend,
+        "empty_cache",
+        lambda: events.append("empty_cache"),
+    )
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.empty(2, 2, device="meta"))
+    result = LoadResult(value=model, model=model)
+    if hook_name == "before_rdma_receive":
+        monkeypatch.setattr(
+            adapter,
+            "_finalize_model_specific_weights",
+            lambda value, _names: events.append("model_specific") or value,
+        )
+
+    assert getattr(adapter, hook_name)(result) is result
+
+    expected = ["model_specific"] if hook_name == "before_rdma_receive" else []
+    if online_quant:
+        if hook_name != "before_rdma_receive":
+            expected.extend(("gc", "empty_cache"))
+        expected.append(("layerwise", model, adapter.model_config))
+    expected.append(("process", model, adapter.model_config, torch.device("cpu")))
+    assert events == expected
+
+
 def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
     fake_platforms = SimpleNamespace(
         current_platform=SimpleNamespace(
@@ -843,6 +916,7 @@ def _stub_vllm_current_device(monkeypatch, *, current_device: int) -> None:
 
 
 def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
+    """Install isolated vLLM loader stubs with a custom post-processing hook."""
     packages = [
         "vllm",
         "vllm.model_executor",
@@ -856,6 +930,14 @@ def _stub_vllm_process_weights_after_loading(monkeypatch, process_fn) -> None:
     utils = ModuleType("vllm.model_executor.model_loader.utils")
     utils.process_weights_after_loading = process_fn
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
+
+    base_loader = ModuleType("vllm.model_executor.model_loader.base_loader")
+    base_loader._has_online_quant = lambda _model: False
+    monkeypatch.setitem(sys.modules, base_loader.__name__, base_loader)
+
+    reload_module = ModuleType("vllm.model_executor.model_loader.reload")
+    reload_module.finalize_layerwise_processing = lambda *_args: None
+    monkeypatch.setitem(sys.modules, reload_module.__name__, reload_module)
 
 
 def _stub_metadata_client(monkeypatch) -> None:
