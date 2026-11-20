@@ -369,6 +369,9 @@ class FSDPTrainerAdapter(TrainerEngineAdapter):
         return f"__pub__{index}__{name}"
 
     def _wire_dtype(self, shard: LocalTensorShard) -> torch.dtype:
+        # Integer state (e.g. a hash router's token-to-expert table) is sent exactly as held.
+        if not shard.source_tensor.is_floating_point():
+            return shard.source_tensor.dtype
         return self._wire_dtype_overrides.get(shard.name, WIRE_DTYPE)
 
     def _require_in_place_servable(self, shard: LocalTensorShard) -> None:
