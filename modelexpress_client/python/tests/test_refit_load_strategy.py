@@ -236,11 +236,6 @@ def test_p2p_rejects_desired_version_change_during_load(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     ctx = _context()
     result = LoadResult(value=nn.Linear(1, 1))
-    client = MagicMock()
-    client.__enter__.return_value = client
-    client.get_weight_version.return_value = _version(
-        "version-7", WeightPayloadFormat.FULL_HF_CHECKPOINT
-    )
 
     def change_desired(*_args):
         """Change the configured version while returning a successful load."""
@@ -248,9 +243,6 @@ def test_p2p_rejects_desired_version_change_during_load(monkeypatch):
         return result
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
-        return_value=client,
-    ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
         side_effect=change_desired,
     ), pytest.raises(
@@ -273,16 +265,8 @@ def test_p2p_rejects_rank_load_outcome_disagreement(monkeypatch):
 
     ctx.adapter = _DistributedAdapter(gather)
     result = LoadResult(value=nn.Linear(1, 1))
-    client = MagicMock()
-    client.__enter__.return_value = client
-    client.get_weight_version.return_value = _version(
-        "version-7", WeightPayloadFormat.FULL_HF_CHECKPOINT
-    )
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
-        return_value=client,
-    ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
         return_value=result,
     ), pytest.raises(
@@ -301,20 +285,9 @@ def test_desired_p2p_requires_a_tensor_read_lease():
     assert DesiredVersionP2PStrategy.requires_tensor_read_lease is True
 
 
-@pytest.mark.parametrize(
-    ("model_name", "storage_type"),
-    [
-        (None, ObjectStorageType.S3),
-        ("mx_model_abc", ObjectStorageType.S3),
-        (None, ObjectStorageType.AZURE),
-    ],
-)
-def test_desired_p2p_uses_exact_revision(monkeypatch, model_name, storage_type):
+def test_desired_p2p_uses_exact_revision_without_control_record(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
-    if model_name is None:
-        monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
-    else:
-        monkeypatch.setenv("MX_MODEL_NAME_OVERRIDE", model_name)
+    monkeypatch.delenv("MX_MODEL_NAME_OVERRIDE", raising=False)
     model_path = "/root/.cache/vllm/assets/model_streamer/0088a9aa"
     ctx = _context()
     adapter = VllmAdapter(
@@ -326,18 +299,10 @@ def test_desired_p2p_uses_exact_revision(monkeypatch, model_name, storage_type):
     )
     ctx.identity = adapter.build_identity()
     result = LoadResult(value=nn.Linear(1, 1))
-    client = MagicMock()
-    client.__enter__.return_value = client
-    client.get_weight_version.return_value = _version(
-        "version-7",
-        WeightPayloadFormat.FULL_HF_CHECKPOINT,
-        model_name=model_name or model_path,
-        storage_type=storage_type,
-    )
 
     with patch(
         "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
-        return_value=client,
+        side_effect=AssertionError("P2P must not query the refit control plane"),
     ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
         return_value=result,
@@ -345,71 +310,15 @@ def test_desired_p2p_uses_exact_revision(monkeypatch, model_name, storage_type):
         assert DesiredVersionP2PStrategy().load(result, ctx) is result
 
     load.assert_called_once_with(result, ctx)
-    client.get_weight_version.assert_called_once_with("version-7")
     assert ctx.identity.revision == "version-7"
-
-
-@pytest.mark.parametrize(
-    ("version", "message"),
-    [
-        (
-            _version(
-                "version-7",
-                WeightPayloadFormat.FULL_HF_CHECKPOINT,
-                state=WeightVersionState.STAGING,
-            ),
-            "not READY",
-        ),
-        (
-            _version(
-                "version-7",
-                WeightPayloadFormat.FULL_HF_CHECKPOINT,
-                model_name="other-model",
-            ),
-            "model_name does not match",
-        ),
-        (
-            _version("other-version", WeightPayloadFormat.FULL_HF_CHECKPOINT),
-            "requested revision 'version-7' but MX returned 'other-version'",
-        ),
-    ],
-)
-def test_desired_p2p_requires_matching_ready_control_record(
-    monkeypatch, version, message
-):
-    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
-    ctx = _context()
-    result = LoadResult(value=nn.Linear(1, 1))
-    client = MagicMock()
-    client.__enter__.return_value = client
-    client.get_weight_version.return_value = version
-
-    with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
-        return_value=client,
-    ), patch(
-        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load"
-    ) as load, pytest.raises(StrategyFailed, match=message):
-        DesiredVersionP2PStrategy().load(result, ctx)
-
-    load.assert_not_called()
-    assert ctx.identity.revision == "base"
 
 
 def test_desired_p2p_restores_revision_on_miss(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     ctx = _context()
     result = LoadResult(value=nn.Linear(1, 1))
-    client = MagicMock()
-    client.__enter__.return_value = client
-    client.get_weight_version.return_value = _version(
-        "version-7", WeightPayloadFormat.FULL_HF_CHECKPOINT
-    )
 
     with patch(
-        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
-        return_value=client,
-    ), patch(
         "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
         side_effect=StrategyFailed("miss", mutated=False),
     ), pytest.raises(StrategyFailed):

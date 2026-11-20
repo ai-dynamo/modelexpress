@@ -597,6 +597,16 @@ resolve from its serving version instead of revisiting the full lineage. Mixed
 P2P/object-storage runtimes still resolve from the full root because their disk
 checkpoint may lag the serving version.
 
+Desired-version P2P uses the exact revision in the generator's normal READY
+`SourceIdentity` publication as its availability record. It does not require a
+separate refit `WeightVersion`: deployments may install weights through an
+external transport and publish only their complete runtime tensors. Exact
+identity matching, rank selection, manifest validation, and the donor read
+lease remain unchanged. If no matching READY generator exists, P2P misses and
+the desired-version chain may try object storage, which still requires a READY
+`WeightVersion` to resolve the payload and replay lineage. A configured desired
+UID never permits a version-agnostic fallback.
+
 The engine's serving version remains separate from checkpoint-cache state.
 vLLM constructs its Control server only after EngineCore and its workers finish
 loading. Because an explicit desired UID makes the MX loader fail closed, the

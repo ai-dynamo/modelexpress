@@ -13,8 +13,8 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and object-storage replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
-| `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither P2P nor object storage can load it |
+| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only exact-version P2P and object-storage replay; P2P can recover directly from a READY generator publication without a refit `WeightVersion`, while object-storage replay requires one. Without a desired UID, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
+| `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither a matching READY P2P generator nor the desired version's object storage can load it |
 | `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. Desired-version cold start defaults to `GENERATOR,OBJECT_STORAGE`; `OBJECT_STORAGE` disables P2P for both cold start and active refit. `TRAINER` applies only to active refit and is rejected for desired-version cold start. |
 | `MX_MAX_REPLAY_CHAIN_LENGTH` | `64` | Positive cold-start object-storage replay limit, including the full checkpoint root; align with the running engine's `max_replay_chain_length` when accepting longer chains |
 | `MX_REFIT_CHECKPOINT_DIR` | (unset) | Host-local cache for RL full checkpoints, deltas, and materialized checkpoints from S3 or Azure; the object-storage startup strategy skips when it is unset |
