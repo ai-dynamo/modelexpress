@@ -25,6 +25,10 @@ class VllmGeneratorContext(GeneratorEngineContext):
     vllm_config: VllmConfig
     # Maps a trainer-native source state_dict to HF names/layout before capture.
     convert_native_to_hf: Callable[[dict], dict] | None = None
+    # Install trainer refits through vLLM's own load_weights instead of replaying
+    # traced loader writes: each source is staged whole, so any model vLLM can
+    # reload installs without its loader being traceable.
+    install_through_loader: bool = False
 
 
 __all__ = ["VllmGeneratorContext"]
