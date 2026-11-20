@@ -3,6 +3,8 @@
 
 """Tests for the centralized environment-variable registry."""
 
+import logging
+
 import pytest
 
 from modelexpress import envs
@@ -98,6 +100,19 @@ def test_pool_reg_default_yields_to_vmm_arena(
 def test_invalid_int_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("MX_METADATA_PORT", "not-a-number")
     assert envs.MX_METADATA_PORT == 5555
+
+
+@pytest.mark.parametrize("value", ["0", "-5"])
+def test_heartbeat_interval_non_positive_uses_default(monkeypatch, caplog, value):
+    monkeypatch.setenv("MX_HEARTBEAT_INTERVAL_SECS", value)
+    with caplog.at_level(logging.WARNING, logger="modelexpress.envs"):
+        assert envs.MX_HEARTBEAT_INTERVAL_SECS == 30
+    assert f"MX_HEARTBEAT_INTERVAL_SECS={value!r}" in caplog.text
+
+
+def test_heartbeat_interval_override(monkeypatch):
+    monkeypatch.setenv("MX_HEARTBEAT_INTERVAL_SECS", "7")
+    assert envs.MX_HEARTBEAT_INTERVAL_SECS == 7
 
 
 def test_bool_parsing(monkeypatch, caplog):
