@@ -10,6 +10,8 @@ CUDAPluggableAllocator + MemPool require CUDA and skip otherwise.
 
 from __future__ import annotations
 
+import types
+
 import pytest
 
 
@@ -210,6 +212,44 @@ class TestUseArenaWithMemPool:
         # No assertion about arena state; just that the allocation works.
         assert t.numel() == 1024
 
+    def test_idle_segments_return_to_arena_on_exit(self):
+        """A buffer freed inside the scope must not stay mapped after it.
+
+        Regression test for #1033: a process-lifetime MemPool kept freed
+        loading buffers cached as idle arena memory, and empty_cache()
+        does not release a private pool that is still referenced.
+        """
+        import torch
+
+        from modelexpress.vmm.arena import VmmArena
+        from modelexpress.vmm.backend import CudaVmmBackend
+        from modelexpress.vmm.hook import use_arena
+
+        backend = CudaVmmBackend(device=0)
+        gran = backend.allocation_granularity()
+        arena = VmmArena(total_bytes=gran * 64, backend=backend)
+        keep = None
+        try:
+            with use_arena(arena, device=0):
+                keep = torch.empty(gran * 4, dtype=torch.uint8, device="cuda:0")
+                torch.cuda.synchronize()
+                mapped_with_keep = arena.mapped_bytes
+                scratch = torch.empty(gran * 8, dtype=torch.uint8, device="cuda:0")
+                torch.cuda.synchronize()
+                assert arena.mapped_bytes >= mapped_with_keep + gran * 8
+                del scratch
+                torch.cuda.synchronize()
+            assert keep.numel() == gran * 4
+            # The segment holding keep stays mapped; the scratch segment,
+            # idle once scratch is freed, must not.
+            assert arena.mapped_bytes == mapped_with_keep, (
+                f"freed scratch buffer still mapped: "
+                f"{arena.mapped_bytes - mapped_with_keep} bytes"
+            )
+        finally:
+            del keep
+            arena.close()
+
     def test_nesting_raises(self):
         from modelexpress.vmm.arena import VmmArena
         from modelexpress.vmm.backend import CudaVmmBackend
@@ -227,6 +267,163 @@ class TestUseArenaWithMemPool:
         finally:
             a1.close()
             a2.close()
+
+
+class TestUseArenaPoolLifetime:
+    """use_arena gives each scope its own MemPool and drops it while the
+    arena is still active (#1033). Mocks PyTorch, so no CUDA needed."""
+
+    def test_pool_released_before_arena_deactivates(self, monkeypatch):
+        from contextlib import contextmanager
+
+        torch = pytest.importorskip("torch")
+        import torch.cuda.memory as torch_cuda_memory
+
+        from modelexpress.vmm import hook as vmm_hook
+
+        events = []
+
+        class FakePool:
+            def __init__(self, allocator=None):
+                events.append("pool_created")
+
+            def __del__(self):
+                events.append(
+                    "pool_released_while_active"
+                    if vmm_hook._active_arena is not None
+                    else "pool_released_after_deactivate"
+                )
+
+        @contextmanager
+        def fake_use_mem_pool(pool, device=None):
+            events.append("pool_entered")
+            yield
+
+        class FakeExt:
+            @staticmethod
+            def set_active_arena(capsule):
+                events.append("activate" if capsule is not None else "deactivate")
+
+        class FakeAlloc:
+            def allocator(self):
+                return object()
+
+        class FakeArena:
+            capsule = object()
+
+        monkeypatch.setattr(vmm_hook, "_callbacks_initialized", True)
+        monkeypatch.setattr(vmm_hook, "_pluggable_alloc", FakeAlloc())
+        monkeypatch.setattr(vmm_hook, "_vmm_alloc_ext", FakeExt)
+        monkeypatch.setattr(torch_cuda_memory, "MemPool", FakePool)
+        monkeypatch.setattr(torch.cuda, "use_mem_pool", fake_use_mem_pool)
+
+        for _ in range(2):
+            with vmm_hook.use_arena(FakeArena(), device=0):
+                pass
+
+        one_scope = [
+            "activate",
+            "pool_created",
+            "pool_entered",
+            "pool_released_while_active",
+            "deactivate",
+        ]
+        assert events == one_scope * 2
+
+    def test_pool_retained_when_release_idle_is_false(self, monkeypatch):
+        from contextlib import contextmanager
+
+        torch = pytest.importorskip("torch")
+        import torch.cuda.memory as torch_cuda_memory
+
+        from modelexpress.vmm import hook as vmm_hook
+
+        events = []
+
+        class FakePool:
+            def __init__(self, allocator=None):
+                events.append("pool_created")
+
+            def __del__(self):
+                events.append("pool_released")
+
+        @contextmanager
+        def fake_use_mem_pool(pool, device=None):
+            yield
+
+        class FakeExt:
+            @staticmethod
+            def set_active_arena(capsule):
+                events.append("activate" if capsule is not None else "deactivate")
+
+        class FakeAlloc:
+            def allocator(self):
+                return object()
+
+        class FakeArena:
+            capsule = object()
+
+        monkeypatch.setattr(vmm_hook, "_callbacks_initialized", True)
+        monkeypatch.setattr(vmm_hook, "_pluggable_alloc", FakeAlloc())
+        monkeypatch.setattr(vmm_hook, "_vmm_alloc_ext", FakeExt)
+        monkeypatch.setattr(vmm_hook, "_retained_pools", [])
+        monkeypatch.setattr(torch_cuda_memory, "MemPool", FakePool)
+        monkeypatch.setattr(torch.cuda, "use_mem_pool", fake_use_mem_pool)
+
+        with vmm_hook.use_arena(FakeArena(), device=0, release_idle=False):
+            pass
+
+        assert events == ["activate", "pool_created", "deactivate"]
+        assert len(vmm_hook._retained_pools) == 1
+
+    @pytest.mark.parametrize(
+        ("version", "expected"),
+        [
+            ("2.10.0+cu128", False),
+            ("2.12.1", False),
+            ("2.13.0", True),
+            ("2.14.0+cu130", True),
+        ],
+    )
+    def test_pool_release_safe_in_pool_scope_by_torch_version(
+        self, monkeypatch, version, expected
+    ):
+        torch = pytest.importorskip("torch")
+        from torch.torch_version import TorchVersion
+
+        from modelexpress.vmm import hook as vmm_hook
+
+        monkeypatch.setattr(torch, "__version__", TorchVersion(version))
+        assert vmm_hook.pool_release_safe_in_pool_scope() is expected
+
+    def test_nesting_check_runs_before_pool_creation(self, monkeypatch):
+        torch = pytest.importorskip("torch")
+        import torch.cuda.memory as torch_cuda_memory
+
+        from modelexpress.vmm import hook as vmm_hook
+
+        created = []
+
+        class FakePool:
+            def __init__(self, allocator=None):
+                created.append(self)
+
+        class FakeAlloc:
+            def allocator(self):
+                return object()
+
+        class FakeArena:
+            capsule = object()
+
+        monkeypatch.setattr(vmm_hook, "_callbacks_initialized", True)
+        monkeypatch.setattr(vmm_hook, "_pluggable_alloc", FakeAlloc())
+        monkeypatch.setattr(vmm_hook, "_active_arena", FakeArena())
+        monkeypatch.setattr(torch_cuda_memory, "MemPool", FakePool)
+
+        with pytest.raises(RuntimeError, match="already active"):
+            with vmm_hook.use_arena(FakeArena(), device=0):
+                pass
+        assert created == []
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +468,51 @@ class TestOptionalExtension:
 
         with pytest.raises(ArenaUnavailableError, match="not available"):
             vmm_hook._ensure_callbacks_initialized()
+
+    @pytest.mark.parametrize(
+        ("version", "supported"),
+        [
+            ("2.6.0+cu124", False),
+            ("2.7.1", False),
+            ("2.8.0", True),
+            ("2.14.0+cu130", True),
+        ],
+    )
+    def test_ensure_callbacks_refuses_torch_below_2_8(
+        self, monkeypatch, version, supported
+    ):
+        """Below torch 2.8 the init path raises before building any
+        allocator; from 2.8 it does not refuse on version."""
+        torch = pytest.importorskip("torch")
+        from torch.torch_version import TorchVersion
+
+        from modelexpress.vmm import hook as vmm_hook
+        from modelexpress.vmm.hook import ArenaUnavailableError
+
+        monkeypatch.setattr(torch, "__version__", TorchVersion(version))
+        monkeypatch.setattr(vmm_hook, "_callbacks_initialized", False)
+        monkeypatch.setattr(vmm_hook, "ARENA_AVAILABLE", True)
+        monkeypatch.setattr(
+            vmm_hook, "_vmm_alloc_ext", types.SimpleNamespace(__file__="ext.so")
+        )
+
+        built = []
+
+        def fake_allocator(*args):
+            built.append(args)
+            raise RuntimeError("stop after version gate")
+
+        monkeypatch.setattr(torch.cuda, "CUDAPluggableAllocator", fake_allocator)
+
+        assert vmm_hook.arena_supported_torch() is supported
+        if supported:
+            with pytest.raises(RuntimeError, match="stop after version gate"):
+                vmm_hook._ensure_callbacks_initialized()
+            assert len(built) == 1
+        else:
+            with pytest.raises(ArenaUnavailableError, match="2.8"):
+                vmm_hook._ensure_callbacks_initialized()
+            assert built == []
 
     def test_vllm_loader_falls_back_to_nullcontext(self, monkeypatch, caplog):
         """When MX_VMM_ARENA=1 but ARENA_AVAILABLE=False, the arena
@@ -469,7 +711,7 @@ class TestLoaderLifecycle:
         if use_arena_factory is None:
 
             @contextmanager
-            def _stub_use_arena(arena, device):
+            def _stub_use_arena(arena, device, release_idle=True):
                 yield
 
             monkeypatch.setattr("modelexpress.vmm.hook.use_arena", _stub_use_arena)
@@ -543,7 +785,7 @@ class TestLoaderLifecycle:
         entered: list[object] = []
 
         @contextmanager
-        def _recording_use_arena(arena, device):
+        def _recording_use_arena(arena, device, release_idle=True):
             entered.append(arena)
             yield
 
@@ -580,7 +822,7 @@ class TestLoaderLifecycle:
         entered: list[object] = []
 
         @contextmanager
-        def _recording_use_arena(arena, device):
+        def _recording_use_arena(arena, device, release_idle=True):
             entered.append(arena)
             yield
 
