@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch.nn as nn
 
 from .. import envs
-from ..adapter import EngineAdapter, StrategyFailed
+from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import host_resident_parameters, log_tensor_summary
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
@@ -224,7 +224,16 @@ def _init_nixl_manager(
         listen_port=listen_port,
         accelerator_backend=accelerator_backend,
     )
-    manager.initialize()
+    try:
+        manager.initialize()
+    except Exception:
+        try:
+            manager.shutdown()
+        except Exception as cleanup_error:
+            raise StrategyRecoveryError(
+                f"Failed to shut down partially initialized NIXL manager: {cleanup_error}"
+            ) from cleanup_error
+        raise
     logger.debug(f"[Worker {global_rank}] NIXL manager initialized")
     return manager
 
@@ -253,8 +262,8 @@ def register_tensors(
 ) -> None:
     """Collect model tensors and register them with NIXL.
 
-    Failures are logged but do not raise — the worker continues without
-    P2P serving capability.
+    Registration failures disable P2P serving. A draft receiver that cannot
+    be shut down instead raises StrategyRecoveryError to prevent unsafe retry.
 
     Args:
         reuse_discovered: If True, skip tensor discovery
@@ -377,7 +386,7 @@ def register_tensors(
             # sub-range of the arena reserve) would restore single-MR here.
             logger.debug(
                 f"[Worker {ctx.global_rank}] Appending draft tensors to the "
-                "shared NIXL registration..."
+                "NIXL registration..."
             )
             ctx.nixl_manager.register_additional_tensors(ctx.tensors)
         elif not ctx.nixl_manager.tensor_descriptors:
@@ -392,7 +401,7 @@ def register_tensors(
                 ctx.nixl_manager.register_tensors(ctx.tensors)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
     except Exception as e:
-        if ctx.p2p_role == "draft":
+        if ctx.p2p_role == "draft" and ctx.nixl_manager is ctx.shared_nixl_manager:
             # Never publish draft descriptors that are not registered; the
             # shared agent itself stays with the main load.
             ctx.nixl_manager = None
@@ -411,16 +420,24 @@ def register_tensors(
             #    so a half-initialized one gets advertised to the MX server and
             #    peers select a source that cannot transfer.
             try:
-                ctx.nixl_manager.shutdown()
-            except Exception:
+                ctx.nixl_manager.shutdown(
+                    **({"strict": True} if ctx.p2p_role == "draft" else {})
+                )
+            except Exception as cleanup_error:
+                if ctx.p2p_role == "draft":
+                    raise StrategyRecoveryError(
+                        f"Failed to shut down draft receive manager after "
+                        f"registration failure: {cleanup_error}"
+                    ) from cleanup_error
                 logger.warning(
                     f"[Worker {ctx.global_rank}] Failed to shut down NIXL manager "
                     "after registration failure; the metadata listener port may "
                     "stay bound",
                     exc_info=True,
                 )
-            finally:
-                ctx.nixl_manager = None
+            ctx.nixl_manager = None
+            if ctx.p2p_role == "draft":
+                clear_exception_tracebacks(e)
         logger.warning(
             f"[Worker {ctx.global_rank}] NIXL registration failed, "
             f"worker will continue without P2P serving: {e}"

@@ -46,7 +46,7 @@ class FakeManager:
     def register_additional_tensors(self, tensors):
         raise RuntimeError("NIXL_ERR_BACKEND")
 
-    def shutdown(self):
+    def shutdown(self, *, strict=False):
         self.shutdown_calls += 1
         if self.shutdown_raises:
             raise RuntimeError("agent already gone")

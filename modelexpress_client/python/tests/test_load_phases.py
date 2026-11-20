@@ -16,8 +16,8 @@ into the model, so a strategy reports a phase failure as a mutated one.
 
 Registration has to see the model in its final layout, so the default
 finalize() ends with it rather than load(). RDMA overrides finalize() without
-it: its target buffers must carry registrations before the source can write
-into them, so it registers mid-transfer.
+that default: its target buffers must carry registrations before the source can
+write into them. Drafts then hand their finalized tensors to the shared agent.
 
 Run: pytest tests/test_load_phases.py
 """

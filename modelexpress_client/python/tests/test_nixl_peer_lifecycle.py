@@ -20,11 +20,13 @@ Run: pytest tests/test_nixl_peer_lifecycle.py
 
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from modelexpress.nixl_transfer import NixlTransferManager
+from modelexpress.types import TensorDescriptor
 
 
 class FakeAgent:
@@ -107,6 +109,65 @@ class TestTracksLoadedPeers:
 
 
 class TestDisconnect:
+    def test_failed_read_release_blocks_shutdown_and_retains_destination(
+        self, monkeypatch, mock_accelerator_backend_cls
+    ):
+        agent = MagicMock()
+        agent.release_xfer_handle.side_effect = RuntimeError("READ still active")
+        mgr = _manager(agent=agent, accelerator=mock_accelerator_backend_cls())
+        tensors = {"weight": torch.ones(4)}
+        mgr._tensors = tensors
+        registration = object()
+        mgr._registered_memory = [registration]
+        release_source = MagicMock()
+
+        def timeout(*args):
+            raise TimeoutError("READ timed out")
+
+        monkeypatch.setattr(mgr, "_wait_for_xfers", timeout)
+        with pytest.raises(TimeoutError, match="READ timed out"):
+            mgr.receive_from_source(
+                b"metadata",
+                [TensorDescriptor("weight", 4096, 16, 0, "torch.float32")],
+                remote_agent_name="source",
+                release_source=release_source,
+            )
+
+        with pytest.raises(RuntimeError, match="READ still active"):
+            mgr.shutdown()
+        assert mgr._agent is agent
+        assert mgr._tensors is tensors
+        assert mgr._registered_memory == [registration]
+        agent.deregister_memory.assert_not_called()
+        agent.remove_remote_agent.assert_not_called()
+        release_source.assert_not_called()
+
+        agent.release_xfer_handle.side_effect = None
+        mgr.shutdown()
+        agent.deregister_memory.assert_called_once_with(registration)
+        release_source.assert_called_once_with()
+        assert mgr._agent is None
+
+    def test_strict_shutdown_keeps_failed_registrations_retryable(self):
+        agent = MagicMock()
+        agent.deregister_memory.side_effect = RuntimeError("registration is busy")
+        mgr = _manager(agent=agent)
+        registration = object()
+        mgr._registered_memory = [registration]
+        tensors = {"weight": object()}
+        mgr._tensors = tensors
+
+        with pytest.raises(RuntimeError, match="registration is busy"):
+            mgr.shutdown(strict=True)
+        assert mgr._agent is agent
+        assert mgr._registered_memory == [registration]
+        assert mgr._tensors is tensors
+
+        agent.deregister_memory.side_effect = None
+        mgr.shutdown(strict=True)
+        assert agent.deregister_memory.call_count == 2
+        assert mgr._agent is None
+
     def test_manager_registers_process_exit_teardown_once(self):
         mgr = _manager()
         with (

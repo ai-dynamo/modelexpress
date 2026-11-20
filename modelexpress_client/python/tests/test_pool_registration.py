@@ -803,6 +803,9 @@ class TestHostMemoryRegistration:
             call("vram-handle"),
             call("dram-handle"),
         ]
+        assert mgr.receive_cleanup_pending
+        mgr._agent.release_xfer_handle.side_effect = None
+        mgr.shutdown()
 
     def test_descriptors_record_memory_type_and_host_device(self):
         mgr = self._make_manager()
