@@ -56,7 +56,11 @@ class AcceleratorBackend(Protocol):
         ...
 
     def tensor_mem_type(self, tensor: torch.Tensor) -> int:
-        """Return the ``p2p_pb2.TensorMemoryType`` NIXL registers ``tensor`` as."""
+        """Return the ``p2p_pb2.TensorMemoryType`` NIXL registers ``tensor`` as.
+
+        Raises ``ValueError`` for a tensor neither on this accelerator nor in
+        host memory.
+        """
         ...
 
     def supports_rdma_p2p(self) -> bool:

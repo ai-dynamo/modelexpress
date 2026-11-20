@@ -3077,6 +3077,32 @@ class TestPublishMetadataAndReady:
             "layer.0.weight", "layer.1.weight", "layer.2.weight",
         }
 
+    def test_publish_without_backend_classifies_with_manager_backend(self):
+        """Callers outside MX (Dynamo's GPU memory service) omit the backend."""
+        from modelexpress.metadata.publish import publish_metadata_and_ready
+
+        mx_client = MagicMock()
+        nixl_manager = MagicMock()
+        nixl_manager.nixl_metadata = b"nixl-data"
+        nixl_manager.accelerator_backend = CudaAcceleratorBackend()
+
+        with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
+             patch("modelexpress.metadata.publish.PublisherThread") as publisher_cls:
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                {"engram.weight": torch.zeros(4)},
+                worker_rank=2,
+                device_id=2,
+                identity=_make_identity("my-model"),
+                worker_id="inst-uuid",
+            )
+            publisher_cls.call_args.kwargs["publish_fn"]()
+
+        (tensor,) = mx_client.publish_metadata.call_args.args[1].tensor_source.tensors
+        assert tensor.mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        assert tensor.device_id == 0
+
     def test_publish_fn_retries_publish(self):
         from modelexpress.metadata.publish import publish_metadata_and_ready
 

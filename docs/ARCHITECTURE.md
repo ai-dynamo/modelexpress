@@ -1039,7 +1039,7 @@ Each GPU worker generates a unique `worker_id` (`uuid4().hex[:8]`) at init and p
 
 ### Tensor Discovery
 
-The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. `CudaAcceleratorBackend` and `XpuAcceleratorBackend` are the concrete backends today, so collection targets CUDA or XPU tensors depending on the active backend. This discovers three categories:
+The loader uses `iter_module_tensors()` (in `tensor_utils.py`) to walk the full PyTorch module tree via `named_parameters()` and `named_buffers()`, keeping tensors accepted by the active `AcceleratorBackend.is_accel_tensor()` predicate after post-processing. `CudaAcceleratorBackend` and `XpuAcceleratorBackend` are the concrete backends today, so collection targets CUDA or XPU tensors depending on the active backend. The vLLM and SGLang adapters also pass `include_host_parameters=True`, which adds parameters in host memory (see [Parameters in Host Memory](#parameters-in-host-memory)). This discovers three categories:
 
 | Category | Source | Example |
 |----------|--------|---------|
@@ -1255,9 +1255,18 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 
 Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source crashed/restarted (stale rkeys), UCX transport misconfiguration, premature target connection. Fix: use robust ready coordination, check for restarts, enable `UCX_LOG_LEVEL=DEBUG`.
 
-### Parameters in Host Memory Skip RDMA
+### Parameters in Host Memory
 
-Tensor discovery only collects accelerator tensors, so a parameter in host memory is never transferred and the target would serve its dummy values. `register_tensors()` therefore skips NIXL registration when the model has any non-empty parameter outside accelerator memory: such a worker serves inference but never publishes itself as a P2P source, so targets fall back to the next strategy. A target whose own model has such parameters skips registration the same way and falls back instead of receiving. Known case: DeepSeek V4.1 Engram tables, which vLLM keeps in pinned host memory by default. `--engram-config '{"cpu_offload": false}'` keeps them on the GPU so RDMA can transfer them, at the cost of the tables' GPU memory on every rank.
+Some models keep parameters in pinned host memory, such as the DeepSeek V4.1 Engram tables.
+
+The vLLM and SGLang adapters discover these parameters (`EngineAdapter.discovers_host_parameters()`). On the NIXL transport they move as NIXL DRAM next to the GPU weights. SGLang's `transfer_engine` transport registers them with Mooncake, which, at the time of writing, detects host memory itself. Host buffers are not collected.
+
+A guard in `register_tensors()` keeps a target from serving initial values for parameters that discovery does not collect. It skips NIXL registration when the model has a non-empty parameter that is:
+
+- For engines that discover host parameters: in neither accelerator nor host memory, for example left on `meta`.
+- For other engines: outside accelerator memory, including host memory.
+
+The worker then serves inference but never publishes itself as a P2P source, and a target falls back to the next strategy instead of receiving. This applies to TensorRT-LLM models with host parameters, such as DeepSeek V4, whose Engram tables are, at the time of writing, always in host memory.
 
 ### Long Source Warmup
 

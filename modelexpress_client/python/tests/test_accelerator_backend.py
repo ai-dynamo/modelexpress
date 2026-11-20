@@ -88,6 +88,8 @@ class TestCudaAcceleratorBackend:
 
         assert backend.tensor_mem_type(FakeCudaTensor()) == p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
         assert backend.tensor_mem_type(torch.zeros(1)) == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        with pytest.raises(ValueError, match="meta"):
+            backend.tensor_mem_type(torch.empty(1, device="meta"))
 
     def test_accelerator_backend_for_cuda(self):
         assert isinstance(
@@ -199,6 +201,8 @@ class TestXpuAcceleratorBackend:
 
         assert backend.tensor_mem_type(FakeTensor("xpu")) == p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
         assert backend.tensor_mem_type(FakeTensor("cpu")) == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        with pytest.raises(ValueError, match="cuda"):
+            backend.tensor_mem_type(FakeTensor("cuda"))
 
     def test_xpu_backend_torch_device(self):
         assert XpuAcceleratorBackend().torch_device(1) == torch.device("xpu", 1)

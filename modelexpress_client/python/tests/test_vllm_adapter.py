@@ -1639,6 +1639,20 @@ class TestTargetSharedDraftPrefixes:
         )
 
 
+def test_discovery_includes_host_parameters(mock_accelerator_backend_cls):
+    adapter = VllmAdapter(_context_config(load_device="cpu"), _model_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="meta")
+    model = nn.Module()
+    model.attn = nn.Parameter(torch.empty(4, device="meta"))
+    model.engram = nn.Parameter(torch.zeros(4))
+
+    registered = adapter.discover_tensors(LoadResult(value=model, model=model))
+
+    assert adapter.discovers_host_parameters() is True
+    assert set(registered) == {"attn", "engram"}
+    assert registered["engram"].data_ptr() == model.engram.data_ptr()
+
+
 @pytest.mark.parametrize(
     "class_module,class_name,excluded",
     [

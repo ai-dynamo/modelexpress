@@ -24,7 +24,9 @@ from modelexpress.load_strategy.context import LoadResult
 from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
 
-def _ctx(backend):
+def _ctx(backend, *, discovers_host_parameters=False):
+    adapter = MagicMock()
+    adapter.discovers_host_parameters.return_value = discovers_host_parameters
     return SimpleNamespace(
         p2p_enabled=True,
         p2p_role="main",
@@ -35,7 +37,7 @@ def _ctx(backend):
         tensors={},
         nixl_manager=None,
         vmm_arena=None,
-        adapter=MagicMock(),
+        adapter=adapter,
         accelerator_backend=backend,
         mx_client=MagicMock(),
     )
@@ -123,6 +125,39 @@ def test_source_with_accelerator_parameters_registers(patched, backend):
 
     assert ctx.nixl_manager is manager
     manager.register_tensors.assert_called_once_with({"attn": model.attn})
+
+
+def test_source_registers_host_parameters_when_discovery_includes_them(
+    patched, backend
+):
+    ctx = _ctx(backend, discovers_host_parameters=True)
+    model = _model(host_table=True)
+    discovered = {"attn": model.attn, "engram": model.engram}
+    ctx.adapter.discover_tensors.return_value = discovered
+    manager = MagicMock()
+    manager.tensor_descriptors = []
+
+    with patch.object(base, "_init_nixl_manager", return_value=manager):
+        base.register_tensors(LoadResult(value=model, model=model), ctx)
+
+    assert ctx.nixl_manager is manager
+    manager.register_tensors.assert_called_once_with(discovered)
+
+
+def test_source_with_undiscovered_device_parameter_does_not_register(
+    patched, mock_accelerator_backend_cls
+):
+    # The meta parameter is on neither this accelerator nor the host, so
+    # discovery would skip it even with host parameters included.
+    ctx = _ctx(mock_accelerator_backend_cls(), discovers_host_parameters=True)
+    model = _model(host_table=True)
+
+    with patch.object(base, "_init_nixl_manager") as init:
+        base.register_tensors(LoadResult(value=model, model=model), ctx)
+
+    ctx.adapter.discover_tensors.assert_not_called()
+    init.assert_not_called()
+    assert ctx.nixl_manager is None
 
 
 def test_target_with_host_parameters_falls_back_before_receiving(

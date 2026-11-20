@@ -443,6 +443,9 @@ class VllmAdapter(EngineAdapter):
             and cls.__name__ == "KimiK3LatentMoETailOp"
         )
 
+    def discovers_host_parameters(self) -> bool:
+        return True
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
@@ -462,6 +465,7 @@ class VllmAdapter(EngineAdapter):
             result.model,
             self.accelerator_backend,
             preserve_local=local_tensors,
+            include_host_parameters=self.discovers_host_parameters(),
         )
         if _is_speculative_draft(self.vllm_config, self.model_config):
             prefixes = _target_shared_draft_prefixes(result.model, self.vllm_config)
