@@ -1257,11 +1257,16 @@ Target fails with `Remote access error on mlx5_X:1/IB`. Common causes: source cr
 
 ### Parameters in Host Memory
 
-Some models keep parameters in pinned host memory: DeepSeek V4.1 Engram tables and Qwen4-Exp per-layer embedding tables. vLLM does so by default for both (`EngramConfig.cpu_offload`); SGLang when configured (`--engram-config '{"placement": "cpu"}'`, `--ple-offload-embedding`).
+Some models keep parameters in pinned host memory, such as the DeepSeek V4.1 Engram tables.
 
-The vLLM and SGLang adapters discover these parameters (`EngineAdapter.discovers_host_parameters()`). On the NIXL transport they move as NIXL DRAM next to the GPU weights. SGLang's `transfer_engine` transport registers them with Mooncake, which detects host memory itself. Host buffers are not collected.
+The vLLM and SGLang adapters discover these parameters (`EngineAdapter.discovers_host_parameters()`). On the NIXL transport they move as NIXL DRAM next to the GPU weights. SGLang's `transfer_engine` transport registers them with Mooncake, which, at the time of writing, detects host memory itself. Host buffers are not collected.
 
-A parameter that discovery skips would keep the target's initial values, so `register_tensors()` skips NIXL registration when the model has any non-empty parameter discovery does not collect: one outside accelerator memory for engines that do not discover host parameters, and one on any other device (for example `meta`) for every engine. The worker serves inference but never publishes itself as a P2P source, and a target falls back to the next strategy instead of receiving. This applies to TensorRT-LLM models with host parameters, such as DeepSeek V4, whose Engram tables are always in host memory.
+A guard in `register_tensors()` keeps a target from serving initial values for parameters that discovery does not collect. It skips NIXL registration when the model has a non-empty parameter that is:
+
+- For engines that discover host parameters: in neither accelerator nor host memory, for example left on `meta`.
+- For other engines: outside accelerator memory, including host memory.
+
+The worker then serves inference but never publishes itself as a P2P source, and a target falls back to the next strategy instead of receiving. This applies to TensorRT-LLM models with host parameters, such as DeepSeek V4, whose Engram tables are, at the time of writing, always in host memory.
 
 ### Long Source Warmup
 

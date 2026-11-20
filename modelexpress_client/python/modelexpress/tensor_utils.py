@@ -380,13 +380,14 @@ def _discovers_parameter(
     )
 
 
-def untransferred_parameters(
+def undiscovered_parameters(
     module: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
     *,
     include_host_parameters: bool = False,
 ) -> list[str]:
-    """Return names of non-empty parameters that tensor discovery skips.
+    """Return names of non-empty parameters in memory that tensor discovery
+    does not collect from.
 
     A target would keep its initial values for these, e.g. DeepSeek V4.1
     Engram tables in pinned host memory when host parameters are not

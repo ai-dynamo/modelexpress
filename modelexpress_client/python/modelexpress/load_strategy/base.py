@@ -17,7 +17,7 @@ import torch.nn as nn
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import log_tensor_summary, untransferred_parameters
+from ..tensor_utils import log_tensor_summary, undiscovered_parameters
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
@@ -323,15 +323,15 @@ def register_tensors(
             # A peer would keep dummy values for parameters discovery skips.
             # Raise instead of returning so the handler below also releases a
             # manager that artifact install already created.
-            skipped = untransferred_parameters(
+            skipped = undiscovered_parameters(
                 result.model,
                 ctx.accelerator_backend,
                 include_host_parameters=ctx.adapter.discovers_host_parameters(),
             )
             if skipped:
                 raise RuntimeError(
-                    f"{len(skipped)} parameters would not be transferred "
-                    f"(first: {skipped[0]})"
+                    f"{len(skipped)} parameters are in memory that discovery "
+                    f"does not collect from (first: {skipped[0]})"
                 )
 
             ctx.tensors = ctx.adapter.discover_tensors(result)

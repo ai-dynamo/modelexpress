@@ -19,7 +19,7 @@ from modelexpress.tensor_utils import (
     collect_module_tensors,
     safe_checksum,
     storage_view,
-    untransferred_parameters,
+    undiscovered_parameters,
 )
 
 
@@ -359,11 +359,11 @@ class TestStorageView:
 
 
 # ---------------------------------------------------------------------------
-# untransferred_parameters
+# undiscovered_parameters
 # ---------------------------------------------------------------------------
 
 
-class TestUntransferredParameters:
+class TestUndiscoveredParameters:
     def test_lists_non_empty_parameters_outside_accelerator(
         self, mock_accelerator_backend_cls
     ):
@@ -373,13 +373,13 @@ class TestUntransferredParameters:
         model.on_host = nn.Parameter(torch.empty(4))
         model.empty_on_host = nn.Parameter(torch.empty(0))
         model.register_buffer("host_buffer", torch.empty(4))
-        assert untransferred_parameters(model, backend) == ["on_host"]
+        assert undiscovered_parameters(model, backend) == ["on_host"]
 
     def test_empty_when_all_parameters_on_accelerator(
         self, mock_accelerator_backend_cls
     ):
         backend = mock_accelerator_backend_cls(torch_device_type="cpu")
-        assert untransferred_parameters(nn.Linear(4, 4), backend) == []
+        assert undiscovered_parameters(nn.Linear(4, 4), backend) == []
 
     @pytest.mark.parametrize(
         ("include_host_parameters", "expected"),
@@ -393,7 +393,7 @@ class TestUntransferredParameters:
         model.on_host = nn.Parameter(torch.empty(4))
         model.on_meta = nn.Parameter(torch.empty(4, device="meta"))
         assert (
-            untransferred_parameters(
+            undiscovered_parameters(
                 model, backend, include_host_parameters=include_host_parameters
             )
             == expected
