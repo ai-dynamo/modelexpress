@@ -360,9 +360,7 @@ def iter_module_tensors(
     results: list[tuple[str, torch.Tensor, str]] = []
 
     for name, param in module.named_parameters():
-        if backend.is_accel_tensor(param) or (
-            include_host_parameters and param.device.type == "cpu"
-        ):
+        if _discovers_parameter(param, backend, include_host_parameters):
             results.append((name, param, "parameter"))
 
     for name, buf in module.named_buffers():
@@ -372,21 +370,34 @@ def iter_module_tensors(
     return results
 
 
-def host_resident_parameters(
+def _discovers_parameter(
+    param: torch.Tensor,
+    backend: AcceleratorBackend,
+    include_host_parameters: bool,
+) -> bool:
+    return backend.is_accel_tensor(param) or (
+        include_host_parameters and param.device.type == "cpu"
+    )
+
+
+def untransferred_parameters(
     module: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
+    *,
+    include_host_parameters: bool = False,
 ) -> list[str]:
-    """Return names of non-empty parameters outside accelerator memory.
+    """Return names of non-empty parameters that tensor discovery skips.
 
-    For engines whose discovery skips host parameters, a target would keep
-    its initial values for these (e.g. DeepSeek V4.1 Engram tables in pinned
-    host memory).
+    A target would keep its initial values for these, e.g. DeepSeek V4.1
+    Engram tables in pinned host memory when host parameters are not
+    discovered, or a parameter left on the ``meta`` device.
     """
     backend = _resolve_accelerator_backend(accelerator_backend)
     return [
         name
         for name, param in module.named_parameters()
-        if param.numel() > 0 and not backend.is_accel_tensor(param)
+        if param.numel() > 0
+        and not _discovers_parameter(param, backend, include_host_parameters)
     ]
 
 
@@ -446,7 +457,9 @@ def collect_module_tensors(
     backend = _resolve_accelerator_backend(accelerator_backend)
     local_ranges: dict[torch.device, set[tuple[int, int]]] = {}
     for local in preserve_local:
-        if local.numel() == 0 or not backend.is_accel_tensor(local):
+        if local.numel() == 0 or not _discovers_parameter(
+            local, backend, include_host_parameters
+        ):
             continue
         if not local.is_contiguous():
             raise ValueError("Local runtime tensors must be contiguous")

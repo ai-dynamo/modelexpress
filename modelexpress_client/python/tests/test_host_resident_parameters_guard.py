@@ -144,6 +144,22 @@ def test_source_registers_host_parameters_when_discovery_includes_them(
     manager.register_tensors.assert_called_once_with(discovered)
 
 
+def test_source_with_undiscovered_device_parameter_does_not_register(
+    patched, mock_accelerator_backend_cls
+):
+    # The meta parameter is on neither this accelerator nor the host, so
+    # discovery would skip it even with host parameters included.
+    ctx = _ctx(mock_accelerator_backend_cls(), discovers_host_parameters=True)
+    model = _model(host_table=True)
+
+    with patch.object(base, "_init_nixl_manager") as init:
+        base.register_tensors(LoadResult(value=model, model=model), ctx)
+
+    ctx.adapter.discover_tensors.assert_not_called()
+    init.assert_not_called()
+    assert ctx.nixl_manager is None
+
+
 def test_target_with_host_parameters_falls_back_before_receiving(
     patched, backend, monkeypatch
 ):

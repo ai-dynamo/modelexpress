@@ -1261,7 +1261,7 @@ Some models keep parameters in pinned host memory: DeepSeek V4.1 Engram tables a
 
 The vLLM and SGLang adapters discover these parameters (`EngineAdapter.discovers_host_parameters()`). On the NIXL transport they move as NIXL DRAM next to the GPU weights. SGLang's `transfer_engine` transport registers them with Mooncake, which detects host memory itself. Host buffers are not collected.
 
-An engine whose discovery does not collect host parameters would leave a target with their initial values, so `register_tensors()` skips NIXL registration when such a model has any non-empty parameter outside accelerator memory. The worker serves inference but never publishes itself as a P2P source, and a target falls back to the next strategy instead of receiving. This applies to TensorRT-LLM, whose DeepSeek V4 Engram tables are always in host memory.
+A parameter that discovery skips would keep the target's initial values, so `register_tensors()` skips NIXL registration when the model has any non-empty parameter discovery does not collect: one outside accelerator memory for engines that do not discover host parameters, and one on any other device (for example `meta`) for every engine. The worker serves inference but never publishes itself as a P2P source, and a target falls back to the next strategy instead of receiving. This applies to TensorRT-LLM models with host parameters, such as DeepSeek V4, whose Engram tables are always in host memory.
 
 ### Long Source Warmup
 

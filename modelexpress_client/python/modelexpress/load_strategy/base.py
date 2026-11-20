@@ -17,7 +17,7 @@ import torch.nn as nn
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
-from ..tensor_utils import host_resident_parameters, log_tensor_summary
+from ..tensor_utils import log_tensor_summary, untransferred_parameters
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
 from .context import LoadContext, LoadResult
 
@@ -320,18 +320,19 @@ def register_tensors(
                 )
                 return
 
-            # When discovery skips host parameters, a peer would keep dummy
-            # values for them. Raise instead of returning so the handler below
-            # also releases a manager that artifact install already created.
-            if not ctx.adapter.discovers_host_parameters():
-                host_params = host_resident_parameters(
-                    result.model, ctx.accelerator_backend
+            # A peer would keep dummy values for parameters discovery skips.
+            # Raise instead of returning so the handler below also releases a
+            # manager that artifact install already created.
+            skipped = untransferred_parameters(
+                result.model,
+                ctx.accelerator_backend,
+                include_host_parameters=ctx.adapter.discovers_host_parameters(),
+            )
+            if skipped:
+                raise RuntimeError(
+                    f"{len(skipped)} parameters would not be transferred "
+                    f"(first: {skipped[0]})"
                 )
-                if host_params:
-                    raise RuntimeError(
-                        f"{len(host_params)} parameters are outside accelerator "
-                        f"memory (first: {host_params[0]})"
-                    )
 
             ctx.tensors = ctx.adapter.discover_tensors(result)
             if ctx.p2p_role == "draft":
