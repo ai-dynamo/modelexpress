@@ -2303,6 +2303,54 @@ def test_sglang_instanttensor_iter_uses_instanttensor_load_format():
     assert weights == [("w", tensor)]
 
 
+def test_sglang_instanttensor_iter_drops_default_loader_options():
+    extra_config = {"enable_multithread_load": True, "num_threads": 8, "enable_gds": True, "other": 1}
+    load_config = _load_config(model_loader_extra_config=extra_config)
+    adapter = SglangAdapter(load_config, _model_config(), _device_config())
+    patcher, loader_cls, _ = _patch_sglang_default_loader([])
+
+    with patcher:
+        adapter.build_instanttensor_weight_iter(model=MagicMock())
+
+    assert loader_cls.call_args.args[0].model_loader_extra_config == {"other": 1}
+    assert load_config.model_loader_extra_config is extra_config
+    assert len(extra_config) == 4
+
+
+def test_sglang_apply_weight_iter_uses_sglang_load_weights_only():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    weights_iter = iter([("w", torch.randn(2))])
+    model = MagicMock()
+    loader_cls = SimpleNamespace(load_weights_only=MagicMock())
+    result = LoadResult(value=None, model=model)
+
+    with patch.dict(
+        sys.modules,
+        {"sglang.srt.model_loader.loader": SimpleNamespace(DefaultModelLoader=loader_cls)},
+    ):
+        assert adapter.apply_weight_iter(result, weights_iter) is result
+
+    loader_cls.load_weights_only.assert_called_once_with(
+        model, weights_iter, adapter.target_device
+    )
+    model.load_weights.assert_not_called()
+
+
+def test_sglang_apply_weight_iter_without_load_weights_only_calls_model():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    weights_iter = iter([("w", torch.randn(2))])
+    model = MagicMock()
+    result = LoadResult(value=None, model=model)
+
+    with patch.dict(
+        sys.modules,
+        {"sglang.srt.model_loader.loader": SimpleNamespace(DefaultModelLoader=SimpleNamespace())},
+    ):
+        adapter.apply_weight_iter(result, weights_iter)
+
+    model.load_weights.assert_called_once_with(weights_iter)
+
+
 def test_sglang_instanttensor_iter_requires_model():
     adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
     with pytest.raises(RuntimeError, match="requires result.model"):
