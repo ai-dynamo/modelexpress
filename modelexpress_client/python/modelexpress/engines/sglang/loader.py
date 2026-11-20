@@ -20,13 +20,16 @@ import torch.nn as nn
 from ... import envs, p2p_pb2
 from ...load_strategy import (
     LoadContext,
+    publish_metadata,
+    register_tensors,
     run_load_strategy_chain,
+    unpublish_metadata,
     validate_load_strategy_chain,
 )
 from ...load_strategy.base import clear_exception_tracebacks
 from ...load_strategy.context import LoadResult
 from ...metadata.payload import tensor_source_metadata, worker_tensor_descriptors
-from ...metadata.publish import _heartbeat_threads
+from ...metadata.publish import _heartbeat_threads, extend_published_tensors
 from ...metadata.publisher import PublisherThread
 from ...metrics import enable_metrics
 from ...metrics import metrics as selection_metrics
@@ -195,6 +198,8 @@ class MxModelLoader:
         self._ctx: LoadContext | None = None
         self._strict_draft_publication = False
         self._draft_weight_adapter = None
+        self._transfer_engine_registered = False
+        self._draft_tensors: dict[str, torch.Tensor] = {}
 
     def load_model(
         self,
@@ -393,14 +398,13 @@ class MxModelLoader:
                 # manifest instead of registering a second source under a
                 # colliding mx_source_id.
                 _tensor_registry.setdefault(ctx.device_id, {}).update(ctx.tensors)
+                main_loader = _loader_registry.get(ctx.device_id)
+                if main_loader is not None and ctx.draft_published:
+                    main_loader._draft_tensors = ctx.tensors
             return model
 
         _loader_registry[ctx.device_id] = self
-        _tensor_registry[ctx.device_id] = ctx.tensors
-        if ctx.nixl_manager is not None:
-            _nixl_managers[ctx.device_id] = ctx.nixl_manager
-        else:
-            _nixl_managers.pop(ctx.device_id, None)
+        self._sync_registries(ctx)
 
         with selection_metrics.time_load_phase(
             "sglang", ctx.identity.model_name, "publish"
@@ -441,20 +445,7 @@ class MxModelLoader:
             self.remote_instance_transfer_engine_weight_info = {}
             return result.model.eval()
         self._ctx = ctx
-
-        transfer_engine = getattr(
-            self.load_config, "remote_instance_weight_loader_transfer_engine", None
-        )
-        session_id = getattr(
-            self.load_config,
-            "remote_instance_weight_loader_transfer_engine_session_id",
-            None,
-        )
-        if transfer_engine is None or not session_id:
-            raise RuntimeError(
-                "SGLang ModelExpress transfer_engine transport requires an "
-                "initialized SGLang TransferEngine and session id."
-            )
+        transfer_engine, session_id = self._transfer_engine_handles()
         logger.info(
             "[Worker %s] SGLang MxModelLoader starting transfer_engine "
             "(model=%s)",
@@ -545,6 +536,7 @@ class MxModelLoader:
                 self.remote_instance_transfer_engine_weight_info = {}
                 return result.model.eval()
         ctx.tensors = tensors
+        self._transfer_engine_registered = True
         self.remote_instance_transfer_engine_weight_info = weight_info
         publish_ok = self._publish_transfer_engine_source(
             ctx=ctx,
@@ -919,6 +911,148 @@ class MxModelLoader:
             ctx.worker_id,
         )
         return True
+
+    def _transfer_engine_handles(self):
+        transfer_engine = getattr(
+            self.load_config, "remote_instance_weight_loader_transfer_engine", None
+        )
+        session_id = getattr(
+            self.load_config,
+            "remote_instance_weight_loader_transfer_engine_session_id",
+            None,
+        )
+        if transfer_engine is None or not session_id:
+            raise RuntimeError(
+                "SGLang ModelExpress transfer_engine transport requires an "
+                "initialized SGLang TransferEngine and session id."
+            )
+        return transfer_engine, session_id
+
+    def before_weights_release(self, *, content_preserved: bool) -> None:
+        """Stop serving before release_memory_occupation unmaps the weights.
+
+        Runs even when ``content_preserved``: a CPU backup still unmaps the GPU
+        pages that peers read.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            return
+        self._stop_serving(ctx)
+
+    def after_weights_resume(self, *, content_preserved: bool) -> None:
+        """Republish after resume_memory_occupation if the weights were kept.
+
+        Without a CPU backup the memory is garbage until reload_model().
+        """
+        ctx = self._ctx
+        if ctx is None or not content_preserved or self._transport() != "nixl":
+            return
+        if ctx.nixl_manager is None:
+            register_tensors(None, ctx, reuse_discovered=True)
+        publish_metadata(ctx)
+        self._sync_registries(ctx)
+
+    def reload_model(
+        self,
+        *,
+        model: nn.Module,
+        model_config: ModelConfig,
+        device_config: DeviceConfig,
+    ) -> None:
+        """Reload the weights in place under the boot worker id and identity.
+
+        SGLang's CUDA graphs need the weights at fixed addresses, so a failed
+        strategy is never followed by a model reinitialization.
+        """
+        ctx = self._ctx
+        if ctx is None:
+            raise RuntimeError(
+                "ModelExpress did not load this model, so it cannot reload it "
+                "in place"
+            )
+        transport = self._transport()
+        if transport != "nixl":
+            raise RuntimeError(
+                "ModelExpress reloads SGLang weights in place only on the 'nixl' "
+                f"transport, not {transport!r}"
+            )
+        self._stop_serving(ctx)
+
+        ctx.is_reload = True
+        ctx.loaded_identity = p2p_pb2.SourceIdentity()
+        ctx.loaded_identity.CopyFrom(ctx.identity)
+        ctx.tensors = {}
+        ctx.adapter.is_reload = True
+        logger.info(
+            "[Worker %s] SGLang MxModelLoader reloading weights in place "
+            "(model=%s, worker_id=%s)",
+            ctx.global_rank,
+            ctx.identity.model_name,
+            ctx.worker_id,
+        )
+        try:
+            self._run_load_strategy_chain(model, ctx)
+            self._republish_draft_tensors(ctx)
+        finally:
+            ctx.adapter.is_reload = False
+            ctx.is_reload = False
+            ctx.loaded_identity = None
+            self._sync_registries(ctx)
+
+    def _republish_draft_tensors(self, ctx: LoadContext) -> None:
+        """Serve the draft pass's tensors again; SGLang reloads only the target."""
+        if not self._draft_tensors or ctx.nixl_manager is None:
+            return
+        try:
+            ctx.nixl_manager.register_additional_tensors(self._draft_tensors)
+            extended = extend_published_tensors(
+                self._draft_tensors,
+                device_id=ctx.device_id,
+                worker_rank=ctx.worker_rank,
+            )
+        except Exception:
+            logger.warning(
+                "[Worker %s] Failed to republish draft tensors after reload",
+                ctx.global_rank,
+                exc_info=True,
+            )
+            return
+        if extended:
+            ctx.tensors.update(self._draft_tensors)
+
+    def _transport(self) -> str:
+        return getattr(self.load_config, "modelexpress_transport", "nixl")
+
+    def _stop_serving(self, ctx: LoadContext) -> None:
+        """Unpublish and release the memory registrations.
+
+        Shutting down NIXL waits for in-flight transfers; unregistering
+        TransferEngine memory does not.
+        """
+        unpublish_metadata(ctx)
+        if ctx.nixl_manager is not None:
+            try:
+                ctx.nixl_manager.shutdown()
+            except Exception:
+                logger.warning(
+                    "[Worker %s] Failed to shut down NIXL manager",
+                    ctx.global_rank,
+                    exc_info=True,
+                )
+            finally:
+                ctx.nixl_manager = None
+                _nixl_managers.pop(ctx.device_id, None)
+        if self._transfer_engine_registered:
+            transfer_engine, _ = self._transfer_engine_handles()
+            self._unregister_transfer_engine_tensors(ctx.tensors, transfer_engine)
+            self._transfer_engine_registered = False
+
+    def _sync_registries(self, ctx: LoadContext) -> None:
+        _tensor_registry[ctx.device_id] = ctx.tensors
+        if ctx.nixl_manager is not None:
+            _nixl_managers[ctx.device_id] = ctx.nixl_manager
+        else:
+            _nixl_managers.pop(ctx.device_id, None)
 
     @property
     def nixl_manager(self) -> NixlTransferManager | None:
