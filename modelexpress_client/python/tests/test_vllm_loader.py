@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 
 from modelexpress import p2p_pb2
+from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.context import LoadResult
@@ -1584,7 +1585,12 @@ class TestMtpDrafterSecondLoad:
         ) as publish:
             publish_metadata(ctx)
 
-        extend.assert_called_once_with(ctx.tensors, device_id=2, worker_rank=5)
+        extend.assert_called_once_with(
+            ctx.tensors,
+            device_id=2,
+            worker_rank=5,
+            accelerator_backend=ctx.accelerator_backend,
+        )
         publish.assert_not_called()
         assert ctx.draft_published is True
 
@@ -2123,10 +2129,27 @@ class TestExtendPublishedTensors:
         t.dtype = torch.bfloat16
         return {f"{prefix}.weight": t}
 
+    def test_protos_carry_tensor_memory_type(self):
+        from modelexpress.metadata.publish import build_tensor_protos
+
+        protos = build_tensor_protos(
+            {"host.weight": torch.zeros(4)},
+            device_id=3,
+            global_rank=3,
+            accelerator_backend=CudaAcceleratorBackend(),
+        )
+        assert protos[0].mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+        assert protos[0].device_id == 0
+
     def test_returns_false_without_publication(self):
         from modelexpress.metadata.publish import extend_published_tensors
 
-        assert extend_published_tensors(self._tensors("x"), device_id=7, worker_rank=7) is False
+        assert extend_published_tensors(
+            self._tensors("x"),
+            device_id=7,
+            worker_rank=7,
+            accelerator_backend=CudaAcceleratorBackend(),
+        ) is False
 
     def test_p2p_mode_extends_running_worker_server(self):
         from modelexpress.metadata import publish as publish_mod
@@ -2135,7 +2158,10 @@ class TestExtendPublishedTensors:
         publish_mod._worker_servers[3] = server
         try:
             assert publish_mod.extend_published_tensors(
-                self._tensors("mx_draft::mtp"), device_id=3, worker_rank=3
+                self._tensors("mx_draft::mtp"),
+                device_id=3,
+                worker_rank=3,
+                accelerator_backend=CudaAcceleratorBackend(),
             ) is True
         finally:
             publish_mod._worker_servers.pop(3, None)
@@ -2190,12 +2216,16 @@ class TestExtendPublishedTensors:
                     device_id=4,
                     identity=_make_identity("my-model"),
                     worker_id="inst",
+                    accelerator_backend=CudaAcceleratorBackend(),
                 )
                 publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
 
                 nixl_manager.nixl_metadata = b"target-and-draft"
                 assert publish_mod.extend_published_tensors(
-                    self._tensors("mx_draft::mtp"), device_id=4, worker_rank=4
+                    self._tensors("mx_draft::mtp"),
+                    device_id=4,
+                    worker_rank=4,
+                    accelerator_backend=CudaAcceleratorBackend(),
                 ) is True
                 publisher.republish.assert_called_once()
 
@@ -2976,6 +3006,7 @@ class TestPublishMetadataAndReady:
                 identity=identity,
                 worker_id="inst-uuid",
                 ready_fn=ready_fn,
+                accelerator_backend=CudaAcceleratorBackend(),
             )
 
         mx_client.publish_metadata.assert_not_called()
@@ -3022,7 +3053,16 @@ class TestPublishMetadataAndReady:
         mock_publisher = MagicMock()
         with patch.dict(os.environ, {"MX_P2P_METADATA": "0"}), \
              patch("modelexpress.metadata.publish.PublisherThread", return_value=mock_publisher) as publisher_cls:
-            publish_metadata_and_ready(mx_client, nixl_manager, tensors, worker_rank=0, device_id=0, identity=identity, worker_id="inst-uuid")
+            publish_metadata_and_ready(
+                mx_client,
+                nixl_manager,
+                tensors,
+                worker_rank=0,
+                device_id=0,
+                identity=identity,
+                worker_id="inst-uuid",
+                accelerator_backend=CudaAcceleratorBackend(),
+            )
             publisher_cls.call_args.kwargs["publish_fn"]()
 
         worker = mx_client.publish_metadata.call_args.args[1]
@@ -3063,6 +3103,7 @@ class TestPublishMetadataAndReady:
                 device_id=0,
                 identity=identity,
                 worker_id="w-1",
+                accelerator_backend=CudaAcceleratorBackend(),
             )
             publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
             result = publish_fn()
@@ -3098,6 +3139,7 @@ class TestPublishMetadataAndReady:
                 device_id=0,
                 identity=identity,
                 worker_id="w-1",
+                accelerator_backend=CudaAcceleratorBackend(),
             )
             publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
             with pytest.raises(RuntimeError, match="Failed to publish metadata after 3 attempts"):
@@ -3132,6 +3174,7 @@ class TestPublishMetadataAndReady:
                 device_id=0,
                 identity=identity,
                 worker_id="w-1",
+                accelerator_backend=CudaAcceleratorBackend(),
             )
             publish_fn = publisher_cls.call_args.kwargs["publish_fn"]
             with pytest.raises(_FakeRpcError, match="permission denied"):
@@ -3166,6 +3209,7 @@ class TestPublishMetadataAndReady:
                 device_id=0,
                 identity=_make_identity(),
                 worker_id="w-1",
+                accelerator_backend=CudaAcceleratorBackend(),
             )
 
             mx_client.publish_metadata.assert_not_called()

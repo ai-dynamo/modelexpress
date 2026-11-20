@@ -13,7 +13,8 @@
 
 use async_trait::async_trait;
 use modelexpress_common::grpc::p2p::{
-    ArtifactSourceMetadata, SourceIdentity, SourceStatus, TensorSourceMetadata, WorkerMetadata,
+    ArtifactSourceMetadata, SourceIdentity, SourceStatus, TensorMemoryType, TensorSourceMetadata,
+    WorkerMetadata,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -84,6 +85,12 @@ pub(crate) fn parse_training_step(extra_parameters: &HashMap<String, String>) ->
         .get("training_step")
         .or_else(|| extra_parameters.get("version"))
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+/// Stored tensor records omit the VRAM default, so they match records written
+/// before `mem_type` existed.
+pub(crate) fn is_vram_mem_type(mem_type: &i32) -> bool {
+    *mem_type == TensorMemoryType::Vram as i32
 }
 
 pub(crate) fn parse_layout_signature(extra_parameters: &HashMap<String, String>) -> Option<String> {
@@ -182,6 +189,8 @@ pub struct TensorRecord {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    /// Memory type of addr (maps to `TensorMemoryType` proto enum)
+    pub mem_type: i32,
 }
 
 /// Bounded artifact discovery summary stored with worker metadata.
@@ -241,6 +250,7 @@ impl From<modelexpress_common::grpc::p2p::TensorDescriptor> for TensorRecord {
             size: desc.size,
             device_id: desc.device_id,
             dtype: desc.dtype,
+            mem_type: desc.mem_type,
         }
     }
 }
@@ -299,6 +309,7 @@ impl From<TensorRecord> for modelexpress_common::grpc::p2p::TensorDescriptor {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            mem_type: record.mem_type,
         }
     }
 }

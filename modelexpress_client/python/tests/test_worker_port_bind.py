@@ -10,6 +10,7 @@ import grpc
 import pytest
 
 from modelexpress import p2p_pb2
+from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.metadata import publish as publish_mod
 from modelexpress.metadata.worker_server import WorkerGrpcServer
 
@@ -91,6 +92,7 @@ def test_publish_names_worker_grpc_port_setting(taken_port, monkeypatch):
             device_id=3,
             identity=p2p_pb2.SourceIdentity(model_name="m"),
             worker_id="w",
+            accelerator_backend=CudaAcceleratorBackend(),
         )
 
     message = str(exc_info.value)
