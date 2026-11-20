@@ -92,6 +92,12 @@ pub const HF_HUB_OFFLINE: &str = "HF_HUB_OFFLINE";
 pub const HF_ENDPOINT: &str = "HF_ENDPOINT";
 /// Suppresses use of the locally cached HuggingFace token.
 pub const HF_HUB_DISABLE_IMPLICIT_TOKEN: &str = "HF_HUB_DISABLE_IMPLICIT_TOKEN";
+/// Maximum retry attempts for transient HuggingFace Hub errors (429, 5xx,
+/// dropped connections) during model downloads.
+pub const MODEL_EXPRESS_HF_MAX_RETRIES: &str = "MODEL_EXPRESS_HF_MAX_RETRIES";
+/// Base delay in milliseconds for the exponential backoff between HuggingFace
+/// retry attempts.
+pub const MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS: &str = "MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS";
 
 // ── NGC ─────────────────────────────────────────────────────────────────────
 /// Base URL for the NGC artifact/download API.
@@ -186,6 +192,10 @@ const DEFAULT_GC_TIMEOUT_SECS: u64 = 3600;
 /// `MX_NCCL_REFIT_TRANSFER_TIMEOUT_S` default of 600.0 seconds.
 const DEFAULT_NCCL_REFIT_TRANSFER_TIMEOUT_SECS: u64 = 600;
 
+// ── Default HuggingFace retry tuning ────────────────────────────────────────
+const DEFAULT_HF_MAX_RETRIES: u64 = 3;
+const DEFAULT_HF_RETRY_BASE_DELAY_MS: u64 = 1000;
+
 // ── Getters ───────────────────────────────────────────────────────────────
 
 /// Resolve the user's home directory: [`HOME`], then [`USERPROFILE`].
@@ -244,6 +254,21 @@ pub fn hf_offline() -> bool {
 }
 
 /// Whether the locally cached HuggingFace token must not be used implicitly, via
+/// Maximum retry attempts for transient HuggingFace Hub errors
+/// ([`MODEL_EXPRESS_HF_MAX_RETRIES`], default 3).
+pub fn hf_max_retries() -> u64 {
+    env_u64(MODEL_EXPRESS_HF_MAX_RETRIES, DEFAULT_HF_MAX_RETRIES)
+}
+
+/// Base delay in milliseconds for the exponential backoff between HuggingFace
+/// retry attempts ([`MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS`], default 1000).
+pub fn hf_retry_base_delay_ms() -> u64 {
+    env_u64(
+        MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS,
+        DEFAULT_HF_RETRY_BASE_DELAY_MS,
+    )
+}
+
 /// [`HF_HUB_DISABLE_IMPLICIT_TOKEN`]. Same truthy values as [`hf_offline`].
 pub fn hf_implicit_token_disabled() -> bool {
     env::var(HF_HUB_DISABLE_IMPLICIT_TOKEN)
@@ -455,6 +480,11 @@ mod tests {
         assert_eq!(
             HF_HUB_DISABLE_IMPLICIT_TOKEN,
             "HF_HUB_DISABLE_IMPLICIT_TOKEN"
+        );
+        assert_eq!(MODEL_EXPRESS_HF_MAX_RETRIES, "MODEL_EXPRESS_HF_MAX_RETRIES");
+        assert_eq!(
+            MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS,
+            "MODEL_EXPRESS_HF_RETRY_BASE_DELAY_MS"
         );
         assert_eq!(NGC_API_ENDPOINT, "NGC_API_ENDPOINT");
         assert_eq!(NGC_AUTH_ENDPOINT, "NGC_AUTH_ENDPOINT");
