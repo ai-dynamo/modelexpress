@@ -76,6 +76,7 @@ prepare() {
   fi
 
   STREAMER_LOG="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/model-streamer.log"
+  : > "${STREAMER_LOG}"
 }
 
 start_vllm() {
