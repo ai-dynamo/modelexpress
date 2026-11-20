@@ -12,6 +12,7 @@ pub mod refit_collective;
 pub mod registry;
 pub mod server;
 pub mod services;
+pub mod tls;
 
 // Re-export for testing
 pub use cache::*;
