@@ -48,7 +48,10 @@ def _scrape_gauge(text: str, name: str) -> Optional[float]:
     Matches ``name`` and ``name{labels...}`` lines; skips ``# HELP``/``# TYPE``.
     Taking the max over label series is the conservative choice (busiest shard).
     """
-    pat = re.compile(rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+([0-9eE.+-]+)\s*$")
+    pat = re.compile(
+        rf"^{re.escape(name)}(?:\{{[^}}]*\}})?\s+([0-9eE.+-]+)"
+        r"(?:\s+([+-]?[0-9]+))?\s*$"
+    )
     best: Optional[float] = None
     for line in text.splitlines():
         if line.startswith("#"):
@@ -56,6 +59,8 @@ def _scrape_gauge(text: str, name: str) -> Optional[float]:
         m = pat.match(line.strip())
         if m:
             try:
+                if m.group(2) is not None and not -(2**63) <= int(m.group(2)) < 2**63:
+                    continue
                 v = float(m.group(1))
             except ValueError:
                 continue
