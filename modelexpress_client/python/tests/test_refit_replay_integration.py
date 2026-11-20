@@ -16,7 +16,7 @@ from tests.helpers.refit_replay import replay_ops
 def test_native_conversion_records_generator_device_for_local_replay(harness, monkeypatch):
     h = harness
     monkeypatch.setattr(
-        module, "registered_buffer_alloc_scope", lambda _backend: nullcontext()
+        module, "registered_buffer_alloc_scope", lambda _backend, **_: nullcontext()
     )
     h.transfer._device = torch.device("cpu")
     h.capture.source_replay = True
