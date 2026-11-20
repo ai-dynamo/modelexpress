@@ -95,19 +95,24 @@ def publish_metadata_and_ready(
     accelerator: str = "cuda",
     ready_fn: Callable[[], bool] | None = None,
     *,
-    accelerator_backend: AcceleratorBackend,
+    accelerator_backend: AcceleratorBackend | None = None,
 ) -> None:
     """Prepare tensor metadata publication and start the publisher thread.
 
     When ``ready_fn`` is provided, metadata remains undiscoverable until the
     engine has completed initialization and the callback returns ``True``.
+    Without ``accelerator_backend``, tensors are classified by the backend of
+    ``nixl_manager``, which registered them.
     """
     logger.info(
         f"[Worker {worker_rank}] Preparing {len(tensors)} tensors for model '{identity.model_name}'"
     )
 
     tensor_protos = build_tensor_protos(
-        tensors, device_id, worker_rank, accelerator_backend=accelerator_backend
+        tensors,
+        device_id,
+        worker_rank,
+        accelerator_backend=accelerator_backend or nixl_manager.accelerator_backend,
     )
 
     # This node's RDMA-fabric location, published once so the topology_aware

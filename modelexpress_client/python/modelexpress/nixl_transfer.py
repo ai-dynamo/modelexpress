@@ -232,6 +232,11 @@ class NixlTransferManager:
         return self._agent_name
 
     @property
+    def accelerator_backend(self) -> AcceleratorBackend:
+        """Backend that classified and registered this agent's tensors."""
+        return self._accelerator_backend
+
+    @property
     def backends(self) -> list[str]:
         """NIXL backends this agent was created with (see MX_NIXL_BACKEND).
 
