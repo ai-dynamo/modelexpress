@@ -1119,6 +1119,14 @@ agent.release_xfer_handle(handle)
 
 ## FP8 Model Handling (DeepSeek-V3)
 
+Iterator-based vLLM loading owns buffered FP8 indexer weights and scales before
+replaying complete pairs. BF16 weights and pre-fused projections pass through;
+an FP8 indexer weight missing its scale fails explicitly. The partial pair replay
+suppresses MTP completeness checks only for that second load; the initial
+checkpoint load retains draft-layer validation. A CUDA integration test checks
+that replay through the real vLLM fused loader preserves both projection shards;
+it skips when CUDA or vLLM is unavailable.
+
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
 
 For quant methods with `uses_meta_device`, vLLM's native loader runs `finalize_layerwise_processing()` after loading weights and before `process_weights_after_loading()`. ModelExpress uses the standalone `load_weights()` API inside its strategy chain, so its vLLM adapter mirrors that ordering for native, streamed, and RDMA target loads. For native and streamed checkpoint loading, skipping the layerwise finalizer can leave remaining online-FP8 parameters on the Meta device; Qwen3.5 then fails in `_C::static_scaled_fp8_quant` during post-load processing. Before finalizing online-quantized models, these two paths also run `gc.collect()` and empty the accelerator allocator cache, as native loading does in vLLM 0.32 and later; with InstantTensor this releases the blocks the loader left cached. Checkpoint loads without online quantization skip this cleanup. RDMA target preparation leaves the cache untouched and releases it only after a successful receive.
