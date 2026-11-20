@@ -73,8 +73,8 @@ if TYPE_CHECKING:
     MX_ENABLE_SEPARATE_DRAFT_P2P: bool
     # Kubernetes service backend
     MX_K8S_SERVICE_PATTERN: str
-    MX_K8S_SOURCE_RETRIES: str
-    MX_K8S_SOURCE_BACKOFF_SECONDS: str
+    MX_K8S_SOURCE_RETRIES: int
+    MX_K8S_SOURCE_BACKOFF_SECONDS: float
     # NIXL / transport
     MX_NIXL_BACKEND: str
     MX_NIXL_METADATA_TIMEOUT: float
@@ -196,6 +196,34 @@ def _env_float(name: str, default: float) -> float:
     return value
 
 
+def _env_non_negative_int(name: str, default: int) -> int:
+    """As :func:`_env_int`, for a count that cannot be negative (e.g. retries)."""
+    value = _env_int(name, default)
+    if value < 0:
+        logger.warning(
+            "Invalid %s=%r; must not be negative, using default %d",
+            name,
+            os.environ.get(name),
+            default,
+        )
+        return default
+    return value
+
+
+def _env_non_negative_float(name: str, default: float) -> float:
+    """As :func:`_env_float`, for a pause that may be zero but not negative."""
+    value = _env_float(name, default)
+    if value < 0.0:
+        logger.warning(
+            "Invalid %s=%r; must not be negative, using default %s",
+            name,
+            os.environ.get(name),
+            default,
+        )
+        return default
+    return value
+
+
 def _env_positive_float(name: str, default: float) -> float:
     """As :func:`_env_float`, for a variable that has to be a finite positive bound.
 
@@ -305,9 +333,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_K8S_SERVICE_PATTERN": lambda: os.environ.get(
         "MX_K8S_SERVICE_PATTERN", "mx-sources"
     ),
-    "MX_K8S_SOURCE_RETRIES": lambda: os.environ.get("MX_K8S_SOURCE_RETRIES", ""),
-    "MX_K8S_SOURCE_BACKOFF_SECONDS": lambda: os.environ.get(
-        "MX_K8S_SOURCE_BACKOFF_SECONDS", ""
+    "MX_K8S_SOURCE_RETRIES": lambda: _env_non_negative_int(
+        "MX_K8S_SOURCE_RETRIES", 5
+    ),
+    "MX_K8S_SOURCE_BACKOFF_SECONDS": lambda: _env_non_negative_float(
+        "MX_K8S_SOURCE_BACKOFF_SECONDS", 0.5
     ),
     # ── NIXL / transport ───────────────────────────────────────────────────
     "MX_NIXL_BACKEND": lambda: os.environ.get("MX_NIXL_BACKEND", "UCX").strip().upper(),
