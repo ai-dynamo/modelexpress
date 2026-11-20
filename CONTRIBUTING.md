@@ -68,7 +68,7 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `cargo run --bin fallback_test` | Run fallback tests |
 | `./run_integration_tests.sh` | Integration tests (starts server) |
 | `python3 -m unittest discover -s .github/scripts/tests -v` | CI version-stamping and nightly workflow tests (requires PyYAML, bash and jq) |
-| `./test_grpc_transfer_k8s.sh` | gRPC transfer tests on kind (requires Docker, kubectl and Helm) |
+| `bash test_grpc_transfer_k8s.sh` | gRPC transfer tests on kind (requires Docker, kubectl and Helm) |
 | `pytest modelexpress_client/python/tests/` | Run Python client tests |
 | `pytest ci/k8s/client/test_inference_parity.py` | Check inference comparison failures and Dynamo target coverage without GPUs |
 | `pytest ci/k8s/client/test_aiperf_payload.py` | Check payloads against the pinned AIPerf dependency from `ci/pyproject.toml`; runs in CPU CI |
@@ -79,9 +79,10 @@ A devcontainer configuration is provided for VSCode in `.devcontainer/`. It incl
 | `pre-commit run` | Run hooks on staged files |
 | `pre-commit run --all-files` | Run hooks on all files |
 
-The kind gRPC test preserves existing cluster endpoint and TLS settings. It
-rewrites those settings only for a cluster it creates, and exits immediately
-if building or loading the test image fails.
+The kind gRPC test sends requests to the chosen kind context and cleans up
+the test namespace only after creating it. An existing test namespace causes
+the run to stop. The script preserves an existing cluster's endpoint and TLS
+settings and exits immediately if building or loading the test image fails.
 
 ### Pre-commit Hooks
 
