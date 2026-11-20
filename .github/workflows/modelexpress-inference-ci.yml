@@ -408,6 +408,7 @@ jobs:
     needs: [build-client-vllm]
     permissions:
       contents: read
+      id-token: write
     env:
       FRAMEWORK: vllm
     strategy:
@@ -423,6 +424,14 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+
+      - name: Authenticate to ModelExpress S3 cache
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::210086341041:role/modelexpress-ci-s3
+          aws-region: ${{ env.MX_CI_S3_REGION }}
+          role-session-name: mx-${{ env.FRAMEWORK }}-${{ github.run_id }}-${{ strategy.job-index }}
+          unset-current-credentials: true
 
       - name: Run model streamer test
         uses: ./.github/actions/run-mx-streamer-test
@@ -450,6 +459,7 @@ jobs:
     needs: [build-client-sglang]
     permissions:
       contents: read
+      id-token: write
     env:
       FRAMEWORK: sglang
     strategy:

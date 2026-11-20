@@ -464,7 +464,9 @@ Every job runs on the velonix self-hosted runners. The runner override reaches
 the child workflows' control jobs. Model-streamer tests use the `ai-dynamo-gpu`
 organization runner group with the `ai-dynamo-gpu-1-amd64-v1` label. Each test
 runs directly in its worker image, authenticated through `container.credentials`.
-The job service account needs read and write access to `ai-dynamo-modelexpress-ci`.
+The tests use GitHub OpenID Connect (OIDC), which supplies short-lived AWS credentials,
+to assume `arn:aws:iam::210086341041:role/modelexpress-ci-s3` for S3 access.
+Only the model-streamer jobs receive OIDC token permission in the inference workflow.
 Core CI defaults to read-only repository contents; only its coverage job receives
 OIDC token permission.
 Run-specific caller groups prevent one nightly from cancelling another; the

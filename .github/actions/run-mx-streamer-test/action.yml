@@ -5,7 +5,7 @@ name: 'Run ModelExpress Model Streamer Test'
 description: |
   Runs an inference server in the GPU job container. Tests loading model weights
   from S3 and fallback to Hugging Face when S3 loading fails.
-  The job service account must have read and write access to the S3 bucket.
+  The job must supply AWS credentials with read and write access to the S3 bucket.
 
 inputs:
   framework:
