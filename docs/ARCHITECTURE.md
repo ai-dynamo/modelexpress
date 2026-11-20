@@ -177,6 +177,8 @@ ModelExpress/
 │       │       ├── checkpoint_selection.py # Role-specific shard filtering before reads
 │       │       ├── draft_weights.py    # Model-specific main/draft selection rules
 │       │       ├── loader.py           # MxModelLoader for remote_instance backend
+│       │       ├── p2p_metadata_sync.py # Dual-role P2P non-weight metadata HTTP sync
+│       │       ├── registration.py     # SGLang plugin registration (sglang.srt.plugins)
 │       │       └── role_aware_streamer.py # Lazily imported SGLang shard-filtering loader
 │       ├── tensor_utils.py             # Tensor collection, checksums, storage views
 │       ├── transfer_safety.py          # Model feature detection for the P2P gate
