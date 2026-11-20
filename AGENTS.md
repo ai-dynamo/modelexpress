@@ -59,7 +59,7 @@ Hooks: `cargo fmt`, `cargo clippy` (--fix), `cargo check`, trailing whitespace, 
 
 ## Procedures (skills)
 
-Load the matching skill before starting any of these. Each is a `SKILL.md` under `.agents/skills/`:
+Load the matching skill before starting any of these. Each is a `SKILL.md` under `.agents/skills/`. `skills/` is a symlink to it, which is the path the NVSkills catalog tooling expects:
 
 | Task | Skill |
 |---|---|
@@ -67,6 +67,7 @@ Load the matching skill before starting any of these. Each is a `SKILL.md` under
 | Add a gRPC service | `add-grpc-service` |
 | Bump the release version or public-image tags | `bump-version` |
 | Commit sign-off and DCO repair | `dco` |
+| Wire an RL trainer and a vLLM or SGLang generator through ModelExpress for live weight refit; configure FSDP staging or diagnose RDMA rail selection | `modelexpress-rl-refit` |
 
 ## Git Workflow
 
