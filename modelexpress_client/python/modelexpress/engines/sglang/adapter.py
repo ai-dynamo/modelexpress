@@ -178,7 +178,12 @@ class SglangAdapter(EngineAdapter):
     ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("SGLang weight iterator loading requires result.model")
-        load_weights_only = _sglang_load_weights_only()
+        try:
+            from sglang.srt.model_loader.loader import DefaultModelLoader
+        except ImportError:
+            DefaultModelLoader = None
+        # Added in SGLang 0.5.20.
+        load_weights_only = getattr(DefaultModelLoader, "load_weights_only", None)
         with capture_tensor_attrs(self.accelerator_backend):
             if load_weights_only is None:
                 result.model.load_weights(weights_iter)
@@ -404,15 +409,6 @@ class SglangAdapter(EngineAdapter):
 _DEFAULT_LOADER_ONLY_OPTIONS = frozenset(
     {"enable_multithread_load", "num_threads", "enable_gds"}
 )
-
-
-def _sglang_load_weights_only():
-    """Return DefaultModelLoader.load_weights_only, or None before SGLang 0.5.20."""
-    try:
-        from sglang.srt.model_loader.loader import DefaultModelLoader
-    except ImportError:
-        return None
-    return getattr(DefaultModelLoader, "load_weights_only", None)
 
 
 def _set_load_config_attr(obj, name: str, value) -> None:
