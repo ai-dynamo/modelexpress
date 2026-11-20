@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 spec = importlib.util.spec_from_file_location(
     "comment_gate", Path(__file__).resolve().parents[1] / "scripts/comment_gate.py"
@@ -184,6 +185,21 @@ def mirror_environment():
         "GITHUB_ACTOR": "copy-pr-bot[bot]",
         "PR_NUMBER": "0",
     }
+
+
+def test_rl_validation_passes_its_configured_context_to_authorization():
+    workflows = Path(__file__).resolve().parents[3] / ".github/workflows"
+    parent = yaml.safe_load((workflows / "modelexpress-rl-ci.yml").read_text())
+    validate = parent["jobs"]["validate"]
+    step = next(step for step in validate["steps"] if step.get("id") == "inputs")
+    environment = {**parent.get("env", {}), **validate.get("env", {}), **step["env"]}
+    _, get = request()
+    result = gate.authorize_workflow(
+        {**mirror_environment(), "KUBE_CONTEXT": environment.get("KUBE_CONTEXT", "")}, get,
+    )
+    assert result["sha"] == SHA
+    gpu = yaml.safe_load((workflows / "modelexpress-rl-generator-only-gpu-ci.yml").read_text())
+    assert environment["KUBE_CONTEXT"] == gpu["env"]["KUBE_CONTEXT"]
 
 
 @pytest.mark.parametrize("event", ["schedule", "workflow_dispatch"])
