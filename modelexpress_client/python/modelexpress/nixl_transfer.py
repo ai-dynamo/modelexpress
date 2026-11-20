@@ -1764,21 +1764,25 @@ class NixlTransferManager:
         """Last data-plane failure observed on a transfer, or None."""
         return self._data_plane_error
 
-    def shutdown(self) -> None:
-        """Disconnect remote agents before releasing local NIXL resources."""
-        if self._atexit_registered:
-            atexit.unregister(self.shutdown)
-            self._atexit_registered = False
+    def shutdown(self, *, strict: bool = False) -> None:
+        """Release the Agent; strict receivers retain failed registrations."""
         disconnected = self.disconnect_remote_agents()
         if self._agent is not None:
-            for registered in reversed(self._registered_memory):
+            while self._registered_memory:
+                registered = self._registered_memory[-1]
                 try:
                     self._agent.deregister_memory(registered)
                 except Exception:
+                    if strict:
+                        raise
                     logger.warning(
                         "Failed to deregister NIXL memory during shutdown",
                         exc_info=True,
                     )
+                self._registered_memory.pop()
+        if self._atexit_registered:
+            atexit.unregister(self.shutdown)
+            self._atexit_registered = False
         self._registered_memory = []
         self._base_registration_ranges = []
         self._appended_registrations = {}

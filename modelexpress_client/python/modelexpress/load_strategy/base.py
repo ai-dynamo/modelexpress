@@ -402,7 +402,7 @@ def register_tensors(
             # sub-range of the arena reserve) would restore single-MR here.
             logger.debug(
                 f"[Worker {ctx.global_rank}] Appending draft tensors to the "
-                "shared NIXL registration..."
+                "NIXL registration..."
             )
             ctx.nixl_manager.register_additional_tensors(ctx.tensors)
         elif not ctx.nixl_manager.tensor_descriptors:
@@ -423,7 +423,7 @@ def register_tensors(
             if registering:
                 raise NixlRegistrationError(str(e)) from e
             raise
-        if ctx.p2p_role == "draft":
+        if ctx.p2p_role == "draft" and ctx.nixl_manager is ctx.shared_nixl_manager:
             # Never publish draft descriptors that are not registered; the
             # shared agent itself stays with the main load.
             ctx.nixl_manager = None

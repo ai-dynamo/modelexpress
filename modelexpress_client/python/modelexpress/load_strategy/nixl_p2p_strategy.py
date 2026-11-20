@@ -175,7 +175,11 @@ class NixlP2PStrategy(LoadStrategy):
         """
 
     def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
-        """Already finalized inside the candidate loop; do not process twice."""
+        """Hand draft weights to the shared publication after receive cleanup."""
+        if _is_draft_pass(ctx):
+            self.rollback(ctx)
+            if result.model_for_publish is not None:
+                register_tensors(result, ctx)
 
     def abort(self, result: LoadResult, ctx: LoadContext) -> None:
         """Nothing to undo: prepare() starts no engine state, and rollback()
@@ -189,6 +193,8 @@ class NixlP2PStrategy(LoadStrategy):
                     # The agent belongs to the main load, which keeps serving from
                     # it. Release only the draft's own registrations.
                     ctx.nixl_manager.deregister_tensors(ctx.tensors)
+                elif _is_draft_pass(ctx):
+                    ctx.nixl_manager.shutdown(strict=True)
                 else:
                     ctx.nixl_manager.shutdown()
         except Exception as error:
@@ -377,9 +383,10 @@ class NixlP2PStrategy(LoadStrategy):
                     ) from cleanup_error
                 # A reload target is the engine's live model; the next
                 # candidate overwrites it in place, see execute_load_strategies.
+                if e.mutated:
+                    clear_exception_tracebacks(e)
                 if e.mutated and not ctx.is_reload:
                     try:
-                        clear_exception_tracebacks(e)
                         reinitialized = ctx.adapter.reinit_for_retry(result)
                         # LoadResult is the stable envelope shared with the
                         # outer strategy chain. Some adapters return a new
@@ -838,14 +845,14 @@ class NixlP2PStrategy(LoadStrategy):
                     ]
                 ctx.adapter.prepare_rdma_target_from_manifest(result, adapter_tensors)
             state = self._state(ctx)
-            if adaptive_enabled() and ctx.nixl_manager is None:
+            if (adaptive_enabled() or _is_draft_pass(ctx)) and ctx.nixl_manager is None:
                 state.last_failure = P2PFailure.CHANNEL
                 ctx.nixl_manager = _init_nixl_manager(
                     ctx.global_rank,
                     ctx.device_id,
                     self.channel,
                     listen_port=(
-                        0 if self.channel == "tcp"
+                        0 if self.channel == "tcp" or _is_draft_pass(ctx)
                         else envs.MX_METADATA_PORT + ctx.device_id
                     ),
                     accelerator_backend=ctx.accelerator_backend,
@@ -955,8 +962,6 @@ class NixlP2PStrategy(LoadStrategy):
                             timeout_seconds=_transfer_timeout_seconds(),
                             remote_agent_name=remote_agent_name,
                             require_exact_match=require_exact_match,
-                            # The shared agent's catalog also holds the main
-                            # load's tensors; match only the draft's.
                             destination_tensors=(
                                 ctx.tensors if _is_draft_pass(ctx) else None
                             ),

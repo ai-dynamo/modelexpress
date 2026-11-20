@@ -316,11 +316,15 @@ def test_draft_preparation_uses_model_names_before_namespaced_registration():
     manager = _manager()
     ctx = _ctx(manager)
     ctx.p2p_role = "draft"
+    ctx.device_id = 0
     ctx.draft_tensor_namespace = "__draft__/test/"
     ctx.tensors = {}
     name = ctx.draft_tensor_namespace + "w0"
     desc = _descriptor(name)
-    with patch(__name__ + "._descriptor", return_value=desc):
+    with patch(__name__ + "._descriptor", return_value=desc), patch(
+        "modelexpress.load_strategy.nixl_p2p_strategy._init_nixl_manager",
+        return_value=manager,
+    ):
         _receive(manager, ctx=ctx,
                  register=lambda *args, **kwargs: ctx.tensors.update({name: object()}))
     args = ctx.adapter.prepare_rdma_target_from_manifest.call_args.args

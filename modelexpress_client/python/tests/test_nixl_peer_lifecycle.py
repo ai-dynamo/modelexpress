@@ -63,6 +63,42 @@ def _manager(agent=None, metadata=b"md", accelerator=None):
     return mgr
 
 
+def test_draft_shutdown_retains_failed_registration(monkeypatch):
+    from modelexpress.adapter import StrategyRecoveryError
+    from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+    agent = FakeAgent()
+    manager = _manager(agent=agent)
+    first, second = object(), object()
+    tensors = {"draft.weight": object()}
+    manager._registered_memory = [first, second]
+    manager._tensors = tensors
+    ctx = SimpleNamespace(
+        p2p_role="draft", nixl_manager=manager, shared_nixl_manager=None, tensors=tensors,
+    )
+    deregister = agent.deregister_memory
+
+    def fail_first(registered):
+        if registered is first:
+            raise RuntimeError("registration is busy")
+        deregister(registered)
+
+    monkeypatch.setattr(agent, "deregister_memory", fail_first)
+    with pytest.raises(StrategyRecoveryError, match="registration is busy"):
+        RdmaStrategy().rollback(ctx)
+    assert manager._agent is agent
+    assert manager._tensors is tensors
+    assert manager._registered_memory == [first]
+    assert agent.deregistered == [second]
+    assert ctx.nixl_manager is manager
+
+    monkeypatch.setattr(agent, "deregister_memory", deregister)
+    RdmaStrategy().rollback(ctx)
+    assert manager._agent is None
+    assert ctx.nixl_manager is None
+    assert agent.deregistered == [second, first]
+
+
 class TestTracksLoadedPeers:
     def test_a_fetched_source_is_tracked_with_its_endpoint(self):
         """The endpoint is retained because it identifies the peer we connected to."""

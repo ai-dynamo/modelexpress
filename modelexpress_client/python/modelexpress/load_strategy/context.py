@@ -108,7 +108,7 @@ class LoadContext:
         default_factory=CudaAcceleratorBackend
     )
     # "main" for the primary load; "draft" for the speculative second pass
-    # on the same worker. The draft shares the main load's NIXL agent,
+    # on the same worker. The draft publishes through the main load's NIXL agent,
     # metadata port and SourceIdentity rather than publishing its own.
     p2p_role: str = "main"
     # A separate draft is advertised within its main model's publication.
@@ -122,8 +122,8 @@ class LoadContext:
     # Replica-wide cold-start fallback skips peer reads but still publishes.
     skip_rdma: bool = False
     # Draft pass only: the main load's already-initialized NIXL manager. The
-    # draft registers into it instead of binding MX_METADATA_PORT + device_id
-    # a second time.
+    # draft registers its finalized tensors into it after releasing its
+    # temporary receive manager, without rebinding MX_METADATA_PORT + device_id.
     shared_nixl_manager: NixlTransferManager | None = None
     # Set only after the draft's descriptors have extended the main publication.
     draft_published: bool = False
