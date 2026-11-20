@@ -468,6 +468,9 @@ pub async fn create_backend(config: BackendConfig) -> MetadataResult<Arc<dyn Met
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn MetadataBackend>)
         }
+        BackendConfig::RedisCluster { .. } => {
+            Err("redis-cluster backend is not yet supported for P2P metadata".into())
+        }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesBackend::new(&namespace).await?;
             backend.connect().await?;
