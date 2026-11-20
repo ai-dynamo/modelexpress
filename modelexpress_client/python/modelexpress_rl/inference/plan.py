@@ -41,6 +41,13 @@ class StreamingSettings:
     staging_buffers: int = 1
 
 
+class RefitSourceUnavailable(RuntimeError):
+    """No source can serve the version now: none has it yet, every one is busy or draining, or it was retired.
+
+    Retry once a peer installs it or a reader slot frees, or move on to a newer version.
+    """
+
+
 class WeightSource(str, Enum):
     """Location from which a generator obtains weight bytes."""
 

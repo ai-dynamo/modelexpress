@@ -25,6 +25,7 @@ if TYPE_CHECKING:
         ModelExpressGeneratorClient,
         ModelExpressGeneratorConfig,
         ObjectStorageGeneratorConfig,
+        RefitSourceUnavailable,
         SglangGeneratorContext,
         VllmGeneratorContext,
         WeightSource,
@@ -58,6 +59,7 @@ _LAZY = {
     "TrainerStagingMode": ".train",
     "TrainerEngineContext": ".train",
     "WeightPayloadFormat": ".train",
+    "RefitSourceUnavailable": ".inference",
     "WeightSource": ".inference",
     "VllmGeneratorContext": ".inference",
     # Version values shared across the control, trainer, and generator clients.
@@ -89,6 +91,8 @@ __all__ = [  # noqa: RUF022 - grouped by public API role, not alphabetically.
     "WeightPayloadFormat",
     "WeightSource",
     "VllmGeneratorContext",
+    # Raised when no source can serve a version yet; anything else from staging is a real failure.
+    "RefitSourceUnavailable",
     # Version values shared across the control, trainer, and generator clients.
     "MeshIdentity",
     "ObjectStorageSource",
