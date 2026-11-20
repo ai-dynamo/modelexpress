@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from modelexpress import p2p_pb2
+from modelexpress.accelerators import accelerator_backend_for
 from modelexpress.client import MxClient
 
 from .. import envs as rl_envs
@@ -202,6 +203,7 @@ def _create_runtime_tensor_method(
     return RuntimeTensorNixlUpdateMethod(
         manager=capability.nixl_manager,
         device_id=capability.device_id,
+        accelerator=accelerator_backend_for(capability.device).name,
         runtime_tensors=runtime_tensors,
     )
 

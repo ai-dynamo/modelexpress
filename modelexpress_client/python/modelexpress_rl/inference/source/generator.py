@@ -52,7 +52,8 @@ class GeneratorSourceResolver(SourceResolver):
         return WeightPayloadFormat.FULL_TENSOR
 
     def candidates(self, version: WeightVersion) -> Iterator[ResolvedSource]:
-        sources = list(self._list_ready_sources(version.version_id))
+        identity = self._build_identity(version.version_id)
+        sources = list(self._list_ready_sources(version.version_id, identity))
         random.Random().shuffle(sources)
         for source in sources:
             try:
@@ -69,14 +70,15 @@ class GeneratorSourceResolver(SourceResolver):
                 worker=worker,
                 mx_source_id=source.mx_source_id,
                 worker_id=source.worker_id,
+                identity=identity,
             )
 
     def _list_ready_sources(
-        self, version_id: str
+        self, version_id: str, identity: p2p_pb2.SourceIdentity
     ) -> tuple[p2p_pb2.SourceInstanceRef, ...]:
         try:
             response = self._p2p_client.list_sources(
-                identity=self._build_identity(version_id),
+                identity=identity,
                 status_filter=p2p_pb2.SOURCE_STATUS_READY,
             )
         except (grpc.RpcError, RuntimeError) as error:
