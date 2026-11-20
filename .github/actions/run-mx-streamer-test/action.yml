@@ -3,26 +3,13 @@
 
 name: 'Run ModelExpress Model Streamer Test'
 description: |
-  Standalone model-streamer CI test. Runs a single inference server via Docker on a
-  GPU runner — no vCluster, no mx-server, no P2P. Exercises the
-  runai-model-streamer path by streaming safetensors directly from S3, or
-  verifies fallback to HuggingFace when S3 streaming fails.
-
-  Pre-run setup (one-time): downloads the model safetensors from HuggingFace
-  and uploads to S3 if not already present. Subsequent runs skip the upload.
-  No cleanup — the S3 bucket acts as a persistent cache across runs.
-
-  Credentials: the runner is expected to have IRSA (IAM Roles for Service
-  Accounts) access to the S3 bucket via its EKS pod service account.
-  AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE are forwarded from the pod
-  into the Docker container so boto3 can assume the role.
+  Runs an inference server in the GPU job container. Tests loading model weights
+  from S3 and fallback to Hugging Face when S3 loading fails.
+  The job service account must have read and write access to the S3 bucket.
 
 inputs:
   framework:
     description: 'Inference framework to launch (vllm or sglang)'
-    required: true
-  worker_image:
-    description: 'Fully-qualified worker image for the selected framework'
     required: true
   model:
     description: 'HuggingFace model id — used for architecture config and as the upload/download target'
@@ -44,7 +31,7 @@ inputs:
     required: false
     default: '16'
   load_timeout_seconds:
-    description: 'Seconds to wait for "Model streamer weight loading complete" in container logs'
+    description: 'Seconds to wait for "Model streamer weight loading complete" in server logs'
     required: false
     default: '300'
   hf_token:
@@ -59,11 +46,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Set up Python
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
-      with:
-        python-version: "3.12"
-
     - name: Populate S3 model cache (upload safetensors if missing)
       if: inputs.test_model_streamer_fallback == 'false'
       shell: bash
@@ -75,12 +57,6 @@ runs:
         # is harmless — anonymous download still works for public models.
         HF_TOKEN: ${{ inputs.hf_token }}
       run: |
-        # Python is provided by the setup-python step above; works on
-        # self-hosted runners without assuming the runner image ships Python.
-        # boto3 is ~3 MB and installs in seconds; avoids assuming aws-cli
-        # or any other tool is present in the runner image.
-        pip install -q boto3 huggingface_hub
-
         python3 - <<'EOF'
         import boto3, os, pathlib, tempfile
         from huggingface_hub import snapshot_download
@@ -160,24 +136,18 @@ runs:
           MODEL_S3_URI="s3://${S3_BUCKET}/mx-ci-s3-fallback/missing/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/${MODEL}"
         fi
 
-        # IRSA credentials don't auto-propagate into child containers. The EKS
-        # runner pod gets AWS_ROLE_ARN + AWS_WEB_IDENTITY_TOKEN_FILE wired in,
-        # but a `docker run` child sees neither unless we forward them: pass
-        # the role ARN as -e and mount the OIDC token file in as a volume.
-        # boto3 inside the container then does its own sts:AssumeRoleWithWebIdentity.
-        IRSA_TOKEN="${AWS_WEB_IDENTITY_TOKEN_FILE:-/var/run/secrets/eks.amazonaws.com/serviceaccount/token}"
         echo "MODEL_S3_URI=${MODEL_S3_URI}" >> "$GITHUB_ENV"
-        echo "IRSA_TOKEN=${IRSA_TOKEN}" >> "$GITHUB_ENV"
+        echo "STREAMER_LOG=${RUNNER_TEMP}/model-streamer.log" >> "$GITHUB_ENV"
 
-    - name: Start vLLM container with model streamer
+    - name: Start vLLM with model streamer
       if: inputs.framework == 'vllm'
       shell: bash
       env:
-        WORKER_IMAGE: ${{ inputs.worker_image }}
         MODEL: ${{ inputs.model }}
-        S3_REGION: ${{ inputs.s3_region }}
+        AWS_DEFAULT_REGION: ${{ inputs.s3_region }}
+        RUNAI_STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
+        HF_TOKEN: ${{ inputs.hf_token }}
         PORT: ${{ inputs.port }}
-        STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
         TEST_MODEL_STREAMER_FALLBACK: ${{ inputs.test_model_streamer_fallback }}
       run: |
         set -euo pipefail
@@ -185,17 +155,7 @@ runs:
         if [ "${TEST_MODEL_STREAMER_FALLBACK}" = "true" ]; then
           MODEL_ARG="${MODEL}"
         fi
-        CONTAINER_ID=$(docker run -d --gpus all --ipc=host \
-          --entrypoint python3 \
-          -e AWS_ROLE_ARN="${AWS_ROLE_ARN}" \
-          -e AWS_WEB_IDENTITY_TOKEN_FILE="/var/run/secrets/eks-token" \
-          -v "${IRSA_TOKEN}:/var/run/secrets/eks-token:ro" \
-          -e AWS_DEFAULT_REGION="${S3_REGION}" \
-          -e MX_MODEL_URI="${MODEL_S3_URI}" \
-          -e RUNAI_STREAMER_CONCURRENCY="${STREAMER_CONCURRENCY}" \
-          -e VLLM_PLUGINS=modelexpress \
-          -p "${PORT}:${PORT}" \
-          "${WORKER_IMAGE}" \
+        MX_MODEL_URI="${MODEL_S3_URI}" VLLM_PLUGINS=modelexpress nohup python3 \
           -m vllm.entrypoints.openai.api_server \
             --model "${MODEL_ARG}" \
             --served-model-name "${MODEL}" \
@@ -203,33 +163,23 @@ runs:
             --language-model-only \
             --tokenizer "${MODEL}" \
             --load-format modelexpress \
-            --port "${PORT}")
-        echo "Container: ${CONTAINER_ID}"
-        echo "CONTAINER_ID=${CONTAINER_ID}" >> "$GITHUB_ENV"
+            --port "${PORT}" > "${STREAMER_LOG}" 2>&1 &
+        echo "STREAMER_PID=$!" >> "$GITHUB_ENV"
 
-    - name: Start SGLang container with model streamer
+    - name: Start SGLang with model streamer
       if: inputs.framework == 'sglang'
       shell: bash
       env:
-        WORKER_IMAGE: ${{ inputs.worker_image }}
         MODEL: ${{ inputs.model }}
-        S3_REGION: ${{ inputs.s3_region }}
+        AWS_DEFAULT_REGION: ${{ inputs.s3_region }}
+        RUNAI_STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
+        HF_TOKEN: ${{ inputs.hf_token }}
         PORT: ${{ inputs.port }}
-        STREAMER_CONCURRENCY: ${{ inputs.streamer_concurrency }}
       run: |
         set -euo pipefail
         # Keep SGLang's model path on the Hugging Face id. Passing the S3 URI
         # here selects SGLang's native runai_streamer loader and bypasses MX.
-        CONTAINER_ID=$(docker run -d --gpus all --ipc=host \
-          --entrypoint python3 \
-          -e AWS_ROLE_ARN="${AWS_ROLE_ARN}" \
-          -e AWS_WEB_IDENTITY_TOKEN_FILE="/var/run/secrets/eks-token" \
-          -v "${IRSA_TOKEN}:/var/run/secrets/eks-token:ro" \
-          -e AWS_DEFAULT_REGION="${S3_REGION}" \
-          -e MX_MODEL_URI="${MODEL_S3_URI}" \
-          -e RUNAI_STREAMER_CONCURRENCY="${STREAMER_CONCURRENCY}" \
-          -p "${PORT}:${PORT}" \
-          "${WORKER_IMAGE}" \
+        MX_MODEL_URI="${MODEL_S3_URI}" nohup python3 \
           -m sglang.launch_server \
             --model-path "${MODEL}" \
             --served-model-name "${MODEL}" \
@@ -240,9 +190,8 @@ runs:
             --disable-cuda-graph \
             --disable-piecewise-cuda-graph \
             --host 0.0.0.0 \
-            --port "${PORT}")
-        echo "Container: ${CONTAINER_ID}"
-        echo "CONTAINER_ID=${CONTAINER_ID}" >> "$GITHUB_ENV"
+            --port "${PORT}" > "${STREAMER_LOG}" 2>&1 &
+        echo "STREAMER_PID=$!" >> "$GITHUB_ENV"
 
     - name: Wait for model load to complete
       shell: bash
@@ -254,7 +203,7 @@ runs:
         [[ "${LOAD_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: load_timeout_seconds must be a positive integer, got '${LOAD_TIMEOUT}'"; exit 1; }
         deadline=$((SECONDS + LOAD_TIMEOUT))
         while [ $SECONDS -lt $deadline ]; do
-          LOGS="$(docker logs "${CONTAINER_ID}" 2>&1)"
+          LOGS="$(cat "${STREAMER_LOG}")"
           if [ "${TEST_MODEL_STREAMER_FALLBACK}" = "true" ]; then
             if echo "${LOGS}" | grep -q "Strategy model_streamer failed" \
               && echo "${LOGS}" | grep -q "Weights loaded from disk"; then
@@ -265,9 +214,9 @@ runs:
             echo "Model streamer loading confirmed."
             exit 0
           fi
-          if [ "$(docker inspect "${CONTAINER_ID}" --format '{{.State.Running}}')" != "true" ]; then
-            echo "ERROR: container exited before model loading completed."
-            docker logs "${CONTAINER_ID}" 2>&1 | tail -80
+          if ! kill -0 "${STREAMER_PID}" 2>/dev/null; then
+            echo "ERROR: server exited before model loading completed."
+            tail -80 "${STREAMER_LOG}"
             exit 1
           fi
           echo "Still loading... (${SECONDS}s elapsed)"
@@ -275,7 +224,7 @@ runs:
         done
 
         echo "ERROR: model loading did not complete within ${LOAD_TIMEOUT}s."
-        docker logs "${CONTAINER_ID}" 2>&1 | tail -80
+        tail -80 "${STREAMER_LOG}"
         exit 1
 
     - name: Wait for OpenAI server to be ready
@@ -296,26 +245,15 @@ runs:
         PORT: ${{ inputs.port }}
       run: python3 .github/scripts/check_streamer_inference.py
 
-    - name: Cleanup container
+    - name: Cleanup server
       if: always()
       shell: bash
       run: |
-        if [ -n "${CONTAINER_ID:-}" ]; then
-          echo "::group::Container logs (tail 200)"
-          docker logs "${CONTAINER_ID}" 2>&1 | tail -200 || true
+        if [ -n "${STREAMER_LOG:-}" ] && [ -f "${STREAMER_LOG}" ]; then
+          echo "::group::Server logs (tail 200)"
+          tail -200 "${STREAMER_LOG}" || true
           echo "::endgroup::"
-          docker stop "${CONTAINER_ID}" 2>/dev/null || true
-          docker rm -f "${CONTAINER_ID}" 2>/dev/null || true
         fi
-
-    - name: Cleanup local image
-      # `if: always()` so this also runs when the job is cancelled by
-      # cancel-in-progress concurrency. Without it, the vLLM worker image
-      # (~15GB with deps + ModelExpress layer) accumulates in the GPU
-      # runner's Docker daemon across runs and eventually exhausts disk.
-      if: always()
-      shell: bash
-      env:
-        WORKER_IMAGE: ${{ inputs.worker_image }}
-      run: |
-        docker image rm -f "${WORKER_IMAGE}" 2>/dev/null || true
+        if [ -n "${STREAMER_PID:-}" ]; then
+          kill "${STREAMER_PID}" 2>/dev/null || true
+        fi

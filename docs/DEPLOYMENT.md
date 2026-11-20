@@ -461,7 +461,10 @@ including runs that only build and test. The nightly calls
 Vime coverage as E2E CI, using the exact triggering `main` SHA.
 
 Every job runs on the velonix self-hosted runners. The runner override reaches
-the child workflows' control jobs while GPU jobs keep their dedicated runners.
+the child workflows' control jobs. Model-streamer tests use the `ai-dynamo-gpu`
+organization runner group with the `ai-dynamo-gpu-1-amd64-v1` label. Each test
+runs directly in its worker image, authenticated through `container.credentials`.
+The job service account needs read and write access to `ai-dynamo-modelexpress-ci`.
 Core CI defaults to read-only repository contents; only its coverage job receives
 OIDC token permission.
 Run-specific caller groups prevent one nightly from cancelling another; the
