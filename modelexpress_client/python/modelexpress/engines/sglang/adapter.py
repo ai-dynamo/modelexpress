@@ -289,7 +289,7 @@ class SglangAdapter(EngineAdapter):
             for key, value in (
                 getattr(it_config, "model_loader_extra_config", None) or {}
             ).items()
-            if key not in _DEFAULT_LOADER_ONLY_OPTIONS
+            if key not in {"enable_multithread_load", "num_threads", "enable_gds"}
         }
         _set_load_config_attr(it_config, "model_loader_extra_config", extra_config)
         return DefaultModelLoader(it_config)._get_all_weights(self.model_config, model)
@@ -425,13 +425,6 @@ class SglangAdapter(EngineAdapter):
             and self.is_cuda_alike()
             and envs.MX_MS_DISTRIBUTED
         )
-
-
-# model_loader_extra_config options that only SGLang's safetensors loaders read
-# (DefaultModelLoader with AUTO/SAFETENSORS/FASTSAFETENSORS).
-_DEFAULT_LOADER_ONLY_OPTIONS = frozenset(
-    {"enable_multithread_load", "num_threads", "enable_gds"}
-)
 
 
 def _set_load_config_attr(obj, name: str, value) -> None:
