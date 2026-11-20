@@ -165,6 +165,33 @@ def test_sglang_context_separates_worker_rank_from_global_rank(sglang_parallel):
     assert ctx.mx_client.server_url == "mx.example:9000"
 
 
+def test_sglang_all_gather_state_uses_the_world_cpu_group(sglang_parallel, monkeypatch):
+    """The chain's rank agreement must span every SGLang engine rank."""
+    sglang_parallel.world_group.world_size = 2
+    sglang_parallel.world_group.cpu_group = "world-cpu-group"
+    calls = []
+
+    def all_gather_object(output, state, group=None):
+        calls.append(group)
+        output[:] = [state, ("rdma", "failed")]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    assert adapter.all_gather_state(("rdma", "loaded")) == (
+        ("rdma", "loaded"),
+        ("rdma", "failed"),
+    )
+    assert calls == ["world-cpu-group"]
+
+
+def test_sglang_all_gather_state_is_local_without_torch_distributed(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+
+    assert adapter.all_gather_state("state") == ("state",)
+
+
 def test_sglang_parallel_state_is_read_for_each_load(sglang_parallel):
     adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
     assert adapter.get_worker_rank() == 11

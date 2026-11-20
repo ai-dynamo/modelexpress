@@ -82,6 +82,22 @@ class SglangAdapter(EngineAdapter):
 
         return int(parallel_state.get_world_group().local_rank)
 
+    def all_gather_state(self, state) -> tuple[object, ...]:
+        """Gather rank-local state through SGLang's world CPU process group."""
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return (state,)
+
+        parallel = _get_sglang_parallel_context()
+        if parallel is not None:
+            group = parallel.world_group
+        else:
+            from sglang.srt.distributed import parallel_state
+
+            group = parallel_state.get_world_group()
+        states = [None] * group.world_size
+        torch.distributed.all_gather_object(states, state, group=group.cpu_group)
+        return tuple(states)
+
     def get_device_id(self) -> int:
         gpu_id = getattr(self.device_config, "gpu_id", None)
         if gpu_id is not None:
