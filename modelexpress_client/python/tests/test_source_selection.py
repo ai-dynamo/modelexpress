@@ -660,6 +660,7 @@ def test_load_slices_to_max_source_retries():
 def _draft_ctx():
     ctx = MagicMock(global_rank=0)
     ctx.p2p_role = "draft"
+    ctx.publication_namespace = ""
     ctx.draft_tensor_namespace = "mx_draft::test::"
     ctx.accelerator_backend.name = ""
     return ctx
@@ -671,6 +672,22 @@ def _worker_with_tensor(name):
             tensors=[p2p_pb2.TensorDescriptor(name=name)]
         )
     )
+
+
+def test_independent_draft_load_uses_unprefixed_catalog_without_shared_manager():
+    strat = RdmaStrategy()
+    strat._find_source_instances = MagicMock(return_value=_sources(1))
+    strat._fetch_worker_metadata = MagicMock(
+        return_value=_worker_with_tensor("weight")
+    )
+    strat._load_as_target = MagicMock(return_value="loaded")
+    ctx = _draft_ctx()
+    ctx.publication_namespace = "sglang-draft-0"
+    ctx.shared_nixl_manager = None
+
+    assert strat.load(MagicMock(), ctx) == "loaded"
+    strat._fetch_worker_metadata.assert_called_once()
+    strat._load_as_target.assert_called_once()
 
 
 def test_draft_load_skips_main_only_sources_before_transfer_limit():
