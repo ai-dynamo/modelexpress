@@ -12,6 +12,7 @@ from modelexpress import tensor_utils
 from modelexpress.accelerators import CudaAcceleratorBackend
 from modelexpress.tensor_utils import (
     _find_hidden_accel_tensors,
+    adopt_bare_tensors,
     adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
@@ -209,6 +210,27 @@ class TestAdoptHiddenTensors:
         # The collision forced a numeric suffix onto the second buffer.
         buf_names = {name for name, _ in module.named_buffers()}
         assert any(name.endswith("_0") for name in buf_names)
+
+
+class TestAdoptBareTensors:
+    def test_promotes_bare_backend_tensors_only(self, mock_accelerator_backend_cls):
+        backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+        module = nn.Module()
+        module.child = nn.Module()
+        module.child.W_UV = torch.randn(4)
+        module.param = nn.Parameter(torch.randn(4))
+        module.register_buffer("buf", torch.randn(4))
+        module.kv_cache = torch.randn(4)
+
+        assert adopt_bare_tensors(module, backend) == 1
+        assert set(dict(module.named_buffers())) == {"buf", "child.W_UV"}
+        assert set(dict(module.named_parameters())) == {"param"}
+        assert "kv_cache" not in dict(module.named_buffers())
+
+    def test_cpu_tensors_ignored(self):
+        module = nn.Module()
+        module.W_UV = torch.randn(4)
+        assert adopt_bare_tensors(module) == 0
 
 
 # ---------------------------------------------------------------------------

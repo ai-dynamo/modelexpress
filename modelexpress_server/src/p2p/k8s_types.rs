@@ -323,6 +323,11 @@ pub struct TensorDescriptorJson {
     pub size: String,
     pub device_id: u32,
     pub dtype: String,
+    /// Absent in ConfigMaps written before host-memory tensors were published.
+    /// VRAM is not written: a ConfigMap holds a worker's whole manifest and is
+    /// capped at 1 MiB, so VRAM-only manifests keep their previous size.
+    #[serde(default, skip_serializing_if = "crate::p2p::backend::is_vram_mem_type")]
+    pub mem_type: i32,
 }
 
 /// Sanitize model name to be a valid Kubernetes resource name
@@ -342,6 +347,7 @@ pub fn sanitize_model_name(model_name: &str) -> String {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use modelexpress_common::grpc::p2p::TensorMemoryType;
 
     #[test]
     fn test_source_type_name_from_proto() {
@@ -473,6 +479,7 @@ mod tests {
             size: "134217728".to_string(),
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            mem_type: TensorMemoryType::Dram as i32,
         };
 
         let json = serde_json::to_string(&original).expect("serialize");
@@ -483,6 +490,7 @@ mod tests {
         assert_eq!(parsed.size, original.size);
         assert_eq!(parsed.device_id, original.device_id);
         assert_eq!(parsed.dtype, original.dtype);
+        assert_eq!(parsed.mem_type, original.mem_type);
 
         let addr: u64 = parsed.addr.parse().expect("addr should parse as u64");
         assert_eq!(addr, 139948187451390);
@@ -498,6 +506,7 @@ mod tests {
             size: u64::MAX.to_string(),
             device_id: 7,
             dtype: "float16".to_string(),
+            mem_type: TensorMemoryType::Vram as i32,
         };
 
         let json = serde_json::to_string(&desc).expect("serialize");
@@ -505,6 +514,22 @@ mod tests {
 
         let addr: u64 = parsed.addr.parse().expect("max u64 addr should parse");
         assert_eq!(addr, u64::MAX);
+    }
+
+    #[test]
+    fn test_tensor_descriptor_json_without_mem_type() {
+        let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
+        let parsed: TensorDescriptorJson =
+            serde_json::from_str(json).expect("parse legacy descriptor");
+        assert_eq!(parsed.mem_type, TensorMemoryType::Vram as i32);
+    }
+
+    #[test]
+    fn test_tensor_descriptor_json_omits_vram_mem_type() {
+        let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
+        let parsed: TensorDescriptorJson =
+            serde_json::from_str(json).expect("parse legacy descriptor");
+        assert_eq!(serde_json::to_string(&parsed).expect("serialize"), json);
     }
 
     #[test]

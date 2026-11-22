@@ -204,3 +204,15 @@ def test_cold_start_wait_default_and_override(monkeypatch):
     assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 12.5
     monkeypatch.setenv("MX_P2P_COLD_START_WAIT_TIMEOUT_SECS", "1499.9")
     assert envs.MX_P2P_COLD_START_WAIT_TIMEOUT_SECS == 1499.9
+
+
+@pytest.mark.parametrize(
+    "raw, expected", [(None, "auto"), ("", "auto"), (" SafeTensors ", "safetensors")]
+)
+def test_cold_start_format(monkeypatch, raw, expected):
+    """MX_COLD_START_FORMAT defaults to auto and is trimmed and lower-cased."""
+    if raw is None:
+        monkeypatch.delenv("MX_COLD_START_FORMAT", raising=False)
+    else:
+        monkeypatch.setenv("MX_COLD_START_FORMAT", raw)
+    assert envs.MX_COLD_START_FORMAT == expected

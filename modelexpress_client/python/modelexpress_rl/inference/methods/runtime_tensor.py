@@ -13,6 +13,7 @@ from typing import Any
 
 import torch
 from modelexpress import envs, p2p_pb2
+from modelexpress.metadata.payload import accelerators_compatible
 from modelexpress.metadata.worker_server import TensorReadLease, prepare_tensor_read
 from modelexpress.nixl_transfer import NixlTransferManager
 from modelexpress.types import ManifestMismatchError, TensorDescriptor
@@ -68,11 +69,13 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
         *,
         manager: NixlTransferManager,
         device_id: int,
+        accelerator: str,
         runtime_tensors: dict[str, torch.Tensor],
         timeout_seconds: float | None = None,
     ) -> None:
         self._manager = manager
         self._device_id = device_id
+        self._accelerator = accelerator
         self._timeout = float(
             envs.MX_TRANSFER_TIMEOUT if timeout_seconds is None else timeout_seconds
         )
@@ -151,6 +154,25 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
             self._active_read = None
             self._closed = True
 
+    def _validate_peer_accelerator(
+        self,
+        manifest: p2p_pb2.GetTensorManifestResponse,
+        identity: p2p_pb2.SourceIdentity,
+    ) -> None:
+        if not accelerators_compatible(
+            self._accelerator,
+            manifest.accelerator,
+            mx_source_type=identity.mx_source_type,
+            quantization=identity.quantization,
+            dtype=identity.dtype,
+            defer_unknown=False,
+        ):
+            raise ManifestMismatchError(
+                "generator peer accelerator is incompatible: "
+                f"source={manifest.accelerator!r}, target={self._accelerator!r}, "
+                f"quantization={identity.quantization!r}, dtype={identity.dtype!r}"
+            )
+
     @staticmethod
     def _validate_peer_manifest(
         manifest: p2p_pb2.GetTensorManifestResponse,
@@ -218,6 +240,7 @@ class RuntimeTensorNixlUpdateMethod(UpdateMethod):
             timeout=self._timeout,
         )
         try:
+            self._validate_peer_accelerator(lease.manifest, source.identity)
             self._validate_peer_manifest(lease.manifest, self._runtime_tensors)
             self._peer_endpoint(lease.manifest)
         except BaseException:

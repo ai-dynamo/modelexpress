@@ -335,6 +335,10 @@ struct TensorRecordJson {
     pub size: u64,
     pub device_id: u32,
     pub dtype: String,
+    // Absent in records written before host-memory tensors were published.
+    // VRAM is not written, so VRAM-only records keep their previous size.
+    #[serde(default, skip_serializing_if = "super::is_vram_mem_type")]
+    pub mem_type: i32,
 }
 
 fn serialize_u64_as_string<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
@@ -397,6 +401,7 @@ impl From<TensorRecord> for TensorRecordJson {
             size: record.size,
             device_id: record.device_id,
             dtype: record.dtype,
+            mem_type: record.mem_type,
         }
     }
 }
@@ -409,6 +414,7 @@ impl From<TensorRecordJson> for TensorRecord {
             size: json.size,
             device_id: json.device_id,
             dtype: json.dtype,
+            mem_type: json.mem_type,
         }
     }
 }
@@ -1219,6 +1225,7 @@ impl MetadataBackend for RedisBackend {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use modelexpress_common::grpc::p2p::TensorMemoryType;
 
     // ── TensorRecordJson serialization ──────────────────────────────────────
 
@@ -1311,6 +1318,7 @@ mod tests {
             size: 1_073_741_824,
             device_id: 3,
             dtype: "bfloat16".to_string(),
+            mem_type: TensorMemoryType::Dram as i32,
         };
         let json_record = TensorRecordJson::from(record.clone());
         let json = serde_json::to_string(&json_record).expect("serialize");
@@ -1325,6 +1333,21 @@ mod tests {
         assert_eq!(back.size, record.size);
         assert_eq!(back.device_id, record.device_id);
         assert_eq!(back.dtype, record.dtype);
+        assert_eq!(back.mem_type, record.mem_type);
+    }
+
+    #[test]
+    fn test_tensor_record_json_without_mem_type() {
+        let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
+        let t: TensorRecordJson = serde_json::from_str(json).expect("parse legacy record");
+        assert_eq!(t.mem_type, TensorMemoryType::Vram as i32);
+    }
+
+    #[test]
+    fn test_tensor_record_json_omits_vram_mem_type() {
+        let json = r#"{"name":"w","addr":"4096","size":"64","device_id":0,"dtype":"f16"}"#;
+        let t: TensorRecordJson = serde_json::from_str(json).expect("parse legacy record");
+        assert_eq!(serde_json::to_string(&t).expect("serialize"), json);
     }
 
     #[test]
@@ -1365,6 +1388,7 @@ mod tests {
                 size: 512,
                 device_id: 2,
                 dtype: "float16".to_string(),
+                mem_type: TensorMemoryType::Vram as i32,
             }],
             status: 2, // SOURCE_STATUS_READY
             updated_at: 1_700_000_000_000,

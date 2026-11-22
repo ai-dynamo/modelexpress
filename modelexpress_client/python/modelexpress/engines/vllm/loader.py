@@ -47,12 +47,15 @@ from ...load_strategy import (
 from ...load_strategy.draft_gate import DraftPublicationGate
 from ...metrics import enable_metrics, metrics
 from ...nixl_transfer import NixlTransferManager
+from ...tensor_utils import adopt_bare_tensors
 from ...vmm.runtime import log_arena_post_load, maybe_enter_vmm_arena
 from .adapter import (
     _is_speculative_draft,
     _native_load_config,
     build_vllm_load_context,
     cold_start_expected_workers,
+    cold_start_load_config,
+    validate_cold_start_format,
 )
 from .artifacts import (
     _vllm_health_ready,
@@ -60,7 +63,7 @@ from .artifacts import (
     install_vllm_cache_artifacts,
     schedule_vllm_cache_artifact_publish,
 )
-from .source_identity import build_source_identity
+from .source_identity import build_source_identity, is_pinned_revision
 
 from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
@@ -202,6 +205,7 @@ class MxModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
         prefix: str = "",
+        restore: bool = False,
     ) -> nn.Module:
         """Reload weights into an already-initialized model.
 
@@ -216,12 +220,22 @@ class MxModelLoader(BaseModelLoader):
         Peers must not read weights while they are being overwritten, so P2P
         source-serving stops first unless a prior sleep() already stopped it.
         The strategy chain registers and republishes the reloaded tensors.
+
+        `restore=True` says `model` holds `model_config`'s weights from another
+        loader, for example before a process checkpoint, so RDMA may refill them.
+        It enables P2P without requiring it: RDMA needs a revision that pins the
+        captured checkpoint (MX_MODEL_REVISION or a full commit hash), a peer
+        catalog naming every target tensor and a reachable peer; otherwise the
+        reload comes from storage. After a level-2 sleep, map the weight storage
+        back before calling.
         """
         if envs.MX_P2P_COLD_START:
             raise RuntimeError("MX cold start does not support model reload")
         if self._last_sleep_level is None:
             self._stop_serving()
-        return self._load_or_reload_model(vllm_config, model_config, prefix, model)
+        return self._load_or_reload_model(
+            vllm_config, model_config, prefix, model, restore
+        )
 
     def _load_or_reload_model(
         self,
@@ -229,6 +243,7 @@ class MxModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         prefix: str = "",
         model: nn.Module | None = None,
+        restore: bool = False,
     ) -> nn.Module:
         """Load model, auto-detecting the best loading strategy.
 
@@ -248,6 +263,16 @@ class MxModelLoader(BaseModelLoader):
             # Snapshot: a refit rewrites the live identity's revision in place.
             ctx.loaded_identity = p2p_pb2.SourceIdentity()
             ctx.loaded_identity.CopyFrom(self._ctx.identity)
+        elif ctx.is_reload and restore and not is_pinned_revision(model_config):
+            logger.info(
+                f"[Worker {ctx.global_rank}] Restore needs a revision that pins "
+                f"the checkpoint, not {ctx.identity.revision!r}; skipping RDMA"
+            )
+        elif ctx.is_reload and restore:
+            ctx.loaded_identity = p2p_pb2.SourceIdentity()
+            ctx.loaded_identity.CopyFrom(ctx.identity)
+            ctx.require_exact_tensor_catalog = True
+            adopt_bare_tensors(model, ctx.accelerator_backend)
         draft_gate: DraftPublicationGate | None = None
         main_ctx = None
         if is_speculative_draft:
@@ -346,7 +371,14 @@ class MxModelLoader(BaseModelLoader):
         # timers only bracket existing calls; nothing here changes load order.
         model_id = ctx.identity.model_name
         with metrics.time_load("vllm", model_id, model_role):
-            with maybe_enter_vmm_arena(ctx):
+            # vLLM sleep mode loads inside its own memory pool, where torch
+            # before 2.13 cannot destroy the arena's pool on exit.
+            release_idle = True
+            if getattr(model_config, "enable_sleep_mode", False):
+                from ...vmm import hook as vmm_hook
+
+                release_idle = vmm_hook.pool_release_safe_in_pool_scope()
+            with maybe_enter_vmm_arena(ctx, release_idle=release_idle):
                 if ctx.p2p_enabled and ctx.p2p_role == "main":
                     with metrics.time_load_phase("vllm", model_id, "artifact_install"):
                         install_vllm_cache_artifacts(ctx)
@@ -396,6 +428,8 @@ class MxModelLoader(BaseModelLoader):
 
     def _validate_load_policy(self, *, is_speculative_draft: bool = False) -> None:
         validate_load_strategy_chain()
+        # Up front, so a bad value fails at startup even when P2P or the streamer would load.
+        validate_cold_start_format()
 
     def _run_load_strategy_chain(self, model: nn.Module, ctx: LoadContext) -> nn.Module:
         return run_load_strategy_chain(model, ctx)
@@ -415,24 +449,12 @@ class MxModelLoader(BaseModelLoader):
             )
             return
 
-        import copy
-
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
+        disk_config = cold_start_load_config(self.load_config)
         DefaultModelLoader(disk_config).download_model(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights into an already-initialized model (standalone API)."""
-        import copy
-
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
+        disk_config = cold_start_load_config(self.load_config)
         DefaultModelLoader(disk_config).load_weights(model, model_config)
 
     def on_sleep(self, level: int) -> None:

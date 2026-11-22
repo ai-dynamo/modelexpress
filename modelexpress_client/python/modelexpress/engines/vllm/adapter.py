@@ -12,8 +12,10 @@ import inspect
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, Iterator
 
 import torch
@@ -90,6 +92,36 @@ def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
         if isinstance(counter, torch.Tensor):
             tensors.append(counter)
     return tensors
+
+
+@contextmanager
+def _instanttensor_allocator_context() -> Iterator[None]:
+    """Keep 20 MiB allocator segments reusable while loading InstantTensor weights."""
+    if (
+        not torch.cuda.is_initialized()
+        or torch.cuda.memory.get_allocator_backend() != "native"
+    ):
+        yield
+        return
+
+    getter = getattr(torch._C, "_accelerator_getAllocatorSettings", None)
+    if getter is not None:
+        original = getter()
+    else:
+        original = torch.cuda.memory._snapshot().get("allocator_settings", {}).get(
+            "PYTORCH_CUDA_ALLOC_CONF", ""
+        )
+    match = re.search(r"\bmax_split_size_mb\s*:\s*(\d+)", original)
+    if match is None or int(match.group(1)) != 20:
+        yield
+        return
+
+    settings = original[: match.start(1)] + "21" + original[match.end(1) :]
+    torch.cuda.memory._set_allocator_settings(settings)
+    try:
+        yield
+    finally:
+        torch.cuda.memory._set_allocator_settings(original)
 
 
 def _is_speculative_draft(vllm_config, model_config) -> bool:
@@ -330,16 +362,28 @@ def _own_buffered_indexer_tensors(
         yield name, tensor
 
 
+def _pending_indexer_pairs(model: torch.nn.Module) -> Iterator[dict]:
+    """Find buffers on the wrapper and the inner modules vLLM loads."""
+    modules = model.modules() if isinstance(model, torch.nn.Module) else (model,)
+    for module in modules:
+        pending = getattr(module, "_pending_indexer_wk_fp8", None)
+        if pending:
+            yield pending
+
+
+def _clear_pending_indexer_pairs(model: torch.nn.Module) -> None:
+    for pending in _pending_indexer_pairs(model):
+        logger.warning("Clearing pending FP8 indexer wk pairs: %s", sorted(pending))
+        pending.clear()
+
+
 def _rewrite_indexer_wk_pairs(model: torch.nn.Module, recorded: dict[str, torch.Tensor]) -> None:
     """Feed each streamed FP8 indexer wk weight again together with its scale.
 
     vLLM writes the fused ``wk_weights_proj`` shard only once both halves are
     buffered together, so a half the stream stranded would leave it unwritten.
     """
-    pending = getattr(model, "_pending_indexer_wk_fp8", None)
-    if pending:
-        logger.warning("Rewriting FP8 indexer wk pairs left pending by the stream: %s", sorted(pending))
-        pending.clear()
+    _clear_pending_indexer_pairs(model)
     pairs: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
     for name, tensor in recorded.items():
         prefix = name.rsplit(".wk.", 1)[0]
@@ -357,8 +401,45 @@ def _rewrite_indexer_wk_pairs(model: torch.nn.Module, recorded: dict[str, torch.
             replay = disable_mtp_completeness_check()
         with replay:
             model.load_weights(item for _prefix, parts in sorted(pairs.items()) for item in parts.values())
-    if getattr(model, "_pending_indexer_wk_fp8", None):
+    if any(_pending_indexer_pairs(model)):
         raise RuntimeError("FP8 indexer wk pairs remain pending after the rewrite")
+
+
+# Formats vLLM's DefaultModelLoader._prepare_weights accepts; anything else (a typo, or a
+# format served by another loader such as runai_streamer) fails only once a worker reaches
+# the disk fallback, as "Unknown load_format" without naming the variable.
+COLD_START_FORMATS = frozenset(
+    {"auto", "hf", "safetensors", "fastsafetensors", "instanttensor", "mistral", "pt", "npcache"}
+)
+
+
+def validate_cold_start_format() -> str:
+    """Return ``MX_COLD_START_FORMAT``.
+
+    Raises ``ValueError`` if vLLM's DefaultModelLoader cannot use it.
+    """
+    fmt = envs.MX_COLD_START_FORMAT
+    if fmt not in COLD_START_FORMATS:
+        raise ValueError(
+            f"MX_COLD_START_FORMAT={fmt!r} is not a vLLM DefaultModelLoader format; "
+            f"expected one of {sorted(COLD_START_FORMATS)}"
+        )
+    return fmt
+
+
+def cold_start_load_config(load_config):
+    """Copy of ``load_config`` with the load format of the disk fallback.
+
+    ``MX_COLD_START_FORMAT`` (default ``auto``) selects the format. ``safetensors`` refuses
+    ``.bin``/``.pt`` checkpoints, which ``auto`` would load through ``torch.load``.
+    """
+    disk_config = copy.copy(load_config)
+    fmt = validate_cold_start_format()
+    try:
+        disk_config.load_format = fmt
+    except AttributeError:
+        object.__setattr__(disk_config, "load_format", fmt)
+    return disk_config
 
 
 class VllmAdapter(EngineAdapter):
@@ -526,6 +607,7 @@ class VllmAdapter(EngineAdapter):
         if result.model is None:
             raise RuntimeError("vLLM weight iterator loading requires result.model")
         recorded: dict[str, torch.Tensor] = {}
+        _clear_pending_indexer_pairs(result.model)
         result.model.load_weights(_own_buffered_indexer_tensors(weights_iter, recorded))
         _rewrite_indexer_wk_pairs(result.model, recorded)
         return result
@@ -623,7 +705,12 @@ class VllmAdapter(EngineAdapter):
             object.__setattr__(load_config, "load_format", "instanttensor")
 
         loader = DefaultModelLoader(load_config)
-        return loader.get_all_weights(self.model_config, model)
+
+        def weights():
+            with _instanttensor_allocator_context():
+                yield from loader.get_all_weights(self.model_config, model)
+
+        return weights()
 
     def load_via_native(self, result: LoadResult) -> LoadResult:
         if result.model is None:
@@ -631,19 +718,22 @@ class VllmAdapter(EngineAdapter):
 
         from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
-        disk_config = copy.copy(self.load_config)
-        try:
-            disk_config.load_format = "auto"
-        except AttributeError:
-            object.__setattr__(disk_config, "load_format", "auto")
-
-        DefaultModelLoader(disk_config).load_weights(result.model, self.model_config)
+        DefaultModelLoader(cold_start_load_config(self.load_config)).load_weights(
+            result.model, self.model_config
+        )
         return result
 
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
-        return self._process_weights_after_loading(result)
+        return self._finish_checkpoint_load(result)
 
     def after_native_load(self, result: LoadResult) -> LoadResult:
+        return self._finish_checkpoint_load(result)
+
+    def _finish_checkpoint_load(self, result: LoadResult) -> LoadResult:
+        from vllm.model_executor.model_loader.base_loader import _has_online_quant
+
+        if result.model is not None and _has_online_quant(result.model):
+            self._release_loader_cache()
         return self._process_weights_after_loading(result)
 
     def reinit_for_retry(self, result: LoadResult) -> LoadResult:
@@ -679,18 +769,41 @@ class VllmAdapter(EngineAdapter):
         self,
         result: LoadResult,
     ) -> LoadResult:
+        """Run the post-load steps of vLLM's ``BaseModelLoader.load_model``.
+
+        ModelExpress loads through the standalone ``load_weights`` API, so it
+        also runs the layerwise finalizer that native loading applies to online
+        quantized models. Without it, post-load processing can receive Meta
+        tensors.
+        """
         if result.model is None:
             raise RuntimeError("vLLM post-load processing requires result.model")
 
+        from vllm.model_executor.model_loader.base_loader import _has_online_quant
+        from vllm.model_executor.model_loader.reload import (
+            finalize_layerwise_processing,
+        )
         from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
         with capture_tensor_attrs(self.accelerator_backend):
+            if _has_online_quant(result.model):
+                finalize_layerwise_processing(result.model, self.model_config)
             process_weights_after_loading(
                 result.model,
                 self.model_config,
                 self.target_device,
             )
         return result
+
+    def _release_loader_cache(self) -> None:
+        """Release allocator blocks cached by online-quantized checkpoint loading.
+
+        Native vLLM does this between ``load_weights`` and post-processing.
+        RDMA target preparation skips it and releases the cache only after a
+        successful receive.
+        """
+        gc.collect()
+        self.accelerator_backend.empty_cache()
 
     def _refresh_host_quantization_state(self, result: LoadResult) -> LoadResult:
         if result.model is None:

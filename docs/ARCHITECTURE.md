@@ -367,7 +367,7 @@ Cache eviction parses the key back to delete the right snapshot. It keeps the fi
 | `GetMetadata` | `GetMetadataRequest` | `GetMetadataResponse` | Fetch full tensor metadata for one specific worker (MB-scale, on demand) |
 | `UpdateStatus` | `UpdateStatusRequest` | `UpdateStatusResponse` | Update per-worker lifecycle status (Initializing/Ready/Stale) |
 
-Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility and `mx_source_id`), `WorkerMetadata` (rank, runtime `accelerator`, oneof backend_metadata, tensors, status, P2P endpoint fields), `TensorDescriptor` (name, addr, size, device_id, dtype), `SourceInstanceRef` (lightweight worker reference for listing, including runtime `accelerator` for pre-fetch compatibility filtering).
+Key message types: `SourceIdentity` (all fields affecting tensor layout compatibility and `mx_source_id`), `WorkerMetadata` (rank, runtime `accelerator`, oneof backend_metadata, tensors, status, P2P endpoint fields), `TensorDescriptor` (name, addr, size, device_id, dtype, mem_type; `mem_type` is the `TensorMemoryType` the source registered the bytes as, VRAM or DRAM, and `device_id` is 0 for DRAM; descriptors without it decode as VRAM, including Redis and Kubernetes records written before the field existed), `SourceInstanceRef` (lightweight worker reference for listing, including runtime `accelerator` for pre-fetch compatibility filtering).
 
 Rust and Python compute `mx_source_id` from the same normalized, sorted-key JSON encoded as UTF-8, preserving non-ASCII identity strings.
 
@@ -644,7 +644,7 @@ Loading precedence: CLI args > environment variables > config file > defaults.
 |--------|---------|
 | `__init__.py` | Package init, exports `register_modelexpress_loaders()` for callers to register the `modelexpress` and `mx` loaders with vLLM |
 | `client.py` | `MxClient` - gRPC client wrapping `PublishMetadata`, `ListSources`, `GetMetadata`, and `UpdateStatus` RPCs |
-| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled, falls back to generic per-tensor NIXL registration, and requires no classic-allocator pool for registered buffers. Further backends can be added behind the same interface |
+| `accelerators/` | `AcceleratorBackend` boundary for accelerator-specific torch device control and fast-path capability gates, split into `base.py` (protocol), `cuda.py` (`CudaAcceleratorBackend`), and `xpu.py` (`XpuAcceleratorBackend`). CUDA and XPU are implemented backends; XPU keeps CUDA-only fast paths (pool registration, VMM arena, GDS) disabled, falls back to generic per-tensor NIXL registration, and requires no classic-allocator pool for registered buffers. `tensor_mem_type(tensor)` classifies a tensor as VRAM or DRAM for registration, publication, and receive. Further backends can be added behind the same interface |
 | `nixl_transfer.py` | `NixlTransferManager` - NIXL agent lifecycle, tensor registration, RDMA transfers |
 | `gds_transfer.py` | GPUDirect Storage availability check and transfer utilities |
 | `gds_loader.py` | `MxGdsLoader` - GDS-based model loader (direct file-to-GPU) |
@@ -690,12 +690,12 @@ Manages a NIXL agent and RDMA transfers for a single GPU worker:
 | Method | Purpose |
 |--------|---------|
 | `__init__(agent_name, device_id, listen_port, accelerator_backend)` | Create NIXL agent with UCX backend; `listen_port` enables P2P listen thread; `accelerator_backend` owns torch device operations and accelerator capability gates |
-| `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata. With `MX_POOL_REG=1` on a backend that supports pool registration, registers each unique cudaMalloc allocation backing the tensors instead of registering each tensor individually. Raises when a tensor extends past the allocation containing its start address (e.g. a VA reservation backed by several mappings): neither that allocation nor a per-tensor registration can cover it, so the worker does not serve P2P |
-| `register_arena(arena, tensors)` | Register the used VMM arena range once through dmabuf when the active accelerator backend supports the VMM arena fast path, then publish every tensor descriptor against that single MR. Falls back to per-tensor registration when a tensor lies outside the arena range, or when the arena spans several `cuMemCreate` handles (a single MR cannot be addressed by cuda_ipc then; override with `MX_ARENA_SINGLE_MR=1`) |
-| `register_additional_tensors(tensors)` | Append tensors to an already-registered catalog instead of replacing it (`register_tensors` / `register_arena` replace the name -> tensor catalog). Tensors fully covered by the main or a prior appended registration reuse its range; only uncovered ranges are registered. The call refreshes agent metadata, skips names already registered at the same address, and rejects a name registered at a different address. Used by the speculative draft pass on the main load's agent |
+| `register_tensors(tensors)` | Register GPU tensors for RDMA, return serialized metadata. With `MX_POOL_REG=1` on a backend that supports pool registration, registers each unique cudaMalloc allocation backing the tensors instead of registering each tensor individually. Raises when a tensor extends past the allocation containing its start address (e.g. a VA reservation backed by several mappings): neither that allocation nor a per-tensor registration can cover it, so the worker does not serve P2P. Tensors the backend classifies as host memory are registered separately as NIXL DRAM, one region per tensor on device 0, so they do not disable pool registration for the accelerator tensors |
+| `register_arena(arena, tensors)` | Register the used VMM arena range once through dmabuf when the active accelerator backend supports the VMM arena fast path, then publish every tensor descriptor against that single MR. Falls back to per-tensor registration when a tensor lies outside the arena range, or when the arena spans several `cuMemCreate` handles (a single MR cannot be addressed by cuda_ipc then; override with `MX_ARENA_SINGLE_MR=1`). Host-memory tensors never lie in the arena; they are registered as DRAM next to the arena MR and do not trigger the fallback |
+| `register_additional_tensors(tensors)` | Append tensors to an already-registered catalog instead of replacing it (`register_tensors` / `register_arena` replace the name -> tensor catalog). Tensors fully covered by the main or a prior appended registration reuse its range; only uncovered ranges are registered. The call refreshes agent metadata, skips names already registered at the same address, and rejects a name registered at a different address. Uncovered host-memory tensors get their own DRAM registration. Used by the speculative draft pass on the main load's agent |
 | `deregister_tensors(names)` | Release tensors added by `register_additional_tensors` (catalog entries and, once unused, their registration handle). Base-catalog names are ignored; `shutdown()` releases those |
 | `fetch_remote_and_wait(agent_name, ip, port)` | P2P: fetch remote NIXL metadata via listen thread (polls until loaded) |
-| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P) |
+| `receive_from_source(source_metadata, source_tensors, ..., remote_agent_name)` | Execute RDMA read transfer; `remote_agent_name` skips `add_remote_agent` (P2P). Reads are grouped by (source, local) memory type, one NIXL transfer per group; every group is prepared before any transfer starts. A source descriptor with an unknown `mem_type` raises `ManifestMismatchError` |
 | `shutdown()` | Clean up NIXL agent and resources |
 
 For socket metadata exchange, `fetch_remote_and_wait` resolves worker hostnames
@@ -1120,7 +1120,8 @@ agent.release_xfer_handle(handle)
 ## FP8 Model Handling (DeepSeek-V3)
 
 Iterator-based vLLM loading owns buffered FP8 indexer weights and scales before
-replaying complete pairs. BF16 weights and pre-fused projections pass through;
+replaying complete pairs. Pending buffers on the wrapper and its inner modules
+are cleared before each load. BF16 weights and pre-fused projections pass through;
 an FP8 indexer weight missing its scale fails explicitly. The partial pair replay
 suppresses MTP completeness checks only for that second load; the initial
 checkpoint load retains draft-layer validation. A CUDA integration test checks
@@ -1128,6 +1129,10 @@ that replay through the real vLLM fused loader preserves both projection shards;
 it skips when CUDA or vLLM is unavailable.
 
 vLLM's `process_weights_after_loading()` transforms model weights into kernel-friendly formats (FP8 scale repacking, NVFP4 padding/swizzling, MLA dequantized projections) and may create new tensors as bare attributes, buffers, or on quant method objects.
+
+For quant methods with `uses_meta_device`, vLLM's native loader runs `finalize_layerwise_processing()` after loading weights and before `process_weights_after_loading()`. ModelExpress uses the standalone `load_weights()` API inside its strategy chain, so its vLLM adapter mirrors that ordering for native, streamed, and RDMA target loads. For native and streamed checkpoint loading, skipping the layerwise finalizer can leave remaining online-FP8 parameters on the Meta device; Qwen3.5 then fails in `_C::static_scaled_fp8_quant` during post-load processing. Before finalizing online-quantized models, these two paths also run `gc.collect()` and empty the accelerator allocator cache, as native loading does in vLLM 0.32 and later; with InstantTensor this releases the blocks the loader left cached. Checkpoint loads without online quantization skip this cleanup. RDMA target preparation leaves the cache untouched and releases it only after a successful receive.
+
+RDMA target preparation uses `DummyModelLoader`. In the tested vLLM 0.29 online-FP8 path, the dummy loader has already materialized and quantized the online layers before the adapter's finalizer runs, leaving no pending layerwise work. The additional finalizer call leaves parameter and buffer layouts unchanged in this path.
 
 The solution: both source and target run `process_weights_after_loading()` first, then `adopt_hidden_tensors()` discovers transferable accelerator tensors on non-Module objects (quant configs, kernel objects), and finally `register_tensors()` collects everything for RDMA. The target runs post-processing on dummy data to establish the correct tensor layout and receives the real data, including hidden quant config tensors, via RDMA.
 
@@ -1183,12 +1188,17 @@ graph TD
 Zero-byte and unallocated (null-address) tensors remain in manifests and
 participate in exact name, size, and dtype validation. On the sender they stay
 in the published manifest but are excluded from NIXL registration; on the
-receiver they count as matched tensors but are omitted from NIXL descriptor
-lists because they have no registered memory range; a nonzero-size tensor
-skipped this way logs a warning, since the local tensor keeps its current
-values. Arena registration ignores such tensors in its containment check. Both
-sides share one predicate for this. A manifest made entirely of empty tensors completes as a
-successful no-op transfer.
+receiver zero-byte tensors count as matched but are omitted from NIXL
+descriptor lists. A nonzero-size source tensor without an address is rejected
+when exact matching is required; otherwise it is skipped with a warning and
+the receive is recorded as partial, since the local tensor keeps its current
+values. A source with payload matched to a nonzero-size local tensor without
+an address is rejected in every mode before preparing NIXL descriptors.
+Arena and additional-tensor registration exclude both empty and unallocated
+tensors from memory-range and contiguity checks, while retaining their names
+in the catalog. All registration paths share the same memory-range predicate.
+A manifest made entirely of zero-byte tensors completes as a successful no-op
+transfer, including in exact-match mode.
 
 Tarred cache artifacts carry regular files and directories only. The source
 side enumerates members explicitly and hands tar that list, so nothing else can
@@ -1228,6 +1238,7 @@ See [`metadata.md`](metadata.md) for the full storage schema and debugging guide
 | `MX_ARTIFACT_READY_TIMEOUT_SECS` | `1800` | Maximum time the artifact publisher waits for readiness and successful publication before giving up |
 | `MX_ARTIFACT_COMPILE_CONFIG_DIGEST` | `""` (unset) | Feeds the `SourceIdentity` of the torch compile cache and of the kernel JIT caches (Triton, DeepGEMM, TileLang, CuTe DSL, FlashInfer; SGLang also TVM-FFI), adding compile configuration as a partitioning dimension for artifact discovery. Unset leaves the field empty, which drops it from the `mx_source_id` input, so workers whose other identity fields match — model, tensor/pipeline/expert parallel size, dtype, quantization, revision, vLLM/torch/CUDA/Triton versions, GPU arch — share one pool even when their compile configurations differ. See [Pairing workers by compile configuration](DEPLOYMENT.md#pairing-workers-by-compile-configuration) |
 | `MX_MODEL_REVISION` | (from vLLM config) | Override for `SourceIdentity.revision`. Pin to the exact checkpoint identifier so `mx_source_id` is content-addressed |
+| `MX_COLD_START_FORMAT` | `auto` | vLLM only. Load format of the native disk fallback (`DefaultStrategy`, the server-cache path, and the vLLM loader's `download_model`/`load_weights`). `safetensors` refuses `.bin`/`.pt` checkpoints |
 | `MX_K8S_SERVICE_PATTERN` | `mx-sources` | DNS template for the `k8s-service` backend; `{rank}` is substituted with the worker's own rank. Client auto-appends `:{MX_WORKER_GRPC_PORT + rank}` if the resolved pattern has no explicit port |
 | `MX_K8S_SOURCE_RETRIES` | `5` | `k8s-service` max retries on `FAILED_PRECONDITION` (rolling-update transients). Fresh gRPC channel per attempt so kube-proxy re-picks a backend |
 | `MX_K8S_SOURCE_BACKOFF_SECONDS` | `0.5` | `k8s-service` sleep between retry attempts |

@@ -20,15 +20,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelexpress import p2p_pb2
 from modelexpress.load_strategy.base import SourceTransferError
 from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+from modelexpress.types import ManifestMismatchError
 
 P2P_AGENT = "mx-auto-worker0-0d6a01a9"
 BLOB_AGENT = "agent-from-blob"
 
 
-def _descriptor(name="w0"):
-    return SimpleNamespace(name=name, addr=4096, size=128, device_id=0, dtype="torch.bfloat16")
+def _descriptor(name="w0", mem_type=p2p_pb2.TENSOR_MEMORY_TYPE_VRAM):
+    return SimpleNamespace(
+        name=name, addr=4096, size=128, device_id=0, dtype="torch.bfloat16", mem_type=mem_type
+    )
 
 
 def _manager():
@@ -51,6 +55,7 @@ def _ctx(manager):
         worker_rank=0,
         worker_id="target-0",
         is_reload=False,
+        require_exact_tensor_catalog=False,
         nixl_manager=manager,
         accelerator_backend=SimpleNamespace(name="cuda", synchronize=MagicMock()),
         adapter=adapter,
@@ -296,6 +301,16 @@ def test_donor_preparation_precedes_registration(p2p):
     assert events == [("prepare", ["w0"]), ("register", None)]
 
 
+@pytest.mark.parametrize("p2p", [False, True])
+def test_source_memory_type_reaches_receive(p2p):
+    manager = _manager()
+    desc = _descriptor(mem_type=p2p_pb2.TENSOR_MEMORY_TYPE_DRAM)
+    with patch(__name__ + "._descriptor", return_value=desc):
+        _receive(manager, p2p=p2p)
+    source_tensors = manager.receive_from_source.call_args.kwargs["source_tensors"]
+    assert source_tensors[0].mem_type == p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+
+
 def test_draft_preparation_uses_model_names_before_namespaced_registration():
     manager = _manager()
     ctx = _ctx(manager)
@@ -331,3 +346,18 @@ def test_reload_does_not_change_registered_runtime_layout():
     ctx.is_reload = True
     _receive(manager, ctx=ctx)
     ctx.adapter.prepare_rdma_target_from_manifest.assert_not_called()
+
+
+def test_exact_catalog_rejection_falls_back():
+    """A reload that asks for an exact catalog passes that on, and a peer that
+    does not name every target tensor fails the attempt before any write."""
+    mgr = _manager()
+    mgr.receive_from_source.side_effect = ManifestMismatchError("Tensor name mismatch")
+    ctx = _ctx(mgr)
+    ctx.require_exact_tensor_catalog = True
+
+    with pytest.raises(SourceTransferError, match="Tensor name mismatch"):
+        _receive(mgr, ctx=ctx)
+
+    assert mgr.receive_from_source.call_args.kwargs["require_exact_match"] is True
+    mgr.remove_remote_agent.assert_called_once_with(P2P_AGENT)

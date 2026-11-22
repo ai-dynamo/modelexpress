@@ -8,7 +8,7 @@ use modelexpress_common::{
     grpc::p2p::worker_metadata::SourcePayload,
     grpc::p2p::{
         ArtifactSourceMetadata, BackendFramework, MxSourceType, SourceIdentity, TensorDescriptor,
-        WorkerMetadata,
+        TensorMemoryType, WorkerMetadata,
     },
 };
 use modelexpress_server::p2p::backend::WorkerRecord;
@@ -79,6 +79,7 @@ fn artifact_payload_does_not_publish_weight_tensors() {
             size: 4096,
             device_id: 0,
             dtype: "bfloat16".to_string(),
+            mem_type: TensorMemoryType::Vram as i32,
         }],
         source_payload: Some(SourcePayload::ArtifactSource(ArtifactSourceMetadata {
             artifact_id: "artifact-manifest".to_string(),
@@ -159,6 +160,7 @@ fn tensor_payload_also_populates_legacy_tensors_for_old_readers() {
                     size: 4096,
                     device_id: 0,
                     dtype: "bfloat16".to_string(),
+                    mem_type: TensorMemoryType::Vram as i32,
                 }],
             },
         )),

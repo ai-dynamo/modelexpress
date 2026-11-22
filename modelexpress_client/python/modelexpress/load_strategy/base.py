@@ -350,13 +350,21 @@ def register_tensors(
             else:
                 base_port = envs.MX_METADATA_PORT
                 listen_port = base_port + ctx.device_id
-                ctx.nixl_manager = _init_nixl_manager(
-                    ctx.global_rank,
-                    ctx.device_id,
-                    "auto",
-                    listen_port,
-                    ctx.accelerator_backend,
-                )
+                try:
+                    ctx.nixl_manager = _init_nixl_manager(
+                        ctx.global_rank,
+                        ctx.device_id,
+                        "auto",
+                        listen_port,
+                        ctx.accelerator_backend,
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"NIXL agent with listen port {listen_port} = "
+                        f"MX_METADATA_PORT ({base_port}) + device_id "
+                        f"({ctx.device_id}) failed to start; if the port is "
+                        f"taken by another service, change MX_METADATA_PORT: {e}"
+                    ) from e
 
         if ctx.p2p_role == "draft":
             # Reusing the target's manager means tensor_descriptors is already
@@ -445,6 +453,7 @@ def publish_metadata(ctx: LoadContext) -> None:
                 ctx.tensors,
                 device_id=ctx.device_id,
                 worker_rank=ctx.worker_rank,
+                accelerator_backend=ctx.accelerator_backend,
             )
         except Exception as e:
             logger.warning(
@@ -466,6 +475,7 @@ def publish_metadata(ctx: LoadContext) -> None:
             ctx.worker_rank, ctx.device_id, ctx.identity, ctx.worker_id,
             accelerator=ctx.accelerator_backend.name,
             ready_fn=ctx.source_ready_fn,
+            accelerator_backend=ctx.accelerator_backend,
         )
     except Exception as e:
         logger.warning(

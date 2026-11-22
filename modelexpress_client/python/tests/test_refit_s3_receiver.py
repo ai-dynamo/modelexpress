@@ -2768,7 +2768,10 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         lambda version_id, **_kwargs: versions[version_id],
     )
     peer = GeneratorPeerUpdateSource(
-        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="peer:9000"), mx_source_id="peer", worker_id="peer"
+        worker=p2p_pb2.WorkerMetadata(worker_grpc_endpoint="peer:9000"),
+        mx_source_id="peer",
+        worker_id="peer",
+        identity=p2p_pb2.SourceIdentity(model_name="model"),
     )
     resolver = Mock(spec=SourceResolver, kind=WeightSource.GENERATOR)
     resolver.supports.return_value = True
@@ -2777,7 +2780,10 @@ def test_generator_s3_fallback_uses_disk_version_after_peer_updates(
         (peer,) if use_peer_for_second_delta and version.version_id == "delta-2" else ()
     )
     peer_method = RuntimeTensorNixlUpdateMethod(
-        manager=Mock(), device_id=0, runtime_tensors={"weight": tensors[0]}
+        manager=Mock(),
+        device_id=0,
+        accelerator="cuda",
+        runtime_tensors={"weight": tensors[0]},
     )
     monkeypatch.setattr(peer_method, "_prepare_peer_read", lambda _source: Mock())
     monkeypatch.setattr(peer_method, "_receive_peer", lambda _read: {})
@@ -4307,3 +4313,95 @@ def test_single_large_delta_uses_all_configured_chunk_workers(monkeypatch, tmp_p
     checkpoint._apply_shards({"delta.safetensors": (shard, ["weight"])}, index_metadata={"checksum_format": "adler32", "compression_format": "zstd"})
     assert len(threads) == 4
     assert np.array_equal(np.fromfile(path, dtype=np.uint8), target)
+
+
+def test_full_admission_can_drop_uninstalled_heads_working_copy(monkeypatch, tmp_path):
+    """A finite quota can fit the next full checkpoint once the redundant copy is gone."""
+    head_objects = _full_artifact(torch.tensor([3.0, 4.0]), version_label=6)
+    next_objects = _full_artifact(torch.tensor([7.0, 8.0]), version_label=7)
+    adapter, _ = _build(monkeypatch, tmp_path, head_objects | next_objects)
+    checkpoint = adapter._checkpoint
+    store = checkpoint.store
+    head = _full_inputs(version="head-full", version_label=6)
+    prepared = adapter.stage_weight(head)
+    adapter.release_staged_weight(prepared)
+    copy = store.working_copy(head.version_id)
+    assert copy is not None
+    incoming_size = sum(map(len, next_objects.values()))
+    store.max_size_bytes = (
+        store.cache_size_bytes() - sum(map(len, head_objects.values())) + incoming_size
+    )
+    assert store.active_version() == "base-a"
+
+    target = _full_inputs(version="next-full", version_label=7)
+    prepared = adapter.stage_weight(target)
+    assert not copy.exists()
+    assert store.full_path(head.version_id).exists()
+    assert torch.equal(
+        load_file(prepared.path / "model-00001-of-00001.safetensors")["weight"],
+        torch.tensor([7.0, 8.0]),
+    )
+    adapter.release_staged_weight(prepared)
+    adapter.close()
+
+
+def test_spread_tensors_share_one_chunk_budget(monkeypatch, tmp_path):
+    """Several large tensors share the same cap on running and queued blocks."""
+    workers = 4
+    budget = 2 * workers
+    names = [f"weight-{i}" for i in range(workers)]
+    base = np.arange(256, dtype=np.uint8)
+    delta = np.full_like(base, 7)
+    target = base ^ delta
+    path = tmp_path / "weights.bin"
+    np.tile(base, workers).tofile(path)
+    tensors = dict.fromkeys(names, compress_delta(delta))
+    shard = safetensors.numpy.save(tensors, metadata=dict.fromkeys(names, _checksum(target)))
+    checkpoint = receiver_module._LocalCheckpoint.__new__(receiver_module._LocalCheckpoint)
+    checkpoint.locations = {
+        name: (path, index * base.nbytes, base.nbytes) for index, name in enumerate(names)
+    }
+    monkeypatch.setenv("MX_REFIT_DELTA_WORKERS", str(workers))
+    monkeypatch.setattr(receiver_module, "_APPLY_CHUNK_BYTES", 16)
+    monkeypatch.setattr(receiver_module, "_SPREAD_TENSOR_BYTES", 32)
+
+    changed = threading.Condition()
+    unblock = threading.Event()
+    outstanding = peak = 0
+
+    class RecordingExecutor(ThreadPoolExecutor):
+        def submit(self, fn, *args, **kwargs):
+            nonlocal outstanding, peak
+            with changed:
+                outstanding += 1
+                peak = max(peak, outstanding)
+                changed.notify_all()
+
+            def blocked_chunk():
+                nonlocal outstanding
+                try:
+                    assert unblock.wait(timeout=10)
+                    return fn(*args, **kwargs)
+                finally:
+                    with changed:
+                        outstanding -= 1
+
+            return super().submit(blocked_chunk)
+
+    monkeypatch.setattr(receiver_module, "ThreadPoolExecutor", RecordingExecutor)
+    with ThreadPoolExecutor(max_workers=1) as coordinator:
+        finished = coordinator.submit(
+            checkpoint._apply_shards,
+            {"delta.safetensors": (shard, names)},
+            index_metadata={"checksum_format": "adler32", "compression_format": "zstd"},
+        )
+        try:
+            with changed:
+                assert changed.wait_for(lambda: peak >= budget, timeout=5)
+                assert not changed.wait_for(lambda: peak > budget, timeout=0.25)
+        finally:
+            unblock.set()
+        finished.result(timeout=5)
+
+    assert peak == budget
+    np.testing.assert_array_equal(np.fromfile(path, dtype=np.uint8), np.tile(target, workers))

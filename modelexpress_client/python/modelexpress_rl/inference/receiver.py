@@ -5,9 +5,10 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
-import itertools
+import mmap
 import os
 import shutil
 import threading
@@ -133,7 +134,7 @@ _Decompressor = Callable[[memoryview], Any]
 
 # Delta bytes applied per read and write of the checkpoint file. Tensors larger
 # than _SPREAD_TENSOR_BYTES spread their chunks over the apply workers.
-_APPLY_CHUNK_BYTES = 16 << 20
+_APPLY_CHUNK_BYTES = 2 << 20
 _SPREAD_TENSOR_BYTES = 256 << 20
 
 
@@ -141,9 +142,7 @@ def _read_exactly(fd: int, out: memoryview, offset: int) -> None:
     """Fill a byte view with positional reads, rejecting premature EOF."""
     done = 0
     while done < len(out):
-        read = os.pread(fd, len(out) - done, offset + done)
-        out[done : done + len(read)] = read
-        read = len(read)
+        read = os.preadv(fd, [out[done:]], offset + done)
         if read <= 0:
             raise ValueError(f"checkpoint file ended at byte {offset + done}")
         done += read
@@ -1091,6 +1090,8 @@ class _LocalCheckpoint:
         active_version = _active_version(self.store)
         if active_version not in {None, version.version_id}:
             self.store.drop_unused_working_copy(active_version)
+        if restore_version not in {None, active_version, version.version_id}:
+            self.store.drop_unused_working_copy(restore_version)
         target = self.store.full_path(version.version_id)
         if target.exists():
             source = self.store.artifact_source(target)
@@ -1407,9 +1408,14 @@ class _LocalCheckpoint:
         ]
         checksum_format = index_metadata["checksum_format"]
         decompress = _DECOMPRESSORS[index_metadata["compression_format"]]
-        workers = min(rl_envs.MX_REFIT_DELTA_WORKERS, len(items))
-        chunk_workers = rl_envs.MX_REFIT_DELTA_WORKERS if len(items) == 1 else workers
+        chunk_workers = rl_envs.MX_REFIT_DELTA_WORKERS
+        workers = min(chunk_workers, len(items))
+        max_pending = 2 * chunk_workers
+        slots = threading.BoundedSemaphore(max_pending)
         local = threading.local()
+
+        def spread_tensor(size: int) -> bool:
+            return chunk_workers > 1 and size > _SPREAD_TENSOR_BYTES
 
         def apply_chunk(
             fd: int, offset: int, block: bytes, position: int
@@ -1427,72 +1433,120 @@ class _LocalCheckpoint:
             _write_all(fd, view, offset + position)
             return checksum, delta.size
 
+        def apply_mapped(
+            target: np.ndarray, reader: Any, checksum: Adler32Checksum
+        ) -> int:
+            """Keep small tensors on the native mmap path without copying their base bytes."""
+            try:
+                position = 0
+                while position < target.size:
+                    block = reader.read(min(_APPLY_CHUNK_BYTES, target.size - position))
+                    if not block:
+                        break
+                    delta = np.frombuffer(block, dtype=np.uint8)
+                    end = position + delta.size
+                    region = target[position:end]
+                    try:
+                        np.bitwise_xor(region, delta, out=region)
+                        checksum.update(region)
+                    finally:
+                        del region
+                    position = end
+                return position
+            finally:
+                del target
+
         files: dict[Path, int] = {}
-        with ThreadPoolExecutor(
-            max_workers=rl_envs.MX_REFIT_DELTA_WORKERS, thread_name_prefix="modelexpress-delta-chunk"
-        ) as chunks:
+        maps: dict[Path, mmap.mmap] = {}
+        with ExitStack() as stack:
+            for name, _data, _checksum in items:
+                path, _, size = self.locations[name]
+                if path not in files:
+                    descriptor = os.open(path, os.O_RDWR)
+                    stack.callback(os.close, descriptor)
+                    files[path] = descriptor
+                if not spread_tensor(size) and path not in maps:
+                    maps[path] = stack.enter_context(mmap.mmap(files[path], 0))
+            chunks = stack.enter_context(
+                ThreadPoolExecutor(
+                    max_workers=chunk_workers, thread_name_prefix="modelexpress-delta-chunk"
+                )
+            )
 
-            def apply_one(item) -> None:
-                """Decompress one tensor, bound queued chunks, and verify its combined checksum."""
-                name, compressed, expected_checksum = item
-                path, file_offset, size = self.locations[name]
-                fd = files[path]
-                checksum = checksum_factory(checksum_format)
-                # A large tensor's chunks spread over the workers; others stay here.
-                spread = rl_envs.MX_REFIT_DELTA_WORKERS > 1 and size > _SPREAD_TENSOR_BYTES
+            def release_slot(_future: Future) -> None:
+                slots.release()
+
+            def apply_spread(
+                fd: int, file_offset: int, size: int, reader: Any, checksum: Adler32Checksum
+            ) -> int:
+                """Share a single chunk budget and combine results in tensor byte order."""
                 pending: deque[Future] = deque()
+                position = 0
 
-                def collect(result) -> None:
-                    """Combine the next completed chunk checksum in original byte order."""
-                    part, length = result
+                def collect() -> None:
+                    part, length = pending.popleft().result()
                     checksum.extend(part, length)
 
-                reader = decompress(compressed)
-                position = 0
-                extra = b""
                 try:
                     while position < size:
-                        block = reader.read(min(_APPLY_CHUNK_BYTES, size - position))
-                        if not block:
-                            break
-                        if spread:
-                            pending.append(
-                                chunks.submit(apply_chunk, fd, file_offset, block, position)
-                            )
-                            if len(pending) >= 2 * chunk_workers:
-                                collect(pending.popleft().result())
-                        else:
-                            collect(apply_chunk(fd, file_offset, block, position))
-                        position += len(block)
-                    if position == size:
-                        extra = reader.read(1)
+                        if len(pending) == max_pending:
+                            collect()
+                        slots.acquire()
+                        try:
+                            block = reader.read(min(_APPLY_CHUNK_BYTES, size - position))
+                            if not block:
+                                slots.release()
+                                break
+                            length = len(block)
+                            future = chunks.submit(apply_chunk, fd, file_offset, block, position)
+                        except BaseException:
+                            slots.release()
+                            raise
+                        del block
+                        future.add_done_callback(release_slot)
+                        pending.append(future)
+                        position += length
                     while pending:
-                        collect(pending.popleft().result())
+                        collect()
+                    return position
                 finally:
-                    reader.close()
                     for future in pending:
                         future.cancel()
                     wait(pending)
+
+            def apply_one(item) -> None:
+                """Apply one tensor and verify its target checksum."""
+                name, compressed, expected_checksum = item
+                path, file_offset, size = self.locations[name]
+                checksum = checksum_factory(checksum_format)
+                reader = decompress(compressed)
+                try:
+                    if spread_tensor(size):
+                        position = apply_spread(files[path], file_offset, size, reader, checksum)
+                    else:
+                        target = np.frombuffer(
+                            maps[path], dtype=np.uint8, count=size, offset=file_offset
+                        )
+                        try:
+                            position = apply_mapped(target, reader, checksum)
+                        finally:
+                            del target
+                    extra = reader.read(1) if position == size else b""
+                finally:
+                    reader.close()
                 if position != size or extra:
                     raise ValueError(f"canonical delta byte size differs for {name!r}")
-                # Checksums describe the delta's target, not a reverted base.
                 if checksum.hexdigest() != expected_checksum:
                     raise ValueError(f"canonical target checksum differs for {name!r}")
 
-            try:
-                for path in {self.locations[name][0] for name, _data, _checksum in items}:
-                    files[path] = os.open(path, os.O_RDWR)
-                list(
-                    threadpool_map(
-                        items,
-                        apply_one,
-                        max_workers=workers,
-                        thread_name_prefix="modelexpress-delta-apply",
-                    )
+            list(
+                threadpool_map(
+                    items,
+                    apply_one,
+                    max_workers=workers,
+                    thread_name_prefix="modelexpress-delta-apply",
                 )
-            finally:
-                for descriptor in files.values():
-                    os.close(descriptor)
+            )
 
     def _validate_prepared(
         self,

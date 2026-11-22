@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+from contextlib import ExitStack
 
 from .. import envs
 from ..adapter import EngineAdapter, StrategyFailed
@@ -88,7 +89,11 @@ class InstantTensorStrategy(WeightsIteratorLoadStrategy):
             raise StrategyFailed(str(e), mutated=False) from e
 
         try:
-            result = ctx.adapter.apply_weight_iter(result, weights_iter)
+            with ExitStack() as cleanup:
+                close = getattr(weights_iter, "close", None)
+                if close is not None:
+                    cleanup.callback(close)
+                result = ctx.adapter.apply_weight_iter(result, weights_iter)
         except Exception as e:
             logger.warning(
                 f"[Worker {ctx.global_rank}] InstantTensor loading failed, falling through: {e}"

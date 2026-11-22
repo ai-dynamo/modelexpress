@@ -40,7 +40,9 @@ _vmm_arenas: dict[int, "VmmArena"] = {}
 
 
 @contextmanager
-def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
+def maybe_enter_vmm_arena(
+    ctx: "LoadContext", release_idle: bool = True
+) -> Iterator[None]:
     """If ``MX_VMM_ARENA=1`` is set, install a VmmArena hook around the
     load envelope. Otherwise yield without installing anything.
 
@@ -175,7 +177,7 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
     # the .so is absent and the arena machinery cannot be installed.
     # Fall back to the non-arena path with a clear warning rather than
     # crashing the load.
-    from .hook import ARENA_AVAILABLE
+    from .hook import ARENA_AVAILABLE, arena_supported_torch
 
     if not ARENA_AVAILABLE:
         logger.warning(
@@ -184,6 +186,17 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
             "path. Pool-reg (MX_POOL_REG=1) still works. Reinstall "
             "modelexpress with a working C++ compiler to enable the arena "
             "fast path.",
+            ctx.global_rank,
+        )
+        yield
+        return
+
+    if not arena_supported_torch():
+        logger.warning(
+            "[Worker %d] MX_VMM_ARENA=1 set but the installed torch is older "
+            "than 2.8, where empty_cache() can free arena memory with "
+            "cudaFree instead of the arena's allocator; falling back to the "
+            "non-arena load path. Upgrade torch to enable the arena.",
             ctx.global_rank,
         )
         yield
@@ -253,7 +266,7 @@ def maybe_enter_vmm_arena(ctx: "LoadContext") -> Iterator[None]:
     ctx.vmm_arena = arena
     published = False
     try:
-        with use_arena(arena, device=ctx.device_id):
+        with use_arena(arena, device=ctx.device_id, release_idle=release_idle):
             yield
         _vmm_arenas[ctx.device_id] = arena
         published = True

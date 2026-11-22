@@ -52,6 +52,13 @@ class MockAcceleratorBackend:
     def is_accel_tensor(self, tensor: torch.Tensor) -> bool:
         return tensor.device.type == self.torch_device_type
 
+    def tensor_mem_type(self, tensor: torch.Tensor) -> int:
+        from modelexpress import p2p_pb2
+
+        if self.is_accel_tensor(tensor):
+            return p2p_pb2.TENSOR_MEMORY_TYPE_VRAM
+        return p2p_pb2.TENSOR_MEMORY_TYPE_DRAM
+
     def supports_rdma_p2p(self) -> bool:
         return self.rdma_p2p
 
