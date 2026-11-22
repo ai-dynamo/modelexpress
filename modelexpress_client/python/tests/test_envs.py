@@ -216,3 +216,37 @@ def test_cold_start_format(monkeypatch, raw, expected):
     else:
         monkeypatch.setenv("MX_COLD_START_FORMAT", raw)
     assert envs.MX_COLD_START_FORMAT == expected
+
+
+def test_gds_defaults_when_unset(monkeypatch):
+    for name in ("MX_GDS_MAX_CHUNK_KB", "MX_GDS_THREADS", "MX_GDS_TIMEOUT"):
+        monkeypatch.delenv(name, raising=False)
+    assert envs.MX_GDS_MAX_CHUNK_KB == 131072
+    assert envs.MX_GDS_THREADS == 8
+    assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)
+
+
+def test_gds_valid_overrides(monkeypatch):
+    monkeypatch.setenv("MX_GDS_MAX_CHUNK_KB", "4096")
+    monkeypatch.setenv("MX_GDS_THREADS", "16")
+    monkeypatch.setenv("MX_GDS_TIMEOUT", "30")
+    assert envs.MX_GDS_MAX_CHUNK_KB == 4096
+    assert envs.MX_GDS_THREADS == 16
+    assert envs.MX_GDS_TIMEOUT == pytest.approx(30.0)
+
+
+@pytest.mark.parametrize(
+    ("name", "default"), [("MX_GDS_MAX_CHUNK_KB", 131072), ("MX_GDS_THREADS", 8)]
+)
+@pytest.mark.parametrize("value", ["0", "-4", "128k", "1.5", ""])
+def test_gds_int_settings_reject_non_positive_or_malformed(
+    monkeypatch, name, default, value
+):
+    monkeypatch.setenv(name, value)
+    assert getattr(envs, name) == default
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "inf", "nan", "soon"])
+def test_gds_timeout_rejects_non_positive_or_non_finite(monkeypatch, value):
+    monkeypatch.setenv("MX_GDS_TIMEOUT", value)
+    assert envs.MX_GDS_TIMEOUT == pytest.approx(120.0)

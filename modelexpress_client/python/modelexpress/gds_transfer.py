@@ -83,9 +83,6 @@ def _cufile_loadable() -> bool:
         return False
 
 
-_DEFAULT_MAX_CHUNK = 128 * 1024 * 1024  # 128 MB
-
-
 class GdsTransferManager:
     """
     Manages NIXL GDS_MT backend for direct file-to-GPU transfers.
@@ -103,8 +100,7 @@ class GdsTransferManager:
         self._device_id: int | None = None
         self._agent: Any = None
         self._accelerator_backend = accelerator_backend
-        override = envs.MX_GDS_MAX_CHUNK_KB
-        self._max_chunk_size = int(override) * 1024 if override else _DEFAULT_MAX_CHUNK
+        self._max_chunk_size = envs.MX_GDS_MAX_CHUNK_KB * 1024
 
     def __enter__(self) -> GdsTransferManager:
         self.initialize()

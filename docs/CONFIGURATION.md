@@ -172,7 +172,7 @@ MX_POOL_REG and MX_VMM_ARENA are alternative registration optimizations. Pool re
 |---|---|---|
 | RUNAI_STREAMER_CONCURRENCY | 8 | Concurrent storage reads |
 | RUNAI_STREAMER_MEMORY_LIMIT | unset | CPU staging buffer size; 0 uses a single-tensor buffer |
-| MX_GDS_MAX_CHUNK_KB | unset | GDS chunk-size override |
+| MX_GDS_MAX_CHUNK_KB | 131072 (128 MB) | Largest single GDS read, in KB |
 | MX_GDS_THREADS | 8 | GDS worker threads |
 | MX_GDS_TIMEOUT | 120 seconds | GDS operation timeout |
 | INSTANTTENSOR_BACKEND | runtime default | InstantTensor backend such as URING, AIO, CUFILE, or MMAP |
