@@ -84,6 +84,8 @@ spec:
           args:
             - --model
             - $(MODEL_NAME)
+            - --revision
+            - $(MX_MODEL_REVISION)
             - --load-format
             - modelexpress
             - --tensor-parallel-size
@@ -159,6 +161,8 @@ spec:
           args:
             - --model
             - $(MODEL_NAME)
+            - --revision
+            - $(MX_MODEL_REVISION)
             - --load-format
             - modelexpress
             - --tensor-parallel-size

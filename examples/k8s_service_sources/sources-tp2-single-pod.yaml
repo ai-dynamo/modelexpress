@@ -23,7 +23,7 @@
 # Prerequisites:
 #   - HF token secret: kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 #   - Nodes with N GPUs available per pod (for TP=2: 2x GPU per pod)
-#   - Pin the revision via MX_MODEL_REVISION so mx_source_id is content-addressed
+#   - Set MX_MODEL_REVISION to the full Hugging Face commit SHA for vLLM and the source identity
 
 # ---------------------------------------------------------------------------
 # Service - one Service, one port per rank (port 6555+rank)
@@ -111,6 +111,8 @@ spec:
           args:
             - --model
             - $(MODEL_NAME)
+            - --revision
+            - $(MX_MODEL_REVISION)
             - --load-format
             - modelexpress
             - --tensor-parallel-size

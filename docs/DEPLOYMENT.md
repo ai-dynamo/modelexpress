@@ -1595,6 +1595,11 @@ Two deployment topologies are supported; pick based on your TP parallelism needs
 1. **Multi-GPU-per-pod** (TP ranks share NVLink inside one pod). One Service with N named ports. Default pattern: `MX_K8S_SERVICE_PATTERN=mx-sources`, client auto-computes `:{MX_WORKER_GRPC_PORT + rank}`.
 2. **1-GPU-per-pod** (one rank per pod; rank partitioning via labels). N Services with rank selectors. Pattern: `MX_K8S_SERVICE_PATTERN=mx-sources-rank-{rank}:6555`.
 
+Before applying the Hugging Face examples, set `MODEL_NAME` and
+`MX_MODEL_REVISION` to the same model ID and full commit SHA, respectively, in
+every source and target Deployment. The manifest passes the SHA to vLLM
+`--revision` and uses it in the ModelExpress source identity.
+
 **Deploy the multi-GPU-per-pod shape (the common case for TP inference):**
 
 ```bash
@@ -1657,15 +1662,27 @@ spec:
         - name: vllm
           image: your-registry/modelexpress-client:TAG
           env:
+            - { name: MODEL_NAME,          value: "<hugging-face-model-id>" }
             - { name: MX_METADATA_BACKEND, value: "k8s-service" }
             - { name: MX_MODEL_REVISION,   value: "<pinned-commit-sha>" }
             - { name: MX_WORKER_GRPC_PORT, value: "6555" }
             # MX_K8S_SERVICE_PATTERN defaults to `mx-sources`; omit unless overriding.
-          args: ["--model", "$(MODEL_NAME)", "--load-format", "modelexpress", "--tensor-parallel-size", "2"]
+          args:
+            - --model
+            - $(MODEL_NAME)
+            - --revision
+            - $(MX_MODEL_REVISION)
+            - --load-format
+            - modelexpress
+            - --tensor-parallel-size
+            - "2"
           resources: { limits: { nvidia.com/gpu: 2 } }
 ```
 
 **Common operations:**
+
+For Deployments created from an earlier copy of the examples, apply the updated
+manifests with their current checkpoint SHA before using the revision update below.
 
 ```bash
 # Check which rank a pod's workers are serving.
@@ -1674,16 +1691,22 @@ kubectl -n $NAMESPACE logs deploy/mx-sources -c vllm | grep -i "worker_rank"
 # Inspect the Service's port -> backend mapping.
 kubectl -n $NAMESPACE describe svc mx-sources
 
-# Rolling update to a new model revision. Update MX_MODEL_REVISION env
-# in the Deployment; K8s rolls pods one by one; during the transition
-# kube-proxy may route to either version. The client handshake returns
-# FAILED_PRECONDITION on mismatch, and targets retry on a fresh channel.
-kubectl -n $NAMESPACE set env deployment/mx-sources MX_MODEL_REVISION=<new-sha>
+# For this Hugging Face manifest, update the SHA used by both vLLM and
+# ModelExpress. During the rollout, targets retry on a fresh channel if
+# the Service routes to a source with a different identity.
+NEW_MODEL_REVISION=your_new_commit_sha
+kubectl -n $NAMESPACE set env deployment/mx-sources MX_MODEL_REVISION="$NEW_MODEL_REVISION"
 kubectl -n $NAMESPACE rollout status deployment/mx-sources
 
 # Tear down.
 kubectl -n $NAMESPACE delete -f examples/k8s_service_sources/sources-tp2-single-pod.yaml
 ```
+
+When sources and targets use separate Deployments, roll out the source
+Deployments first. Then set `MX_MODEL_REVISION` to the same new SHA on each
+target Deployment that should load the new checkpoint. While both revisions are
+present, each target accepts sources whose identity matches its configured
+revision.
 
 See [`../examples/k8s_service_sources/README.md`](../examples/k8s_service_sources/README.md) for the annotated manifests and [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale.
 

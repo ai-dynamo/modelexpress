@@ -13,7 +13,7 @@
 # Prerequisites:
 #   - HF token secret:  kubectl create secret generic hf-token-secret --from-literal=HF_TOKEN=<token>
 #   - RDMA-capable NICs available on the nodes (rdma/shared_ib)
-#   - Pin the revision via MX_MODEL_REVISION so mx_source_id is content-addressed
+#   - Set MX_MODEL_REVISION to the full Hugging Face commit SHA for vLLM and the source identity
 
 # ---------------------------------------------------------------------------
 # Rank 0
@@ -69,8 +69,7 @@ spec:
           env:
             - name: MODEL_NAME
               value: "deepseek-ai/DeepSeek-V3"
-            # Pin the model revision so mx_source_id is content-addressed.
-            # Replace with the exact HuggingFace commit SHA you intend to serve.
+            # Replace with the full Hugging Face commit SHA you intend to serve.
             - name: MX_MODEL_REVISION
               value: "REPLACE_WITH_COMMIT_SHA"
             - name: VLLM_PLUGINS
@@ -105,6 +104,8 @@ spec:
           args:
             - --model
             - $(MODEL_NAME)
+            - --revision
+            - $(MX_MODEL_REVISION)
             - --load-format
             - modelexpress
             - --tensor-parallel-size
@@ -210,6 +211,8 @@ spec:
           args:
             - --model
             - $(MODEL_NAME)
+            - --revision
+            - $(MX_MODEL_REVISION)
             - --load-format
             - modelexpress
             - --tensor-parallel-size
