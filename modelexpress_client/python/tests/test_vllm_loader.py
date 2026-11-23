@@ -3654,3 +3654,27 @@ def test_standalone_native_loader_does_not_receive_mx_readiness_options(monkeypa
     loader.load_weights("model", "model-config")
     assert received == ["model-config", "model"]
     assert config.model_loader_extra_config["modelexpress_artifact_ready_url"] == "http://127.0.0.1:9007/health"
+
+
+@pytest.mark.parametrize("fmt", ["auto", "safetensors"])
+def test_native_fallback_drops_streamer_options_without_mutating_config(monkeypatch, fmt):
+    from modelexpress.engines.vllm.adapter import cold_start_load_config
+
+    monkeypatch.setenv("MX_COLD_START_FORMAT", fmt)
+    options = {
+        "memory_limit": 8589934592,
+        "concurrency": 8,
+        "distributed": True,
+        "enable_multithread_load": True,
+        "num_threads": 4,
+    }
+    config = SimpleNamespace(load_format="modelexpress", model_loader_extra_config=options)
+    fallback = cold_start_load_config(config)
+
+    assert fallback.load_format == fmt
+    assert fallback.model_loader_extra_config == {"enable_multithread_load": True, "num_threads": 4}
+    assert config.load_format == "modelexpress"
+    assert config.model_loader_extra_config is options
+    assert options["memory_limit"] == 8589934592
+    assert options["concurrency"] == 8
+    assert options["distributed"] is True
