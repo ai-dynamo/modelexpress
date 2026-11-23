@@ -1213,13 +1213,12 @@ class NixlTransferManager:
             remote_agent_name: If set, use this pre-loaded agent (P2P mode)
                 instead of calling add_remote_agent with source_metadata
                 (centralized mode)
-            require_exact_match: When True, require the source manifest and the
-                locally registered tensors to name the exact same set and reject
-                a zero-match transfer. Used for cross-family (heterogeneous)
-                transfers where a name diff can mean vendor-specific hidden or
-                derived tensors, which would otherwise leave part or all of the
-                target at dummy values while RDMA reports success. Same-family
-                transfers leave this False and tolerate subset transfers.
+            require_exact_match: When True, also reject source-only tensors
+                and a zero-match transfer. Used for cross-family (heterogeneous)
+                transfers, where a name diff can mean vendor-specific hidden or
+                derived tensors. Every mode rejects a local tensor the source
+                does not provide, since it would keep its dummy values while
+                RDMA reports success.
             destination_tensors: Optional registered destination catalog used for
                 name matching. Defaults to the most recently registered catalog.
             on_transfer_start: Optional callback invoked immediately before the
@@ -1230,10 +1229,12 @@ class NixlTransferManager:
 
         Raises:
             ManifestMismatchError: On a size/dtype mismatch for a shared tensor,
-                or, when ``require_exact_match`` is set, on any tensor-name
-                mismatch, a nonempty source tensor without an address, or a
-                zero-match transfer. A nonempty local tensor without an address
-                is rejected in every mode.
+                a local tensor missing from the source manifest, a nonempty
+                source tensor without an address for an allocated local
+                tensor, or a nonempty local tensor without an address. When
+                ``require_exact_match`` is set, also on source-only tensors, any
+                nonempty source tensor without an address, or a zero-match
+                transfer.
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
@@ -1294,7 +1295,10 @@ class NixlTransferManager:
             matched_tensors += 1
             if not _has_memory_range(src_tensor.size, src_tensor.addr):
                 if src_tensor.size > 0:
-                    if require_exact_match:
+                    local_allocated = _has_memory_range(
+                        local_size, local_tensor.data_ptr()
+                    )
+                    if require_exact_match or local_allocated:
                         transfer_metrics.record_nixl_receive("rejected")
                         raise ManifestMismatchError(
                             f"Tensor '{src_tensor.name}' has {src_tensor.size} "
@@ -1342,38 +1346,28 @@ class NixlTransferManager:
         src_names = {s.name for s in source_tensors}
         local_only = sorted(set(local_tensors) - src_names)
         source_only = sorted(src_names - set(local_tensors))
-        if local_only or source_only:
-            if require_exact_match:
-                # Cross-family transfer: a name diff can mean vendor-specific
-                # hidden or derived tensors, so completing the transfer would
-                # leave the local-only tensors at dummy values while reporting
-                # RDMA success. Fail closed instead.
-                transfer_metrics.record_nixl_receive("rejected")
-                raise ManifestMismatchError(
-                    "Tensor name mismatch on heterogeneous transfer: "
-                    f"{len(local_only)} local-only "
-                    f"(first: {local_only[:5]}), "
-                    f"{len(source_only)} source-only "
-                    f"(first: {source_only[:5]})"
-                )
-            # Completing here leaves the local-only tensors at their dummy
-            # values while the transfer still reports success, so the warning is
-            # the only evidence today. Downgrade the outcome rather than
-            # recording now: this path falls through to the same return as a
-            # clean transfer, and recording here would count the receive twice.
-            receive_result = "partial"
-            # Names, not just counts. A local-only tensor keeps its dummy value
-            # while the transfer still reports success, so this line is the only
-            # thing between a partial load and silently wrong output -- and a
-            # count cannot distinguish "48 harmless empty buffers" from "48
-            # weights that never arrived". The strict branch above already
-            # reports names for exactly this reason.
-            logger.warning(
+        if local_only or (source_only and require_exact_match):
+            # A local-only tensor keeps its dummy values while RDMA reports
+            # success. Buffers are no exception: bare tensors derived from the
+            # weights in process_weights_after_loading are adopted as buffers.
+            # Cross-family transfers also reject source-only tensors, which can
+            # be vendor-specific hidden or derived tensors.
+            transfer_metrics.record_nixl_receive("rejected")
+            raise ManifestMismatchError(
                 "Tensor name mismatch between source manifest and local "
-                "registration: %d local-only (first: %s), "
-                "%d source-only (first: %s)",
-                len(local_only),
-                local_only[:10],
+                f"registration: {len(local_only)} local-only "
+                f"(first: {local_only[:5]}), "
+                f"{len(source_only)} source-only "
+                f"(first: {source_only[:5]})"
+            )
+        if source_only:
+            # Downgrade the outcome rather than recording now: this path falls
+            # through to the same return as a clean transfer, and recording here
+            # would count the receive twice.
+            receive_result = "partial"
+            logger.warning(
+                "Source manifest has %d tensors this target does not register "
+                "(first: %s)",
                 len(source_only),
                 source_only[:10],
             )

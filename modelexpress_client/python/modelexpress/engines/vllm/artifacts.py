@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
-from importlib.metadata import version as pkg_version
 from pathlib import Path
 
 import torch
@@ -29,6 +28,7 @@ from ...metadata.artifact_transfer import (
 )
 from ...metadata.artifact_transport import PublicationHandle
 from ...metadata.publisher import PublisherThread
+from .source_identity import _vllm_version
 
 logger = logging.getLogger("modelexpress.engines.vllm.artifacts")
 
@@ -566,21 +566,6 @@ def _is_http_url(url: str) -> bool:
 
 def _has_files(path: Path) -> bool:
     return _artifact_lifecycle.has_files(path)
-
-
-def _vllm_version() -> str:
-    try:
-        import vllm
-
-        version = getattr(vllm, "__version__", "")
-        if isinstance(version, str) and version:
-            return version
-    except Exception:
-        pass
-    try:
-        return pkg_version("vllm")
-    except Exception:
-        return ""
 
 
 def _triton_version() -> str:
