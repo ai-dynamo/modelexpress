@@ -338,6 +338,8 @@ def adopt_bare_tensors(
 def iter_module_tensors(
     module: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
+    *,
+    include_host_parameters: bool = False,
 ) -> list[tuple[str, torch.Tensor, str]]:
     """Iterate over all accelerator tensors in a module tree.
 
@@ -345,6 +347,10 @@ def iter_module_tensors(
     When used with capture_tensor_attrs() wrapping process_weights_after_loading,
     bare tensor attributes (e.g. W_UV, W_UK_T) are auto-promoted to
     non-persistent buffers and thus included in named_buffers().
+
+    With ``include_host_parameters``, parameters in host memory are included
+    too (e.g. DeepSeek V4.1 Engram tables in pinned host memory). Host buffers
+    are not, since they tend to be process-local state.
 
     Returns:
         List of (qualified_name, tensor, tensor_type) tuples for each
@@ -354,7 +360,7 @@ def iter_module_tensors(
     results: list[tuple[str, torch.Tensor, str]] = []
 
     for name, param in module.named_parameters():
-        if backend.is_accel_tensor(param):
+        if _discovers_parameter(param, backend, include_host_parameters):
             results.append((name, param, "parameter"))
 
     for name, buf in module.named_buffers():
@@ -364,21 +370,35 @@ def iter_module_tensors(
     return results
 
 
-def host_resident_parameters(
+def _discovers_parameter(
+    param: torch.Tensor,
+    backend: AcceleratorBackend,
+    include_host_parameters: bool,
+) -> bool:
+    return backend.is_accel_tensor(param) or (
+        include_host_parameters and param.device.type == "cpu"
+    )
+
+
+def undiscovered_parameters(
     module: nn.Module,
     accelerator_backend: AcceleratorBackend | None = None,
+    *,
+    include_host_parameters: bool = False,
 ) -> list[str]:
-    """Return names of non-empty parameters outside accelerator memory.
+    """Return names of non-empty parameters in memory that tensor discovery
+    does not collect from.
 
-    RDMA discovers and transfers accelerator tensors only, so a target keeps
-    its initial values for these (e.g. DeepSeek V4.1 Engram tables in pinned
-    host memory).
+    A target would keep its initial values for these, e.g. DeepSeek V4.1
+    Engram tables in pinned host memory when host parameters are not
+    discovered, or a parameter left on the ``meta`` device.
     """
     backend = _resolve_accelerator_backend(accelerator_backend)
     return [
         name
         for name, param in module.named_parameters()
-        if param.numel() > 0 and not backend.is_accel_tensor(param)
+        if param.numel() > 0
+        and not _discovers_parameter(param, backend, include_host_parameters)
     ]
 
 
@@ -405,6 +425,7 @@ def collect_module_tensors(
     accelerator_backend: AcceleratorBackend | None = None,
     *,
     preserve_local: Iterable[torch.Tensor] = (),
+    include_host_parameters: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Collect all accelerator tensors from a module tree into a flat dict.
 
@@ -430,11 +451,16 @@ def collect_module_tensors(
     inside their byte ranges are omitted before deduplication. A parameter or
     wider transfer overlapping local state is a classification conflict and
     raises rather than silently dropping required data or overwriting state.
+
+    With ``include_host_parameters``, parameters in host memory are collected
+    too.
     """
     backend = _resolve_accelerator_backend(accelerator_backend)
     local_ranges: dict[torch.device, set[tuple[int, int]]] = {}
     for local in preserve_local:
-        if local.numel() == 0 or not backend.is_accel_tensor(local):
+        if local.numel() == 0 or not _discovers_parameter(
+            local, backend, include_host_parameters
+        ):
             continue
         if not local.is_contiguous():
             raise ValueError("Local runtime tensors must be contiguous")
@@ -455,7 +481,9 @@ def collect_module_tensors(
     seen_ptrs: set[int] = set()
     storage_view_count = 0
     skipped_duplicate = 0
-    for name, tensor, tensor_type in iter_module_tensors(model, backend):
+    for name, tensor, tensor_type in iter_module_tensors(
+        model, backend, include_host_parameters=include_host_parameters
+    ):
         t = tensor.data if hasattr(tensor, "data") else tensor
 
         if t.numel() == 0:

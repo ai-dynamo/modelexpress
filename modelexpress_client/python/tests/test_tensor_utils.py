@@ -5,6 +5,7 @@
 
 import types
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -16,9 +17,9 @@ from modelexpress.tensor_utils import (
     adopt_hidden_tensors,
     capture_tensor_attrs,
     collect_module_tensors,
-    host_resident_parameters,
     safe_checksum,
     storage_view,
+    undiscovered_parameters,
 )
 
 
@@ -358,11 +359,11 @@ class TestStorageView:
 
 
 # ---------------------------------------------------------------------------
-# host_resident_parameters
+# undiscovered_parameters
 # ---------------------------------------------------------------------------
 
 
-class TestHostResidentParameters:
+class TestUndiscoveredParameters:
     def test_lists_non_empty_parameters_outside_accelerator(
         self, mock_accelerator_backend_cls
     ):
@@ -372,13 +373,31 @@ class TestHostResidentParameters:
         model.on_host = nn.Parameter(torch.empty(4))
         model.empty_on_host = nn.Parameter(torch.empty(0))
         model.register_buffer("host_buffer", torch.empty(4))
-        assert host_resident_parameters(model, backend) == ["on_host"]
+        assert undiscovered_parameters(model, backend) == ["on_host"]
 
     def test_empty_when_all_parameters_on_accelerator(
         self, mock_accelerator_backend_cls
     ):
         backend = mock_accelerator_backend_cls(torch_device_type="cpu")
-        assert host_resident_parameters(nn.Linear(4, 4), backend) == []
+        assert undiscovered_parameters(nn.Linear(4, 4), backend) == []
+
+    @pytest.mark.parametrize(
+        ("include_host_parameters", "expected"),
+        [(False, ["on_host", "on_meta"]), (True, ["on_meta"])],
+    )
+    def test_host_parameters_count_as_transferred_only_when_discovered(
+        self, mock_accelerator_backend_cls, include_host_parameters, expected
+    ):
+        backend = mock_accelerator_backend_cls()
+        model = nn.Module()
+        model.on_host = nn.Parameter(torch.empty(4))
+        model.on_meta = nn.Parameter(torch.empty(4, device="meta"))
+        assert (
+            undiscovered_parameters(
+                model, backend, include_host_parameters=include_host_parameters
+            )
+            == expected
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +432,54 @@ class TestCollectModuleTensors:
         tensors = collect_module_tensors(model, backend)
 
         assert set(tensors) == {"a", "b"}
+
+    @pytest.mark.parametrize("include_host_parameters", [False, True])
+    def test_host_parameters_only_when_requested(
+        self, mock_accelerator_backend_cls, include_host_parameters
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_accel = nn.Parameter(torch.empty(4, device="meta"))
+        model.on_host = nn.Parameter(torch.zeros(4))
+        model.register_buffer("host_buffer", torch.zeros(4))
+
+        tensors = collect_module_tensors(
+            model, backend, include_host_parameters=include_host_parameters
+        )
+
+        expected = {"on_accel", "on_host"} if include_host_parameters else {"on_accel"}
+        assert set(tensors) == expected
+
+    def test_host_parameter_overlapping_local_host_state_raises(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_host = nn.Parameter(torch.zeros(4))
+
+        with pytest.raises(ValueError, match="overlaps local runtime state"):
+            collect_module_tensors(
+                model,
+                backend,
+                preserve_local=[model.on_host.data],
+                include_host_parameters=True,
+            )
+
+    def test_host_parameter_beside_unrelated_local_host_state_is_collected(
+        self, mock_accelerator_backend_cls
+    ):
+        backend = mock_accelerator_backend_cls(torch_device_type="meta")
+        model = nn.Module()
+        model.on_host = nn.Parameter(torch.zeros(4))
+
+        tensors = collect_module_tensors(
+            model,
+            backend,
+            preserve_local=[torch.zeros(4)],
+            include_host_parameters=True,
+        )
+
+        assert set(tensors) == {"on_host"}
 
     def test_non_contiguous_registered_as_storage(self, mock_accelerator_backend_cls):
         backend = mock_accelerator_backend_cls(torch_device_type="cpu")

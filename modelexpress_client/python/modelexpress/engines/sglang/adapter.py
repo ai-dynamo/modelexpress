@@ -126,6 +126,9 @@ class SglangAdapter(EngineAdapter):
             )
         )
 
+    def discovers_host_parameters(self) -> bool:
+        return True
+
     def discover_tensors(self, result: LoadResult) -> dict[str, torch.Tensor]:
         """Collect transferable tensors while preserving process-local state."""
         if result.model is None:
@@ -148,7 +151,11 @@ class SglangAdapter(EngineAdapter):
             self.accelerator_backend,
             exclude=self._exclude_hidden_tensor_object,
         )
-        tensors = collect_module_tensors(result.model, self.accelerator_backend)
+        tensors = collect_module_tensors(
+            result.model,
+            self.accelerator_backend,
+            include_host_parameters=self.discovers_host_parameters(),
+        )
         if is_sglang_draft_model(self.model_config):
             selector = draft_weight_adapter_for(
                 type(result.model).__name__, role="draft", model=result.model

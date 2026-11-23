@@ -249,6 +249,19 @@ def test_collect_sglang_tensors_preserves_non_contiguous_storage_names(
     assert tensors["weight_t.__storage"].dtype == torch.uint8
 
 
+def test_collect_sglang_tensors_includes_host_parameters(mock_accelerator_backend_cls):
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    adapter.accelerator_backend = mock_accelerator_backend_cls(torch_device_type="meta")
+    model = nn.Module()
+    model.attn = nn.Parameter(torch.empty(4, device="meta"))
+    model.engram = nn.Parameter(torch.zeros(4))
+
+    tensors = adapter.discover_tensors(SimpleNamespace(model=model))
+
+    assert adapter.discovers_host_parameters() is True
+    assert set(tensors) == {"attn", "engram"}
+
+
 def test_collect_sglang_tensors_deduplicates_tied_parameters(
     mock_accelerator_backend_cls,
 ):
@@ -2195,7 +2208,7 @@ def test_sglang_draft_discovery_drops_target_shared_embed_and_head():
         "modelexpress.engines.sglang.adapter.adopt_hidden_tensors"
     ), patch(
         "modelexpress.engines.sglang.adapter.collect_module_tensors",
-        side_effect=lambda model, _backend: dict(model.named_parameters()),
+        side_effect=lambda model, _backend, **_kwargs: dict(model.named_parameters()),
     ):
         tensors = adapter.discover_tensors(
             LoadResult(value=None, model=_SharedHeadDraft())
@@ -2210,7 +2223,7 @@ def test_sglang_target_discovery_keeps_embed_and_head():
         "modelexpress.engines.sglang.adapter.adopt_hidden_tensors"
     ), patch(
         "modelexpress.engines.sglang.adapter.collect_module_tensors",
-        side_effect=lambda model, _backend: dict(model.named_parameters()),
+        side_effect=lambda model, _backend, **_kwargs: dict(model.named_parameters()),
     ):
         tensors = adapter.discover_tensors(
             LoadResult(value=None, model=_SharedHeadDraft())
