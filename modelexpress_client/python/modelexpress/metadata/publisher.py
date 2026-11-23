@@ -63,8 +63,8 @@ class PublisherThread:
             stale marking.
         publish_timeout_secs: Seconds to keep waiting/publishing before giving
             up and stopping the thread. Zero retries indefinitely.
-        interval_secs: Optional tick interval override. Defaults to
-            ``MX_HEARTBEAT_INTERVAL_SECS``.
+        interval_secs: Optional tick interval override. Must be positive.
+            Defaults to ``MX_HEARTBEAT_INTERVAL_SECS``.
         heartbeat_after_publish: If False, the thread exits after publish_fn
             succeeds instead of sending READY heartbeats.
         retry_publish_on_failure: If False, stop after the first publish
@@ -128,6 +128,10 @@ class PublisherThread:
             if interval_secs is not None
             else envs.MX_HEARTBEAT_INTERVAL_SECS
         )
+        if self._interval <= 0:
+            raise ValueError(
+                f"PublisherThread interval_secs must be positive, got {self._interval}"
+            )
         self._stop_event = threading.Event()
         self._status_lock = threading.Lock()
         self._started = False
