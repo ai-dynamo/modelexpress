@@ -252,6 +252,8 @@ def _rdma_ctx(instances):
     ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
         instances=instances
     )
+    # A single engine rank: the chain agrees on each outcome with itself.
+    ctx.adapter.all_gather_state.side_effect = lambda state: (state,)
     return ctx
 
 
@@ -1657,6 +1659,7 @@ def test_cold_start_fallback_skips_rdma_but_publishes(monkeypatch):
         p2p_enabled=True,
         skip_rdma=True,
         global_rank=0,
+        adapter=None,
         identity=SimpleNamespace(model_name="model"),
     )
     model = MagicMock()
