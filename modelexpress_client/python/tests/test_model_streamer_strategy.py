@@ -44,6 +44,20 @@ class _FakeAdapter(EngineAdapter):
         return iter(())
 
 
+class _ConsumingAdapter(_FakeAdapter):
+    """Adapter that drains the iterator, as engine load_weights does."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def apply_weight_iter(self, result: LoadResult, weights_iter):
+        self.calls += 1
+        for _ in weights_iter:
+            pass
+        return result
+
+
 def _make_load_context(**overrides):
     """Return a LoadContext with mocked dependencies."""
     from modelexpress.load_strategy import LoadContext
@@ -236,6 +250,23 @@ class TestModelStreamerLoad:
                 strategy.load(model, ctx)
 
         assert exc.value.mutated is False
+
+    def test_builder_error_is_not_mutated(self):
+        model = MagicMock()
+        adapter = _ConsumingAdapter()
+        adapter.build_model_streamer_weight_iter = MagicMock(
+            side_effect=ImportError("runai streamer loader missing")
+        )
+        ctx = _make_load_context(adapter=adapter)
+        strategy = self._make_strategy()
+
+        with pytest.raises(StrategyFailed, match="runai streamer loader missing") as exc:
+            strategy.load_uri(
+                LoadResult(value=model, model=model), ctx, "s3://bucket/model"
+            )
+
+        assert exc.value.mutated is False
+        assert adapter.calls == 0
 
     def test_apply_weight_iter_failure_is_mutated(self):
         model = MagicMock()
