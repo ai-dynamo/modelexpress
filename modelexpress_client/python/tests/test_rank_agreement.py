@@ -475,3 +475,31 @@ def test_rank_local_loaders_do_not_change_the_shared_order(published):
 
     assert rdma.loaded == 1
     assert len(published) == 1
+
+
+@pytest.mark.parametrize("phase", ["prepare", "load", "local_load"])
+@pytest.mark.parametrize("abort_type", [RuntimeError, StrategyFailed])
+def test_abort_failure_cannot_override_fatal_agreement(
+    phase, abort_type, monkeypatch, published
+):
+    local_fatal = StrategyRecoveryError("local fatal") if phase == "local_load" else None
+    peer_phase = "load" if phase == "local_load" else phase
+    peer_outcome = "succeeded" if local_fatal else "fatal"
+    adapter = _PeerRanks({f"{peer_phase}:rdma": peer_outcome})
+    rdma = _Strategy("rdma", error=local_fatal)
+    disk = _Strategy("disk")
+    abort_error = abort_type("abort failed")
+    abort = MagicMock(side_effect=abort_error)
+    monkeypatch.setattr(rdma, "abort", abort)
+
+    with pytest.raises(StrategyRecoveryError) as raised:
+        execute_load_strategies(MagicMock(), _ctx(adapter, is_reload=True), [rdma, disk])
+
+    assert raised.value.__cause__ is abort_error
+    if local_fatal is not None:
+        assert raised.value is local_fatal
+    abort.assert_called_once()
+    assert (disk.prepared, disk.loaded) == (0, 0)
+    assert rdma.rolled_back == 1
+    assert published == []
+    adapter.reinit_for_retry.assert_not_called()

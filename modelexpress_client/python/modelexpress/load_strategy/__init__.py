@@ -152,8 +152,13 @@ def _strategy_phases(
     _prepare_all_ranks(strategy, result, ctx, recovery_failure)
     try:
         yield
-    except BaseException:
-        strategy.abort(result, ctx)
+    except BaseException as failure:
+        try:
+            strategy.abort(result, ctx)
+        except Exception as abort_error:
+            if isinstance(failure, StrategyRecoveryError):
+                raise failure from abort_error
+            raise
         raise
     _finalize_all_ranks(strategy, result, ctx)
 
@@ -272,7 +277,15 @@ def _prepare_all_ranks(
     if failure is None and all(peer_outcome == _SUCCEEDED for peer_outcome in outcomes):
         return
     if outcome == _SUCCEEDED:
-        strategy.abort(result, ctx)
+        try:
+            strategy.abort(result, ctx)
+        except Exception as abort_error:
+            if _FATAL in outcomes:
+                raise StrategyRecoveryError(
+                    f"[Worker {ctx.global_rank}] Another rank could not recover "
+                    f"before {strategy.name}; abort also failed locally"
+                ) from abort_error
+            raise
     if outcome == _FATAL or _FATAL in outcomes:
         if isinstance(failure, StrategyRecoveryError):
             raise failure
