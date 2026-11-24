@@ -420,7 +420,6 @@ impl<'a> ModelDir<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::super::{
         GcsProvider,

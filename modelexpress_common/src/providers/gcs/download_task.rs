@@ -129,7 +129,6 @@ impl DownloadTask {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::super::model_dir::INTERNAL_METADATA_DIR_NAME;
     use super::*;
