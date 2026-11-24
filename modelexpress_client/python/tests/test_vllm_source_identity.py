@@ -198,3 +198,18 @@ def test_default_identity_remains_unchanged(monkeypatch):
     monkeypatch.delenv("MX_P2P_COLD_START", raising=False)
     identity = build_source_identity(_vllm_config(_parallel_config()), _model_config())
     assert not identity.extra_parameters
+
+
+def test_identity_separates_vllm_versions(monkeypatch):
+    from modelexpress.engines.vllm import source_identity
+    from modelexpress.metadata.source_id import compute_mx_source_id
+
+    ids = []
+    for version in ("0.28.0", "0.31.0"):
+        monkeypatch.setattr(source_identity, "_vllm_version", lambda v=version: v)
+        identity = build_source_identity(
+            _vllm_config(_parallel_config()), _model_config()
+        )
+        assert identity.backend_framework_version == version
+        ids.append(compute_mx_source_id(identity))
+    assert ids[0] != ids[1]

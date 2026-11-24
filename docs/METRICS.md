@@ -689,16 +689,16 @@ mean parsing prose into a label and the domain would grow with the wording.
 | result | meaning |
 | --- | --- |
 | `complete` | every locally registered tensor was filled |
-| `partial` | a source/local name mismatch; the transfer completed and reported success, but the local-only tensors still hold their dummy values |
+| `partial` | the source manifest named tensors this target does not register, or a nonempty source tensor without an address matched an unallocated local tensor; the transfer completed and reported success |
 | `empty` | no tensors matched; returned success having moved nothing |
-| `rejected` | strict mode refused the transfer and raised, rather than completing it |
+| `rejected` | the transfer was refused and raised, rather than completing it (for example a local tensor missing from the source manifest) |
 
 `partial` and `empty` both return success to the caller and are logged only as
 warnings, so before this they were indistinguishable from a healthy transfer.
 `rejected` raises instead, and is counted so the family partitions every receive
 rather than only the ones that returned.
-A non-zero `partial` rate across a fleet means manifest drift between source and
-target, which shows up later as wrong model output rather than as a failure.
+A non-zero `partial` or `rejected` rate across a fleet means manifest drift
+between source and target.
 
 Two changes to the client families are breaking for existing dashboards:
 

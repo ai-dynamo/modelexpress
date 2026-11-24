@@ -1081,49 +1081,50 @@ class TestReceiveFromSourceManifestValidation:
                 remote_agent_name="dummy",
             )
 
-    def test_unmatched_name_skips_silently(self, monkeypatch):
-        # No matching local tensor for the source's "w". Loop should `continue`
-        # without raising; the caller decides whether the empty match list is
-        # an error. We just verify the validation doesn't fire spuriously.
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_local_only_tensor_raises_in_every_mode(self, monkeypatch, strict):
+        # "lm_head" would keep its dummy values while RDMA reports success, so a
+        # same-family receive fails closed too.
+        embed = torch.full((4,), 7.0)
+        lm_head = torch.full((4,), -1.0)
         mgr = self._make_manager(
-            monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
+            monkeypatch, {"embed": embed, "lm_head": lm_head}
         )
-        wrong_name = TensorDescriptor(
-            name="w",
-            addr=0x1000,
-            size=4,
-            device_id=0,
-            dtype="torch.float32",
-        )
-        # Empty match -> early-return (0, 0, 0.0); no exception.
-        result = mgr.receive_from_source(
-            source_metadata=b"",
-            source_tensors=[wrong_name],
-            remote_agent_name="dummy",
-        )
-        assert result == (0, 0, 0.0)
-
-    def test_unmatched_name_warns(self, monkeypatch, caplog):
-        # Unmatched names stay non-fatal but are surfaced: an unmatched local
-        # tensor keeps its init values.
-        mgr = self._make_manager(
-            monkeypatch, {"x": torch.zeros(1, dtype=torch.float32)}
-        )
-        wrong_name = TensorDescriptor(
-            name="w",
-            addr=0x1000,
-            size=4,
-            device_id=0,
-            dtype="torch.float32",
-        )
-        with caplog.at_level(logging.WARNING, logger="modelexpress.nixl_transfer"):
+        with pytest.raises(
+            ManifestMismatchError,
+            match=r"1 local-only \(first: \['lm_head'\]\), 0 source-only",
+        ):
             mgr.receive_from_source(
                 source_metadata=b"",
-                source_tensors=[wrong_name],
+                source_tensors=[
+                    TensorDescriptor("embed", 0x1000, 16, 0, str(embed.dtype))
+                ],
+                remote_agent_name="dummy",
+                require_exact_match=strict,
+            )
+        mgr._agent.prep_xfer_dlist.assert_not_called()
+        assert torch.equal(lm_head, torch.full((4,), -1.0))
+
+    def test_source_only_tensor_warns_without_raising(self, monkeypatch, caplog):
+        # A source-only tensor leaves nothing on the target uninitialized.
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
+        local = torch.zeros(1, dtype=torch.float32)
+        mgr = self._make_manager(monkeypatch, {"w": local})
+        mgr._agent.prep_xfer_dlist.side_effect = ["src", "dst"]
+        mgr._agent.make_prepped_xfer.return_value = "handle"
+        mgr._agent.check_xfer_state.return_value = "DONE"
+        with caplog.at_level(logging.WARNING, logger="modelexpress.nixl_transfer"):
+            result = mgr.receive_from_source(
+                source_metadata=b"",
+                source_tensors=[
+                    TensorDescriptor("w", 0x1000, 4, 0, "torch.float32"),
+                    TensorDescriptor("extra", 0x2000, 4, 0, "torch.float32"),
+                ],
                 remote_agent_name="dummy",
             )
+        assert result[:2] == (4, 1)
         assert any(
-            "1 local-only (first: ['x']), 1 source-only (first: ['w'])"
+            "1 tensors this target does not register (first: ['extra'])"
             in rec.getMessage()
             for rec in caplog.records
         )
@@ -1146,7 +1147,7 @@ class TestReceiveFromSourceManifestValidation:
             device_id=0,
             dtype="torch.float32",
         )
-        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+        with pytest.raises(ManifestMismatchError, match="Tensor name mismatch"):
             mgr.receive_from_source(
                 source_metadata=b"",
                 source_tensors=[src],
@@ -1209,7 +1210,7 @@ class TestReceiveFromSourceManifestValidation:
                 dtype="torch.float32",
             ),
         ]
-        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+        with pytest.raises(ManifestMismatchError, match="Tensor name mismatch"):
             mgr.receive_from_source(
                 source_metadata=b"",
                 source_tensors=src,
@@ -1230,7 +1231,7 @@ class TestReceiveFromSourceManifestValidation:
             device_id=0,
             dtype="torch.float32",
         )
-        with pytest.raises(ManifestMismatchError, match="heterogeneous transfer"):
+        with pytest.raises(ManifestMismatchError, match="Tensor name mismatch"):
             mgr.receive_from_source(
                 source_metadata=b"",
                 source_tensors=[src],
@@ -1242,8 +1243,8 @@ class TestReceiveFromSourceManifestValidation:
         # Identical name sets must clear the name-mismatch guard: with only "w"
         # on both sides and require_exact_match=True, execution proceeds past the
         # guard to the size check, which here fails on a deliberate size skew.
-        # A ManifestMismatchError about "heterogeneous transfer" would mean the
-        # name guard fired spuriously; a "size mismatch" proves it did not.
+        # A "Tensor name mismatch" error would mean the name guard fired
+        # spuriously; a "size mismatch" proves it did not.
         local = torch.zeros(10, dtype=torch.float32)
         mgr = self._make_manager(monkeypatch, {"w": local})
         src = TensorDescriptor(
@@ -1467,7 +1468,7 @@ class TestAddresslessTensorTransfers:
 
     @pytest.mark.parametrize("strict", [False, True])
     @pytest.mark.parametrize("mixed", [False, True])
-    def test_unallocated_source_is_partial_or_rejected(
+    def test_unallocated_source_is_rejected_for_allocated_target(
         self, monkeypatch, strict, mixed
     ):
         source_tensors = {"w": torch.empty(1, device="meta")}
@@ -1478,29 +1479,18 @@ class TestAddresslessTensorTransfers:
         source = self._manager(monkeypatch, source_tensors)
         target = self._manager(monkeypatch, local_tensors)
         outcomes = self._outcomes(monkeypatch)
-        kwargs = dict(
-            source_metadata=b"metadata",
-            source_tensors=source.tensor_descriptors,
-            remote_agent_name="source",
-            require_exact_match=strict,
-        )
 
-        if strict:
-            with pytest.raises(ManifestMismatchError, match="w.*source.*address"):
-                target.receive_from_source(**kwargs)
-            target._agent.prep_xfer_dlist.assert_not_called()
-            assert outcomes == ["rejected"]
-        else:
-            result = target.receive_from_source(**kwargs)
-            assert result[:2] == (8 if mixed else 0, 2 if mixed else 1)
-            assert outcomes == ["partial"]
-            if mixed:
-                assert target._agent.prep_xfer_dlist.call_args_list[0].kwargs[
-                    "xfer_list"
-                ] == [(source_tensors["live"].data_ptr(), 8, 0)]
-            else:
-                target._agent.prep_xfer_dlist.assert_not_called()
-            assert local_tensors["w"].item() == 7.0
+        with pytest.raises(ManifestMismatchError, match="w.*source.*address"):
+            target.receive_from_source(
+                source_metadata=b"metadata",
+                source_tensors=source.tensor_descriptors,
+                remote_agent_name="source",
+                require_exact_match=strict,
+            )
+
+        target._agent.prep_xfer_dlist.assert_not_called()
+        assert outcomes == ["rejected"]
+        assert local_tensors["w"].item() == 7.0
 
     @pytest.mark.parametrize("strict", [False, True])
     def test_unallocated_destination_is_rejected(self, monkeypatch, strict):
@@ -1634,17 +1624,20 @@ class TestReceiveOutcomeLabelsAtTheCallSite:
         assert spy.receives == ["complete"]
         assert spy.errors == []
 
-    def test_a_name_diff_counts_one_partial_and_not_a_complete(self, monkeypatch):
-        # A local-only tensor keeps its dummy values while the transfer still
-        # returns success, which is the whole reason `partial` exists.
+    def test_a_source_only_diff_counts_one_partial_and_not_a_complete(
+        self, monkeypatch
+    ):
         local = torch.zeros(4, dtype=torch.float32)
         spy = self._spy(monkeypatch)
-        mgr = self._manager(monkeypatch, {"w": local, "unmatched": local})
+        mgr = self._manager(monkeypatch, {"w": local})
         self._arm(mgr, "DONE")
 
         mgr.receive_from_source(
             source_metadata=b"",
-            source_tensors=[self._matching("w", local)],
+            source_tensors=[
+                self._matching("w", local),
+                self._matching("unmatched", local),
+            ],
             remote_agent_name="source",
         )
 
@@ -1655,7 +1648,7 @@ class TestReceiveOutcomeLabelsAtTheCallSite:
         # Returns (0, 0, 0.0) -- success to the caller, nothing moved on the wire.
         local = torch.zeros(4, dtype=torch.float32)
         spy = self._spy(monkeypatch)
-        mgr = self._manager(monkeypatch, {"x": local})
+        mgr = self._manager(monkeypatch, {})
 
         assert mgr.receive_from_source(
             source_metadata=b"",

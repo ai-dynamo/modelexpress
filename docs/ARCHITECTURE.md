@@ -1202,9 +1202,9 @@ participate in exact name, size, and dtype validation. On the sender they stay
 in the published manifest but are excluded from NIXL registration; on the
 receiver zero-byte tensors count as matched but are omitted from NIXL
 descriptor lists. A nonzero-size source tensor without an address is rejected
-when exact matching is required; otherwise it is skipped with a warning and
-the receive is recorded as partial, since the local tensor keeps its current
-values. A source with payload matched to a nonzero-size local tensor without
+when exact matching is required or when the matching local tensor is
+allocated, since the local tensor would keep its current values. Otherwise it
+is skipped with a warning and the receive is recorded as partial. A source with payload matched to a nonzero-size local tensor without
 an address is rejected in every mode before preparing NIXL descriptors.
 Arena and additional-tensor registration exclude both empty and unallocated
 tensors from memory-range and contiguity checks, while retaining their names

@@ -791,13 +791,12 @@ Same-family transfer is unaffected. Quantized transfer remains allowed for:
 
 because source and target are expected to use the same accelerator-family post-processing layout.
 
-Cross-family transfers also require the source manifest and the target's
-registered tensors to name the exact same set. A tensor-name mismatch (a
-local-only or source-only name) or a zero-match transfer fails closed with a
-`ManifestMismatchError` rather than transferring a subset. This prevents a
-vendor-specific hidden or derived tensor from leaving part of the target at
-dummy values while RDMA reports success. Same-family transfers keep tolerating
-subset transfers (unmatched names are warned, not fatal).
+Every transfer fails closed with a `ManifestMismatchError` when the target
+registers a tensor the source manifest does not name, since that tensor would
+keep its dummy values while RDMA reports success. Cross-family transfers also
+require the reverse: a source-only name or a zero-match transfer fails closed,
+because it can be a vendor-specific hidden or derived tensor. Same-family
+transfers warn on source-only names and continue.
 
 Future work may validate specific quantized CUDA/XPU combinations on hardware. If a specific pair is proven inference-correct after RDMA, ModelExpress may add an explicit allowlist for that quantization/layout pair. ModelExpress does not currently dequantize, requantize, or convert post-processed tensor layouts during transfer. See the accelerator-compatibility rule in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 

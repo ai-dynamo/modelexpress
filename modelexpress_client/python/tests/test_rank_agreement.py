@@ -475,3 +475,67 @@ def test_rank_local_loaders_do_not_change_the_shared_order(published):
 
     assert rdma.loaded == 1
     assert len(published) == 1
+
+
+@pytest.mark.parametrize("rejects_manifest", [False, True])
+def test_missing_tensor_on_one_rank_forces_fallback_before_publication(
+    monkeypatch, rejects_manifest
+):
+    import torch
+
+    from modelexpress.nixl_transfer import ManifestMismatchError, NixlTransferManager
+
+    monkeypatch.setattr(torch.cuda, "set_device", lambda *_: None)
+    weight = torch.full((2,), -1.0)
+    manager = NixlTransferManager(agent_name="test", device_id=0)
+    manager._agent = MagicMock()
+    manager._tensors = {"lm_head": weight}
+    adapter = _PeerRanks({
+        "load:rdma": "succeeded" if rejects_manifest else "failed",
+        "load:disk": "succeeded",
+    })
+    rdma, disk = _Strategy("rdma"), _Strategy("disk")
+    publications = []
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.publish_source_if_supported",
+        lambda *_: publications.append(weight.clone()),
+    )
+
+    def receive(result, ctx):
+        rdma.loaded += 1
+        if rejects_manifest:
+            try:
+                manager.receive_from_source(
+                    source_metadata=b"", source_tensors=[], remote_agent_name="source"
+                )
+            except ManifestMismatchError as error:
+                # The RDMA strategy reports exhausted source candidates as a miss.
+                raise StrategyFailed("No RDMA source succeeded", mutated=False) from error
+        else:
+            weight.fill_(7.0)
+        return result
+
+    def fallback(result, ctx):
+        assert publications == []
+        assert rdma.finalized == 0
+        disk.loaded += 1
+        weight.fill_(42.0)
+        return result
+
+    monkeypatch.setattr(rdma, "load", receive)
+    monkeypatch.setattr(disk, "load", fallback)
+    execute_load_strategies(MagicMock(), _ctx(adapter), [rdma, disk])
+
+    assert adapter.outcomes == [
+        ("prepare:rdma", "succeeded"),
+        ("load:rdma", "failed" if rejects_manifest else "succeeded"),
+        ("prepare:disk", "succeeded"),
+        ("load:disk", "succeeded"),
+        ("finalize:disk", "succeeded"),
+    ]
+    assert (rdma.loaded, rdma.finalized, rdma.aborted, rdma.rolled_back) == (1, 0, 1, 1)
+    assert (disk.loaded, disk.finalized) == (1, 1)
+    assert adapter.reinit_for_retry.call_count == (0 if rejects_manifest else 1)
+    manager._agent.prep_xfer_dlist.assert_not_called()
+    assert len(publications) == 1
+    assert torch.equal(publications[0], torch.full((2,), 42.0))
