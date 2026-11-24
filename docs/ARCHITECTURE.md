@@ -938,6 +938,8 @@ flowchart LR
     P -->|one manifest, two role-scoped tensor sets| T[New replica<br/>main and draft P2P]
 ```
 
+**NIXL receive contexts.** `NixlTransferManager` owns one Agent. Its optional `ucx_mode="tcp"` creates a UCX context with `tcp,cuda_copy` and `UCX_NET_DEVICES=all`, independently of the automatic transport settings and RDMA NIC pinning. MX serializes context creation and restores temporary environment values on success or failure. TCP VMM registration uses per-tensor regions; the existing automatic context keeps its registration policy.
+
 **LoadStrategyChain** (`load_strategy/`):
 
 Auto-detects the best loading strategy with a prioritized chain. Each strategy is a subclass of `LoadStrategy` (ABC) with `is_available(ctx)` and `load(result, ctx)` methods. Engine-specific work is delegated to `ctx.adapter`; `LoadResult` carries the value returned to the engine plus the model used for tensor discovery and publication. The chain filters to eligible strategies and runs them in order until one succeeds:
