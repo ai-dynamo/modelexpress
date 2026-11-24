@@ -1759,3 +1759,29 @@ See the [shared experiment contract](rl/ARCHITECTURE.md#shared-rl-refit-experime
 ### Validation, timing, and cleanup
 
 See [validation, timing, and cleanup](rl/ARCHITECTURE.md#validation-timing-and-cleanup).
+
+### Experimental vLLM checkpoint source replay
+
+Set `MX_REFIT_CHECKPOINT_SOURCE_REPLAY=true` on the vLLM receiver to route
+materialized, full checkpoint installations through captured source writes. The
+default is `false`, retaining the native checkpoint loader. This option does not
+change streamed-checkpoint or surgical changed-tensor installation.
+
+Use only with unquantized floating-point HF safetensors and no native-to-HF
+converter. The checkpoint must remain immutable for the duration of installation,
+and inference must be paused by the normal refit coordinator. Capture occurs at
+that safe point on the first update and is reused only while the source schema
+and live generator layout match. Its first-use cost is part of that update.
+
+Both paths retain native PWAL, finalization and the device fence. Replay copies
+all recorded source writes; it does not skip unchanged weights or bypass GPU
+postprocessing. Unsupported inputs or incomplete captures fail the update; an
+error after replay starts must not trigger a second installation or resume
+inference into uncertain weights. A failed replay retains its source views and
+requires engine recreation before retrying; do not retry by toggling the option.
+Disable the option before starting the engine to use ordinary reload.
+
+Receiver-only Qwen3-30B-A3B BF16 experiments measured warm pause reductions with
+this replay strategy, but do not qualify quantization, S3 reconstruction, or
+end-to-end trainer publication. Independent cold-start output variation remains
+unresolved. Keep this option experimental pending integrated GPU qualification.

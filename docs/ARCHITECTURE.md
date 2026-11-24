@@ -1421,3 +1421,13 @@ for qualification limits.
 ## RL refit CI harness
 
 The RL refit CI harness and its scenario lifecycle are described in the [RL refit architecture](rl/ARCHITECTURE.md#rl-refit-ci-harness).
+
+### Materialized checkpoint source replay
+
+The experimental vLLM checkpoint adapter opens immutable local safetensors as
+CPU views and passes their schema to the existing installer capture cache. It
+replays copies in capture order through `SourceReplayBatch`, retaining the
+ordinary replay path's native post-load processing, storage validation and final
+device fence. Source file handles remain alive through the fence. This is a
+checkpoint input adapter for the existing source install plan, not a new mapping
+engine. See `MX_REFIT_CHECKPOINT_SOURCE_REPLAY` in [deployment](DEPLOYMENT.md).

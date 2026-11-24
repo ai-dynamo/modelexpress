@@ -17,7 +17,7 @@ import logging
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from contextlib import closing
+from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
@@ -350,6 +350,7 @@ class _VllmInstaller(EngineInstaller):
         )
         self.source_install_plan = None
         self._tied_input_peak_bytes = 0
+        self._failed_checkpoint_replay = None
 
     @cached_property
     def _original_loader(self) -> Callable:
@@ -832,8 +833,65 @@ class _VllmInstaller(EngineInstaller):
         with refit_span("post_install"):
             self._synchronize()
 
+    def install_checkpoint_replay(self, path: str | Path) -> None:
+        """Install an immutable local checkpoint through captured source writes.
+
+        Call at the same paused-engine safe point as ordinary checkpoint reload.
+        Capture is cached by source schema and live generator layout; the first
+        update pays capture cost. Keep mmap-backed sources alive through the
+        install_tensors device fence, including native PWAL and finalization.
+        """
+        from safetensors import safe_open
+
+        if self._failed_checkpoint_replay is not None:
+            raise IncompleteRefit("checkpoint replay failed; recreate the engine before retrying")
+        if self._is_quantized or self._convert_native_to_hf is not None:
+            raise IncompleteRefit(
+                "checkpoint source replay requires an unquantized HF checkpoint "
+                "without a native-to-HF converter"
+            )
+        paths, locations, _ = index_checkpoint_tensors(path)
+        with ExitStack() as stack:
+            readers = {
+                shard: stack.enter_context(safe_open(str(shard), framework="pt", device="cpu"))
+                for shard in paths
+            }
+            sources = {
+                name: readers[shard].get_tensor(name)
+                for name, (shard, _, _) in locations.items()
+            }
+            if not sources or any(
+                tensor.dtype not in (torch.bfloat16, torch.float16, torch.float32)
+                for tensor in sources.values()
+            ):
+                raise IncompleteRefit("checkpoint source replay requires floating-point weights")
+            manifest = [
+                (name, tensor.dtype, tuple(tensor.shape))
+                for name, tensor in sources.items()
+            ]
+            capture, _ = self.capture(manifest)
+            if capture.unsupported or capture.unattributed or not capture.copies:
+                raise IncompleteRefit("checkpoint source replay capture is incomplete")
+            if any(item.src_name not in sources for item in capture.copies):
+                raise IncompleteRefit("checkpoint source replay references a missing tensor")
+            writes = tuple(
+                (index, item, sources[item.src_name])
+                for index, item in enumerate(capture.copies)
+            )
+            try:
+                self.install_tensors(SourceReplayBatch(writes, capture.replay_id))
+            except BaseException:
+                # A failed device fence cannot prove that source reads finished.
+                self._failed_checkpoint_replay = (sources, stack.pop_all())
+                raise
+
     def install_checkpoint(self, path: str | Path) -> None:
         """Reload a prepared safetensors checkpoint into the live model."""
+        if self._failed_checkpoint_replay is not None:
+            raise IncompleteRefit("checkpoint replay failed; recreate the engine before retrying")
+        if rl_envs.MX_REFIT_CHECKPOINT_SOURCE_REPLAY:
+            self.install_checkpoint_replay(path)
+            return
         try:
             from vllm.model_executor.model_loader.default_loader import (
                 DefaultModelLoader,
