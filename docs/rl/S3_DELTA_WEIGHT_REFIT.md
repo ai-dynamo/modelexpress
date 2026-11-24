@@ -707,8 +707,9 @@ artifacts, but never evicts the active lineage or the checkpoint being prepared
 or installed. Capacity must therefore cover the active checkpoint plus the
 rollback-safe working set for one update. For a downloaded full checkpoint to
 get a [working copy](#working-copies), size the quota for the active lineage
-plus two copies of that full checkpoint. A capacity rejection preserves the
-active checkpoint as READY so a later update can retry. On initialization, the
+plus two copies of that full checkpoint. If capacity rejects an update during
+replay, the last completely prepared checkpoint is restored as READY so a later
+update can retry. The active serving version is unchanged. On initialization, the
 configured seed is linked as the initial full artifact and becomes the active
 version.
 
@@ -831,3 +832,17 @@ When the index omits `checksum_format`, checksum verification is skipped and
 shard metadata is not interpreted as checksums. Tensor names, dtypes, shapes,
 and byte sizes are always checked before the immutable full artifact is
 promoted.
+
+## Bounded delta application
+
+Canonical deltas apply in 2 MiB chunks. Smaller tensors update their mapped
+file regions directly. Large tensors use positional I/O and share one budget
+of two in-flight chunks per configured worker across the apply call. Their
+target checksums are combined in byte order.
+Freshly downloaded delta bytes are reused without rereading their artifact files.
+A cache capacity rejection restores the last completely prepared version; it
+does not label an older engine version as the current checkpoint files.
+
+Full-checkpoint capacity checks protect the last completed replay head even
+when the engine still serves an older version, so rejection can restore it.
+A redundant working copy of a full checkpoint can be discarded during admission.

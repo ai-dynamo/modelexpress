@@ -1227,7 +1227,6 @@ impl ModelDownloadTracker {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use modelexpress_common::grpc::{api::ApiRequest, health::HealthRequest};

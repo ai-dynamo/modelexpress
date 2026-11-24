@@ -133,7 +133,6 @@ impl ProviderCache for GcsProviderCache {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::super::test_support::{
         expected_model_dir, manifest_entry, write_cached_model, write_incomplete_cached_model,

@@ -153,7 +153,6 @@ impl AuthState {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 pub(crate) mod test_util {
     use std::collections::VecDeque;
     use std::sync::{
@@ -289,7 +288,6 @@ pub(crate) mod test_util {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;

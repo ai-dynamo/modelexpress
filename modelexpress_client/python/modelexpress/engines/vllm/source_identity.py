@@ -12,6 +12,7 @@ module is how a read of a nonexistent ParallelConfig attribute went unnoticed.
 from __future__ import annotations
 
 import re
+from importlib.metadata import version as pkg_version
 
 from ... import envs
 from ... import p2p_pb2
@@ -45,12 +46,25 @@ def _derive_expert_parallel_size(parallel) -> int:
     return max(1, tp_size * dp_size * pcp_size)
 
 
+def _vllm_version() -> str:
+    try:
+        import vllm
+
+        version = getattr(vllm, "__version__", "")
+        if isinstance(version, str) and version:
+            return version
+    except Exception:
+        pass
+    try:
+        return pkg_version("vllm")
+    except Exception:
+        return ""
+
+
 def build_source_identity(
     vllm_config, model_config,
 ) -> p2p_pb2.SourceIdentity:
     """Build a SourceIdentity from vLLM config objects."""
-    from importlib.metadata import version as pkg_version
-
     try:
         mx_version = pkg_version("modelexpress")
     except Exception:
@@ -76,6 +90,9 @@ def build_source_identity(
         dtype=dtype,
         quantization=quantization,
         revision=_resolve_model_revision(model_config),
+        # Parameter names and post-processed layouts can change between vLLM
+        # releases, so workers on different versions must not share a source.
+        backend_framework_version=_vllm_version(),
         extra_parameters=(
             {
                 f"vllm_{name}": str(getattr(parallel, name, 1) or 1)
