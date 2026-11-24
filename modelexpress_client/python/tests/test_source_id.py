@@ -16,7 +16,7 @@ from modelexpress.metadata.source_id import compute_mx_source_id
 
 def _base_identity() -> p2p_pb2.SourceIdentity:
     return p2p_pb2.SourceIdentity(
-        mx_version="0.8.0",
+        mx_version="0.9.0",
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name="deepseek-ai/DeepSeek-V3",
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_VLLM,
@@ -59,7 +59,7 @@ def test_different_revision_gives_different_id():
 
 
 def test_empty_artifact_fields_preserve_existing_id():
-    assert compute_mx_source_id(_base_identity()) == "e0d1bc7459cb4cde"
+    assert compute_mx_source_id(_base_identity()) == "3fbc66d9f9e6a593"
 
 
 def test_artifact_compatibility_fields_affect_id():
@@ -153,13 +153,13 @@ def test_extra_parameters_sorted():
 # ---------------------------------------------------------------------------
 
 def test_pinned_hash_base_identity():
-    assert compute_mx_source_id(_base_identity()) == "e0d1bc7459cb4cde"
+    assert compute_mx_source_id(_base_identity()) == "3fbc66d9f9e6a593"
 
 
 def test_pinned_hash_with_revision():
     pinned = _base_identity()
     pinned.revision = "abc123def4567890"
-    assert compute_mx_source_id(pinned) == "96db7e109daf9e53"
+    assert compute_mx_source_id(pinned) == "1f7f6035128f773f"
 
 
 def test_case_colliding_extra_parameters_are_deterministic():
@@ -175,7 +175,7 @@ def test_case_colliding_extra_parameters_are_deterministic():
     b.extra_parameters["foo"] = "b"
     b.extra_parameters["Foo"] = "a"
     assert compute_mx_source_id(a) == compute_mx_source_id(b)
-    assert compute_mx_source_id(a) == "f4eeab03e859b088"
+    assert compute_mx_source_id(a) == "1770feef40062010"
 
 
 def test_pinned_hash_with_unicode_identity():
@@ -184,4 +184,4 @@ def test_pinned_hash_with_unicode_identity():
     identity.extra_parameters["标签"] = "Crème 𐐀"
     identity.compile_config_digest = "编译-Ä"
     # Cross-checked with Rust compute_mx_source_id, which emits UTF-8 JSON.
-    assert compute_mx_source_id(identity) == "5c25d40f31327f9e"
+    assert compute_mx_source_id(identity) == "ce1ed4c5f29cac77"

@@ -161,7 +161,7 @@ mod tests {
 
     fn base_identity() -> SourceIdentity {
         SourceIdentity {
-            mx_version: "0.8.0".to_string(),
+            mx_version: "0.9.0".to_string(),
             mx_source_type: 0, // Weights (default)
             model_name: "deepseek-ai/DeepSeek-V3".to_string(),
             backend_framework: 1, // vllm
@@ -240,7 +240,7 @@ mod tests {
     fn test_empty_artifact_fields_preserve_existing_id() {
         assert_eq!(
             compute_mx_source_id(&base_identity()).expect("source id"),
-            "e0d1bc7459cb4cde"
+            "3fbc66d9f9e6a593"
         );
     }
 
@@ -335,7 +335,7 @@ mod tests {
     fn test_python_cross_check_base_identity() {
         assert_eq!(
             compute_mx_source_id(&base_identity()).expect("source id"),
-            "e0d1bc7459cb4cde"
+            "3fbc66d9f9e6a593"
         );
     }
 
@@ -345,7 +345,7 @@ mod tests {
         pinned.revision = "abc123def4567890".to_string();
         assert_eq!(
             compute_mx_source_id(&pinned).expect("source id"),
-            "96db7e109daf9e53"
+            "1f7f6035128f773f"
         );
     }
 
@@ -364,7 +364,7 @@ mod tests {
             .insert("foo".to_string(), "b".to_string());
         assert_eq!(
             compute_mx_source_id(&id).expect("source id"),
-            "f4eeab03e859b088"
+            "1770feef40062010"
         );
     }
 
