@@ -68,6 +68,10 @@ def install_artifacts(
     log: logging.Logger = logger,
 ) -> None:
     """Best-effort install of compatible artifacts before model loading."""
+    from ..topology import adaptive_enabled
+
+    if adaptive_enabled():
+        return
     if not _artifact_transfer_enabled():
         return
     backend = _artifact_backend()
