@@ -102,13 +102,13 @@ def _receive(manager, p2p=True, ctx=None, leased=True, register=None):
             return None
 
     with (
-        patch("modelexpress.load_strategy.rdma_strategy.register_tensors", side_effect=register),
+        patch("modelexpress.load_strategy.nixl_p2p_strategy.register_tensors", side_effect=register),
         patch(
             "modelexpress.metadata.worker_server.prepare_tensor_read",
             return_value=(_Lease(), 0),
         ) as prepare_read,
         patch(
-            "modelexpress.load_strategy.rdma_strategy.worker_tensor_descriptors",
+            "modelexpress.load_strategy.nixl_p2p_strategy.worker_tensor_descriptors",
             return_value=[_descriptor()],
         ),
     ):

@@ -198,7 +198,7 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     )
 
     try:
-        tensors, _ = fetch_tensor_manifest(
+        tensor_manifest = fetch_tensor_manifest(
             endpoint,
             "weight-source",
             timeout=1.0,
@@ -220,7 +220,7 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     finally:
         server.stop(grace=None)
 
-    assert [tensor.name for tensor in tensors] == ["weight"]
+    assert [tensor.name for tensor in tensor_manifest.tensors] == ["weight"]
     assert header.mx_source_id == "artifact-source"
     assert header.artifact_id == artifact_id
 
@@ -426,8 +426,9 @@ def test_fetch_tensor_manifest_default_timeout_is_five_seconds(monkeypatch):
         MagicMock(return_value=stub),
     )
 
-    fetch_tensor_manifest("source:6555", "source-123")
+    manifest = fetch_tensor_manifest("source:6555", "source-123")
 
+    assert manifest is stub.GetTensorManifest.return_value
     assert stub.GetTensorManifest.call_args.kwargs["timeout"] == 5.0
     channel.close.assert_called_once()
 
@@ -515,7 +516,7 @@ def test_fetch_tensor_manifest_accepts_legacy_source_without_worker_id():
     server, port = _start_server(LegacyServicer())
 
     try:
-        tensors, _ = fetch_tensor_manifest(
+        manifest = fetch_tensor_manifest(
             f"127.0.0.1:{port}",
             "source-123",
             worker_id="selected-generation",
@@ -524,7 +525,7 @@ def test_fetch_tensor_manifest_accepts_legacy_source_without_worker_id():
     finally:
         server.stop(grace=None)
 
-    assert tensors == []
+    assert not manifest.tensors
 
 
 def test_new_server_accepts_legacy_request_without_worker_id():
@@ -536,7 +537,7 @@ def test_new_server_accepts_legacy_request_without_worker_id():
     server, port = _start_server(servicer)
 
     try:
-        tensors, _ = fetch_tensor_manifest(
+        manifest = fetch_tensor_manifest(
             f"127.0.0.1:{port}",
             "source-123",
             timeout=1.0,
@@ -544,7 +545,7 @@ def test_new_server_accepts_legacy_request_without_worker_id():
     finally:
         server.stop(grace=None)
 
-    assert tensors == []
+    assert not manifest.tensors
 
 
 def test_transfer_artifact_from_worker_retries_after_source_buffer_exhaustion(

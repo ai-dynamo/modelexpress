@@ -1740,16 +1740,19 @@ class NixlTransferManager:
         return self._data_plane_error
 
     def shutdown(self) -> None:
-        """Disconnect remote agents before releasing local NIXL resources."""
+        """Disconnect and release local resources, propagating deregistration failures."""
         if self._atexit_registered:
             atexit.unregister(self.shutdown)
             self._atexit_registered = False
         disconnected = self.disconnect_remote_agents()
+        deregistration_error = None
         if self._agent is not None:
             for registered in reversed(self._registered_memory):
                 try:
                     self._agent.deregister_memory(registered)
-                except Exception:
+                except Exception as error:
+                    if deregistration_error is None:
+                        deregistration_error = error
                     logger.warning(
                         "Failed to deregister NIXL memory during shutdown",
                         exc_info=True,
@@ -1762,6 +1765,8 @@ class NixlTransferManager:
         self._tensor_descriptors = []
         self._tensors = {}
         self._remote_agents = {}
+        if deregistration_error is not None:
+            raise deregistration_error
         logger.info(
             "NixlTransferManager shutdown complete (%d remote agent(s) disconnected)",
             disconnected,

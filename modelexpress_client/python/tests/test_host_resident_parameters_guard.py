@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from modelexpress.adapter import StrategyFailed
-from modelexpress.load_strategy import base, rdma_strategy
+from modelexpress.load_strategy import base, nixl_p2p_strategy as rdma_strategy
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
