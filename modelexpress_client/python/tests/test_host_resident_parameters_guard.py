@@ -208,5 +208,7 @@ def test_target_with_artifact_manager_falls_back_before_receiving(
             "worker",
         )
 
-    artifact_manager.shutdown.assert_called_once()
+    artifact_manager.shutdown.assert_not_called()
     artifact_manager.receive_from_source.assert_not_called()
+    RdmaStrategy().rollback(ctx)
+    artifact_manager.shutdown.assert_called_once()

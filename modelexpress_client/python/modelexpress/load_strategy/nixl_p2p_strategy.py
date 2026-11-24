@@ -26,6 +26,8 @@ from ..source_selection import (
     get_configured_selector,
 )
 from ..topology import (
+    adaptive_enabled,
+    in_domain,
     apply_policy,
     blocks_selection,
     count_in_domain,
@@ -33,16 +35,24 @@ from ..topology import (
     warn_if_no_domain_match,
 )
 from ..transfer_safety import check_transfer_allowed
-from ..types import TensorDescriptor
+from ..types import ManifestMismatchError, TensorDescriptor
 from .base import (
+    _init_nixl_manager,
     LoadContext,
     LoadStrategy,
+    NixlRegistrationError,
     SourceTransferError,
     _as_load_result,
     clear_exception_tracebacks,
     register_tensors,
 )
-from .context import DRAFT_TENSOR_PREFIX, LoadResult, is_draft_tensor_name
+from .context import (
+    DRAFT_TENSOR_PREFIX,
+    LoadResult,
+    P2PFailure,
+    P2PState,
+    is_draft_tensor_name,
+)
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
@@ -126,15 +136,18 @@ def _reload_restores_loaded_weights(ctx: LoadContext) -> bool:
 
 
 class NixlP2PStrategy(LoadStrategy):
-    """Load weights via RDMA P2P transfer from an existing source.
-
-    Overrides load() entirely since RDMA has a fundamentally different flow:
-    prepare target storage -> RDMA receive -> register + publish.
-    """
+    """Shared source discovery, receive and recovery for NIXL P2P strategies."""
 
     channel = "auto"
     requires = (EngineAdapter.discover_tensors,)
     requires_tensor_read_lease = False
+
+    def _state(self, ctx: LoadContext) -> P2PState | None:
+        if not adaptive_enabled():
+            return None
+        if ctx.p2p_state is None:
+            ctx.p2p_state = P2PState(resolve_policy())
+        return ctx.p2p_state
 
     def prepare(self, result: LoadResult, ctx: LoadContext) -> None:
         """Nothing to do before load(); the target is prepared in _load_as_target.
@@ -162,22 +175,27 @@ class NixlP2PStrategy(LoadStrategy):
         buffers to meta would leave the transfer nowhere the model executes
         against.
         """
+        state = self._state(ctx)
+        if (
+            self.channel == "tcp"
+            and state is not None
+            and state.last_failure is P2PFailure.MODEL
+        ):
+            raise StrategyFailed(
+                "P2P model preparation, discovery or processing failed; use a storage loader",
+                mutated=False,
+            )
 
     def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
-        """Nothing to do after load(); the received weights are finalized in
-        _load_as_target.
+        """Hand TCP-received weights to the normal publication agent.
 
-        Finalizing there keeps it inside the candidate loop, so a failure
-        retries the next source on a reinitialized model. A reload target
-        skips it: it has already been through post-processing and has served
-        requests, so its derived host-side state (attention scale mirrors,
-        FlashInfer's bmm1_scale/bmm2_scale cache) is populated and the
-        finalizers reject it as not cold-loaded.
-
-        Overridden rather than inherited: the default would register tensors
-        the transfer already registered, and on a reload leave a layerwise
-        reload this strategy never entered.
+        Model post-processing already ran inside the candidate loop. Calling
+        the default finalizer here would process the model a second time.
         """
+        if self.channel == "tcp":
+            self.rollback(ctx)
+            if result.model_for_publish is not None:
+                register_tensors(result, ctx)
 
     def abort(self, result: LoadResult, ctx: LoadContext) -> None:
         """Nothing to undo: prepare() starts no engine state, and rollback()
@@ -185,17 +203,30 @@ class NixlP2PStrategy(LoadStrategy):
 
     def rollback(self, ctx: LoadContext) -> None:
         """Clean up NIXL state from a failed RDMA target attempt."""
-        if ctx.nixl_manager is not None:
-            if _is_draft_pass(ctx) and ctx.nixl_manager is ctx.shared_nixl_manager:
-                # The agent belongs to the main load, which keeps serving from
-                # it. Release only the draft's own registrations.
-                ctx.nixl_manager.deregister_tensors(ctx.tensors)
-            else:
-                ctx.nixl_manager.shutdown()
+        try:
+            if ctx.nixl_manager is not None:
+                if _is_draft_pass(ctx) and ctx.nixl_manager is ctx.shared_nixl_manager:
+                    # The agent belongs to the main load, which keeps serving from
+                    # it. Release only the draft's own registrations.
+                    ctx.nixl_manager.deregister_tensors(ctx.tensors)
+                else:
+                    ctx.nixl_manager.shutdown()
+        except Exception as error:
+            raise StrategyRecoveryError(
+                f"Failed to release NIXL receiver: {error}"
+            ) from error
         ctx.tensors = {}
         ctx.nixl_manager = None
 
     def is_available(self, ctx: LoadContext) -> bool:
+        if adaptive_enabled():
+            if (
+                ctx.p2p_role != "main"
+                or ctx.is_reload
+                or ctx.accelerator_backend.name != "cuda"
+                or getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
+            ):
+                return False
         if not ctx.p2p_enabled or getattr(ctx, "skip_rdma", False) is True:
             return False
         if not super().is_available(ctx):
@@ -271,6 +302,7 @@ class NixlP2PStrategy(LoadStrategy):
             worker_id = instance.worker_id
             logger.info(
                 f"[Worker {ctx.global_rank}] Source attempt: "
+                f"channel={self.channel} "
                 f"source_attempt_index={attempt_index} "
                 f"source_worker_id={worker_id} mx_source_id={mx_source_id}"
             )
@@ -295,6 +327,13 @@ class NixlP2PStrategy(LoadStrategy):
                 selection_metrics.record_attempt(policy, "metadata_miss")
                 continue
 
+            state = self._state(ctx)
+            if (
+                state is not None
+                and self.channel == "auto"
+                and not in_domain(source_worker, state.policy)
+            ):
+                continue
             if not self._accelerator_compatible(ctx, source_worker, worker_id):
                 continue
 
@@ -326,6 +365,9 @@ class NixlP2PStrategy(LoadStrategy):
                     worker_id,
                 )
             except StrategyFailed as e:
+                state = self._state(ctx)
+                if state is not None and state.last_failure is not P2PFailure.SOURCE:
+                    raise
                 has_next_candidate = (
                     transfer_attempts < MAX_SOURCE_RETRIES
                     and attempt_index + 1 < len(attempts)
@@ -349,10 +391,9 @@ class NixlP2PStrategy(LoadStrategy):
                 try:
                     self.rollback(ctx)
                 except Exception as cleanup_error:
-                    raise StrategyFailed(
+                    raise StrategyRecoveryError(
                         f"Failed to clean up target after source worker "
                         f"{worker_id} failed: {cleanup_error}",
-                        mutated=True,
                     ) from cleanup_error
                 # A reload target is the engine's live model; the next
                 # candidate overwrites it in place, see execute_load_strategies.
@@ -407,7 +448,14 @@ class NixlP2PStrategy(LoadStrategy):
         limits, so the selector controls ordering only.
         """
         policy = configured_policy_label()
-        topology_policy = resolve_policy()
+        state = self._state(ctx)
+        topology_policy = state.policy if state is not None else resolve_policy()
+        if state is not None:
+            if state.sources is not None:
+                return apply_policy(
+                    list(state.sources), topology_policy, channel=self.channel
+                )
+            state.sources = ()
         if blocks_selection(topology_policy):
             logger.warning(
                 f"[Worker {ctx.global_rank}] Topology domain "
@@ -463,7 +511,14 @@ class NixlP2PStrategy(LoadStrategy):
 
             selector = get_configured_selector()
             select_start = time.perf_counter()
-            ordered = apply_policy(selector.order(candidates, ctx), topology_policy)
+            ordered = selector.order(candidates, ctx)
+            if state is not None:
+                unique = {}
+                for source in ordered:
+                    unique.setdefault((source.mx_source_id, source.worker_id), source)
+                ordered = list(unique.values())
+                state.sources = tuple(ordered)
+            ordered = apply_policy(ordered, topology_policy, channel=self.channel)
             select_seconds = time.perf_counter() - select_start
 
             selection_metrics.record_list_sources(selector.name, "ok")
@@ -705,11 +760,14 @@ class NixlP2PStrategy(LoadStrategy):
         mx_source_id: str,
         source_worker_id: str,
     ) -> LoadResult:
-        """Receive fully-processed weights via RDMA from an existing source."""
+        """Receive fully-processed weights through this strategy's NIXL context."""
         # The source-selection policy (random, rendezvous_hash, load_aware, ...)
         # that chose this candidate. Every P2P client family carries it, so a
         # phase duration can be read against the policy that picked the peer.
         policy = configured_policy_label()
+        state = self._state(ctx)
+        if state is not None:
+            state.last_failure = P2PFailure.MODEL
         try:
             with selection_metrics.time_source_attempt_phase(policy, "prepare"):
                 # A reload target is already prepared; see prepare().
@@ -723,21 +781,30 @@ class NixlP2PStrategy(LoadStrategy):
                 mx_source_id,
                 source_worker_id,
             )
+            if state is not None:
+                state.last_failure = P2PFailure.MODEL
             with selection_metrics.time_source_attempt_phase(policy, "finalize"):
                 # A reload target is already finalized; see finalize().
                 if not ctx.is_reload:
                     result = ctx.adapter.after_rdma_receive(result)
+                if state is not None:
+                    # A peer rank may still fail this strategy. Allow this
+                    # rank to join TCP after the chain recovers the model.
+                    state.last_failure = P2PFailure.SOURCE
                 return result
-        except StrategyFailed:
+        except (StrategyFailed, StrategyRecoveryError):
             raise
         except Exception as e:
+            if state is not None and isinstance(e, ManifestMismatchError):
+                state.last_failure = P2PFailure.SOURCE
             # The chain clears tracebacks on a mutated StrategyFailed before
             # falling back (see clear_exception_tracebacks), so by the time this
             # surfaces in the logs only the message survives -- "too many values
             # to unpack (expected 2)" with no frame is not actionable. Record
             # the frames here, while they still exist.
             logger.exception(
-                f"[Worker {ctx.global_rank}] RDMA target load failed "
+                f"[Worker {ctx.global_rank}] P2P target load failed "
+                f"(channel={self.channel}) "
                 f"(source_worker_id={source_worker_id}, mx_source_id={mx_source_id})"
             )
             raise StrategyFailed(str(e), mutated=True) from e
@@ -750,7 +817,7 @@ class NixlP2PStrategy(LoadStrategy):
         mx_source_id: str,
         source_worker_id: str,
     ) -> None:
-        """Receive fully-processed tensors via RDMA from the detected source."""
+        """Receive fully-processed tensors from the selected source."""
         receive_start = time.perf_counter()
         policy = configured_policy_label()
         is_p2p = bool(source_worker.worker_grpc_endpoint)
@@ -794,23 +861,46 @@ class NixlP2PStrategy(LoadStrategy):
                         for t in source_tensors
                     ]
                 ctx.adapter.prepare_rdma_target_from_manifest(result, adapter_tensors)
+            state = self._state(ctx)
+            if state is not None and ctx.nixl_manager is None:
+                state.last_failure = P2PFailure.CHANNEL
+                ctx.nixl_manager = _init_nixl_manager(
+                    ctx.global_rank,
+                    ctx.device_id,
+                    self.channel,
+                    listen_port=(
+                        0 if self.channel == "tcp"
+                        else envs.MX_METADATA_PORT + ctx.device_id
+                    ),
+                    accelerator_backend=ctx.accelerator_backend,
+                    ucx_mode=self.channel,
+                )
+            if state is not None:
+                state.last_failure = P2PFailure.MODEL
             with selection_metrics.time_source_attempt_phase(policy, "register"):
-                register_tensors(result, ctx)
+                try:
+                    register_tensors(result, ctx, required=True)
+                except StrategyRecoveryError:
+                    raise
+                except Exception as error:
+                    if state is not None and isinstance(error, NixlRegistrationError):
+                        state.last_failure = P2PFailure.CHANNEL
+                    raise StrategyFailed(
+                        f"NIXL registration failed: {error}", mutated=True
+                    ) from error
             if _is_draft_pass(ctx):
                 # Registration refreshes ctx.tensors with newly prepared buffers.
                 source_tensors = self._scope_source_tensors(ctx, source_tensors)
 
-            # register_tensors() is best-effort: it logs and swallows, leaving
-            # ctx.nixl_manager unset when registration failed. Everything below
-            # dereferences it, so without this the real cause (which register_tensors
-            # already logged in full) is replaced by an AttributeError on NoneType
-            # several frames later.
+            # Registration can be skipped when the model or metadata path is absent.
             if ctx.nixl_manager is None:
                 raise StrategyFailed(
-                    "NIXL registration failed, cannot receive weights over RDMA "
-                    "(see the preceding registration error for the cause)",
+                    "NIXL registration unavailable, cannot receive weights",
                     mutated=True,
                 )
+
+            if state is not None:
+                state.last_failure = P2PFailure.SOURCE
 
             if is_p2p:
                 host, port_str = ep.rsplit(":", 1)
@@ -898,7 +988,9 @@ class NixlP2PStrategy(LoadStrategy):
                             ),
                         )
                 except Exception as e:
-                    raise SourceTransferError(f"RDMA receive failed: {e}") from e
+                    raise SourceTransferError(
+                        f"P2P receive failed (channel={self.channel}): {e}"
+                    ) from e
                 transfer_time = received.seconds
 
                 bandwidth_gbps = (
@@ -907,7 +999,8 @@ class NixlP2PStrategy(LoadStrategy):
                     else 0
                 )
                 logger.info(
-                    f"[Worker {ctx.global_rank}] [TIMING] RDMA transfer complete: "
+                    f"[Worker {ctx.global_rank}] [TIMING] P2P transfer complete "
+                    f"(channel={self.channel}): "
                     f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
                     f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
                 )

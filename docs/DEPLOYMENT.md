@@ -827,7 +827,7 @@ export MX_PLUGIN_DIR=/opt/modelexpress/plugins
 export MX_LOAD_PLUGIN=example
 ```
 
-Set `MX_LOAD_PLUGIN_BEFORE` to insert the plugin immediately before a built-in strategy: `rdma`, `server-cache`, `instant_tensor`, `model_streamer`, `gds`, or `default`. The default is `server-cache`. For example, `export MX_LOAD_PLUGIN_BEFORE=rdma` tries the plugin first. Built-in strategies retain their relative order. Unknown or empty target names fail before discovery or weight loading; the setting is ignored when no plugin is selected.
+Set `MX_LOAD_PLUGIN_BEFORE` to insert the plugin immediately before a built-in strategy: `rdma`, `tcp`, `server-cache`, `instant_tensor`, `model_streamer`, `gds`, or `default`. The default is `server-cache`. For example, `export MX_LOAD_PLUGIN_BEFORE=rdma` tries the plugin first. Built-in strategies retain their relative order. Unknown or empty target names fail before discovery or weight loading; the setting is ignored when no plugin is selected.
 
 The directory must contain `mx_plugin_example.py`, whose no-argument `register_plugin()` returns a strategy class named `example`. No inference-engine code or `PYTHONPATH` changes are required. Multiple entries may be mounted; all are imported and validated, but only the selected class is instantiated. Entry imports, registration, and construction must not download or load weights.
 
@@ -852,7 +852,7 @@ Plugins execute inside the worker without sandboxing. Deploy trusted artifacts a
 | `MX_P2P_TOPOLOGY` | (unset) | For `topology_aware`. This node's `{domain: value}` map as JSON, e.g. `{"block":"b1","rack":"r3","host":"node7"}`, populated by the operator from the node's labels using the `ClusterTopology` domain→key mapping. Published once at registration and surfaced on `SourceInstanceRef.topology`. Unset/unparseable → this node shares no domain (rendezvous ordering). |
 | `MX_P2P_TOPOLOGY_LOAD_WEIGHT` | `0.0` (falls back to `MX_P2P_LOAD_WEIGHT`) | For `topology_aware`. When `> 0`, the within-tier tiebreak becomes `unit_hash − w·source_load` (source_load read defensively), so within a locality tier selection also steers away from busy sources — composing topology- and load-aware selection. If left unset, it falls back to `MX_P2P_LOAD_WEIGHT` (the load_aware weight) when that feature is deployed, so a single knob turns on both. `0` keeps the pure rendezvous jitter. Clamped to finite `≥ 0`. |
 | `MX_P2P_TOPOLOGY_DOMAIN` | (unset) | Transfer-domain policy for weights and NIXL artifacts, independent of `MX_P2P_SOURCE_SELECTOR`. Names the topology domain (e.g. `zone`) a source must share with this node. This node's value comes from `MX_P2P_TOPOLOGY` or the Dynamo topology mount (`DYN_TOPOLOGY_MOUNT_PATH`, default `/etc/dynamo/topology`), polled for up to 30s under `required` (once per process; `preferred` reads it once without waiting) because the Dynamo operator populates the mount after scheduling. NIXL artifact publication reads topology on each background publish attempt without waiting; an unknown required value fails that attempt so the existing publisher can retry after topology arrives. Use `zone` on AWS: EFA traffic cannot cross Availability Zones. Unset disables the policy. |
-| `MX_P2P_TOPOLOGY_ENFORCEMENT` | `required` | For `MX_P2P_TOPOLOGY_DOMAIN`. `required` drops every source outside this node's domain value (and sources that published none) before metadata fetch or transfer. If this node's value is unknown, weight loading falls through to the next strategy and NIXL artifact lookup returns a cache miss for local rebuild. Old artifact sources without published topology are ineligible under `required`. `preferred` keeps all sources but moves same-domain ones first, preserving the selector's order within each group. Any other value logs a warning and is treated as `required`. |
+| `MX_P2P_TOPOLOGY_ENFORCEMENT` | `required` | For `MX_P2P_TOPOLOGY_DOMAIN`. `required` drops every source outside this node's domain value (and sources that published none) before metadata fetch or transfer. If this node's value is unknown, weight loading falls through to the next strategy and NIXL artifact lookup returns a cache miss for local rebuild. Old artifact sources without published topology are ineligible under `required`. `preferred` keeps all sources but moves same-domain ones first, preserving the selector's order within each group. `adaptive` uses automatic UCX only within the domain, then tries forced TCP with same-domain sources first and cross-domain/unknown sources next. See [Cross-domain model loading](#cross-domain-model-loading) for supported loads and source prerequisites. Any other value logs a warning and is treated as `required`. |
 | `MX_METRICS_ENABLED` | `0` | Opt-in Prometheus metrics collector for the client. `1` enables the collectors (requires the `metrics` extra, `prometheus-client`, which the vLLM, SGLang and TensorRT-LLM engine images already provide). Off by default; selection signals are always emitted as structured logs regardless. See [METRICS.md](METRICS.md). |
 | `PROMETHEUS_MULTIPROC_DIR` | (unset) | Pod-local directory shared by every rank, so one endpoint serves the merged union of all of them. **Required on any pod with more than one worker process**, and it must be set in the pod manifest: `prometheus_client` latches its value class at import, so assigning it from Python produces zero data with no error. Wipe it at the container entrypoint with `python -m modelexpress.metrics --reset`, never from worker code. |
 | `MX_METRICS_PORT` | (unset) | With metrics enabled, serve a pull `/metrics` endpoint on this port. One rank per pod wins the bind and serves every rank's data; the rest re-attempt periodically so the endpoint migrates if the winner exits. |
@@ -921,6 +921,43 @@ the domain becomes available.
 **Combining topology- and load-aware selection.** To rank primarily by RDMA locality *and* steer away from busy sources within each locality tier, set `MX_P2P_SOURCE_SELECTOR=topology_aware` and a non-zero blend weight (`MX_P2P_TOPOLOGY_LOAD_WEIGHT`, or just `MX_P2P_LOAD_WEIGHT` since topology falls back to it). Locality is always the primary key — a closer source outranks a farther one regardless of load; the load term only orders equidistant peers.
 
 Each GPU worker publishes independently using its global rank (`torch.distributed.get_rank()`). No inter-worker coordination or barriers required.
+
+### Cross-domain model loading
+
+Enable cross-domain P2P on a target worker with:
+
+```bash
+export MX_P2P_TOPOLOGY_DOMAIN=fabric
+export MX_P2P_TOPOLOGY='{"fabric":"fabric-a"}'
+export MX_P2P_TOPOLOGY_ENFORCEMENT=adaptive
+```
+
+`fabric` is an operator-defined topology key. Every source advertises its own
+value through `MX_P2P_TOPOLOGY` or the existing topology directory.
+
+With `MX_NIXL_BACKEND=UCX`, the target first tries same-domain sources through the
+existing automatic UCX context. When no such source succeeds, a separate TCP
+context tries same-domain sources first, followed by other and unknown domains.
+Each strategy uses its own `MAX_SOURCE_RETRIES` limit and reuses the same
+compatible source list. A missing
+target domain value skips automatic UCX and uses the full list over TCP; a missing
+`MX_P2P_TOPOLOGY_DOMAIN` is a configuration error. If TCP also fails, the ordinary
+storage loading strategies run after recovery.
+
+The TCP context uses `UCX_TLS=tcp,cuda_copy` and `UCX_NET_DEVICES=all`, bypassing
+RDMA NIC pinning and `NIXL_UCX_TLS` overrides during its creation. Its temporary
+environment is restored afterward. Sources must already enable UCX TCP, advertise
+reachable network addresses, and support GPU reads over TCP with their UCX build.
+Enabling the target policy cannot add TCP support to an RDMA-only source.
+
+This release enables `adaptive` for main-model first loads with CUDA and direct
+worker discovery. With `MX_NIXL_BACKEND=LIBFABRIC`, the target retains same-domain
+P2P through LIBFABRIC and skips the UCX-only TCP strategy. If no same-domain source
+succeeds, it continues to storage loading. Draft, reload, and Service discovery
+skip P2P under `adaptive` and retain storage loading. SGLang `transfer_engine`
+skips peer transfer. Remote JIT cache fetching is deferred under `adaptive`;
+the engine compiles locally.
+`required` and `preferred` retain their existing behavior.
 
 ### Collective Refit (NCCL M2N) Topology
 

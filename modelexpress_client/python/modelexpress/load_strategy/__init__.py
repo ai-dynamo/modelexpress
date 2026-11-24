@@ -75,6 +75,7 @@ class LoadStrategyChain:
         Raises RuntimeError if no strategy succeeds.
         """
         from .rdma_strategy import RdmaStrategy
+        from .tcp_strategy import TcpStrategy
         from .server_cache_strategy import ServerCacheStrategy
         from .instant_tensor_strategy import InstantTensorStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
@@ -85,6 +86,7 @@ class LoadStrategyChain:
 
         all_strategies: list[LoadStrategy] = [
             RdmaStrategy(),
+            TcpStrategy(),
             ServerCacheStrategy(),
             InstantTensorStrategy(),
             ModelStreamerStrategy(),
@@ -381,6 +383,7 @@ def execute_load_strategies(
     strategies: list[LoadStrategy],
 ) -> nn.Module:
     """Execute an ordered policy using the common fallback lifecycle."""
+    ctx.p2p_state = None
     eligible = _eligible_on_every_rank(strategies, ctx)
     logger.info(f"Eligible loaders: {[strategy.name for strategy in eligible]}")
 
@@ -441,6 +444,9 @@ def validate_load_strategy_chain() -> None:
     """Reject policies that require a separate engine integration."""
     from .. import envs
 
+    from ..topology import validate_topology_config
+
+    validate_topology_config()
     if envs.MX_LOAD_STRATEGY_CHAIN != "INFERENCE":
         raise ValueError(
             f"Loading policy {envs.MX_LOAD_STRATEGY_CHAIN!r} requires its engine "

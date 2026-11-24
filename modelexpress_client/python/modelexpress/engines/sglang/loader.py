@@ -34,6 +34,7 @@ from ...metrics import metrics as selection_metrics
 from ...nixl_transfer import NixlTransferManager
 from ...source_selection import configured_policy_label, get_configured_selector
 from ...topology import (
+    adaptive_enabled,
     apply_policy,
     blocks_selection,
     count_in_domain,
@@ -614,6 +615,8 @@ class MxModelLoader:
         # metadata-backend outage is indistinguishable from a cluster that has
         # published no peers -- the exact pair the ListSources counter exists to
         # separate.
+        if adaptive_enabled():
+            return None
         policy = configured_policy_label()
         topology_policy = resolve_policy()
         if blocks_selection(topology_policy):

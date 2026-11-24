@@ -1072,10 +1072,9 @@ def test_load_cleanup_failure_aborts_before_reinit():
     manager.shutdown.side_effect = RuntimeError("shutdown failed")
     ctx.nixl_manager = manager
 
-    with pytest.raises(StrategyFailed, match="shutdown failed") as exc:
+    with pytest.raises(StrategyRecoveryError, match="shutdown failed"):
         strat.load(MagicMock(), ctx)
 
-    assert exc.value.mutated is True
     assert strat._load_as_target.call_count == 1
     assert ctx.nixl_manager is manager
     ctx.adapter.reinit_for_retry.assert_not_called()
@@ -1424,7 +1423,7 @@ def _real_metrics(monkeypatch):
         "modelexpress.load_strategy.nixl_p2p_strategy.worker_tensor_count", lambda w: 1
     )
     monkeypatch.setattr(
-        "modelexpress.load_strategy.nixl_p2p_strategy.register_tensors", lambda result, ctx: None
+        "modelexpress.load_strategy.nixl_p2p_strategy.register_tensors", lambda result, ctx, **kwargs: None
     )
     return collector
 
