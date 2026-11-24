@@ -160,6 +160,7 @@ ModelExpress/
 │       │   ├── context.py              # LoadContext and LoadResult
 │       │   ├── draft_gate.py           # Delay main publication until a draft pass completes
 │       │   ├── base.py                 # LoadStrategy ABC and shared helpers
+│       │   ├── nixl_p2p_strategy.py    # Shared NIXL receive/retry lifecycle
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
 │       │   ├── server_cache_strategy.py # ServerCacheStrategy (weights from MX Server)
 │       │   ├── instant_tensor_strategy.py # InstantTensorStrategy (fast local safetensors)
