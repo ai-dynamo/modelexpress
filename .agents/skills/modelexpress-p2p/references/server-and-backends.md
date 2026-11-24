@@ -18,9 +18,17 @@ Kubernetes Deployment), `docs/K8S_SERVICE_BACKEND.md`, `helm/README.md`.
 
 ## Install The Server With Helm
 
-Install the chart from `helm/` in a ModelExpress checkout. Its image defaults to
-`nvcr.io/nvidia/ai-dynamo/modelexpress-server` at the chart's `appVersion`.
+Install the chart from `helm/` in a ModelExpress checkout. Run the commands
+below from the checkout root, in a namespace that already exists
+(`kubectl create namespace "${NAMESPACE}"` creates one). The chart's image
+defaults to `nvcr.io/nvidia/ai-dynamo/modelexpress-server` at its `appVersion`.
 `MX_METADATA_BACKEND` is required; the server fails to start without it.
+
+Both the chart and the standalone Redis request a persistent volume without
+naming a storage class, so they rely on the cluster's default StorageClass. If
+the cluster has none, the pods can stay `Pending`: set
+`persistence.storageClass` for the chart, and `storageClassName` in the Redis
+manifest, to a class that exists (`kubectl get storageclass`).
 
 Redis backend. The chart does not bundle Redis. If you do not already run one,
 `examples/p2p_transfer_k8s/server/redis_backend/redis-standalone.yaml` deploys
@@ -79,8 +87,12 @@ without a valid backend setting exits; look for the reason in its logs.
 
 ## Point Workers At The Server
 
-Workers use `MX_SERVER_ADDRESS=<service>:8001`. A worker in another namespace
-must qualify the name: `<service>.<server-namespace>.svc.cluster.local:8001`.
+`MX_SERVER_ADDRESS` is the server's gRPC `host:port`, not an HTTP URL; in the
+cluster, the host is the Service's DNS name. Workers in the server's namespace
+use `<service>:8001`; with the install above, the Service is `modelexpress`. A
+worker in a different namespace must use the Service's full DNS name,
+`<service>.<server-namespace>.svc.cluster.local:8001` (for example
+`modelexpress.mx.svc.cluster.local:8001` for a server in namespace `mx`).
 All workers that use one server share one source pool, so workers in different
 namespaces can be sources for each other.
 

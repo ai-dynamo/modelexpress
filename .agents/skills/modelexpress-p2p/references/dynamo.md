@@ -7,120 +7,72 @@ SPDX-License-Identifier: Apache-2.0
 
 Dynamo owns the serving graph and worker lifecycle; ModelExpress (MX) runs
 inside each worker and supplies loading, source discovery, and P2P transfer.
-Authoritative sources: `docs/integrations/orchestrators/dynamo.md` and
-`examples/dynamo_p2p_transfer_k8s/README.md`.
+This reference lists what MX needs from a Dynamo worker. For where each
+setting goes in a `DynamoGraphDeployment` (DGD) and how to scale a component,
+follow Dynamo's documentation for the manifest's `apiVersion`.
 
 This reference covers vLLM and SGLang workers. For TensorRT-LLM, see the
-standalone section of `references/runtimes.md`; Dynamo's TensorRT-LLM runtime
-image does not include the MX client.
+standalone section of `references/runtimes.md`.
 
-## What Dynamo Provides And What You Add
+## Before You Start
 
-| Piece | Provided by Dynamo | You add |
-|---|---|---|
-| MX client in the worker image | Dynamo's vLLM and SGLang runtime images, when built with ModelExpress enabled | Nothing, if the image has it; otherwise layer it with `examples/dynamo_p2p_transfer_k8s/Dockerfile` |
-| MX server | No; the Dynamo platform chart does not install it | Install it (`references/server-and-backends.md`) |
-| Server address in pods | Optional: the operator injects `MODEL_EXPRESS_URL` when the platform chart sets `dynamo-operator.modelExpressURL` | The address in the DGD worker env |
-| Worker load format | No | The runtime flag in the DGD worker args |
+- MX client: Dynamo's vLLM and SGLang runtime images are built with it by
+  default. With another image, install the ModelExpress Python client in it.
+- MX server (`redis` or `kubernetes` backend): the Dynamo platform chart does
+  not install it. Install and health-check it as in
+  `references/server-and-backends.md`. The `k8s-service` backend needs no
+  server.
 
-## MX Server Bring-Up
+## Worker Settings
 
-Install and health-check the server as in `references/server-and-backends.md`.
-Then point the workers at it by setting both variables to the same value in
-every worker's `envs`:
+Add to the `main` container of each worker component:
 
-```yaml
-envs:
-  - name: MX_SERVER_ADDRESS
-    value: "<server-service>.<server-namespace>.svc.cluster.local:8001"
-  - name: MODEL_EXPRESS_URL
-    value: "<server-service>.<server-namespace>.svc.cluster.local:8001"
-```
+- Args. vLLM (`python3 -m dynamo.vllm`): `--load-format modelexpress`.
+  SGLang (`python3 -m dynamo.sglang`): `--load-format remote_instance
+  --remote-instance-weight-loader-backend modelexpress
+  --modelexpress-config '{"transport":"nixl"}'`.
+- Env: with `redis` or `kubernetes`, `MX_SERVER_ADDRESS` and
+  `MODEL_EXPRESS_URL`, both set to the server address, for example
+  `<server-service>.<server-namespace>.svc.cluster.local:8001`. With
+  `k8s-service`, `MX_METADATA_BACKEND=k8s-service` instead.
+- Resources: the cluster's RDMA device resource (for example `rdma/ib`) next
+  to the GPUs.
+- Capability: `IPC_LOCK`.
 
-The MX client reads `MODEL_EXPRESS_URL` before `MX_SERVER_ADDRESS`. The
-operator's injected `MODEL_EXPRESS_URL` applies only to containers that do not
-already set it, so setting it in the DGD keeps an operator-wide default from
-silently overriding the DGD's own address.
+Leave `VLLM_PLUGINS` unset: Dynamo's docs require `dynamo_nixl_telemetry` in
+it whenever it is set.
 
-## Worker Spec
+Optional (see `docs/DEPLOYMENT.md`, P2P Environment Variables):
+`MX_RDMA_NIC_PIN=auto` for per-rank NIC pinning.
 
-Add to each worker service in the `DynamoGraphDeployment`:
-
-vLLM (`python3 -m dynamo.vllm`):
-
-```yaml
-args:
-  - --load-format
-  - modelexpress
-```
-
-SGLang (`python3 -m dynamo.sglang`):
-
-```yaml
-args:
-  - --load-format
-  - remote_instance
-  - --remote-instance-weight-loader-backend
-  - modelexpress
-  - --modelexpress-config
-  - '{"transport":"nixl"}'
-```
-
-RDMA access, as in the checked-in examples (the resource name and count depend
-on the cluster's device plugin):
-
-```yaml
-resources:
-  limits:
-    gpu: "4"
-    custom:
-      rdma/ib: "4"
-extraPodSpec:
-  mainContainer:
-    securityContext:
-      capabilities:
-        add:
-          - IPC_LOCK
-```
+The MX client reads `MODEL_EXPRESS_URL` before `MX_SERVER_ADDRESS`. The Dynamo
+operator injects `MODEL_EXPRESS_URL` into every pod when the platform chart
+sets `dynamo-operator.modelExpressURL`, but only into containers that do not
+already set it. Setting both in the worker keeps an operator-wide default from
+overriding the worker's own address.
 
 With these load formats Dynamo skips its own weight prefetch for Hugging Face
 model names and lets MX acquire the weights. Every worker still needs the
-model's configuration and tokenizer files. Mount a shared model cache (as the
-examples do with `HF_HOME` on a PVC) or download the non-weight files before
-the worker starts.
-
-Optional settings used by the examples (see `docs/DEPLOYMENT.md`, P2P
-Environment Variables): `MX_RDMA_NIC_PIN=auto` for per-rank NIC pinning, and
-`MX_ARTIFACT_TRANSFER=1` with `MX_ARTIFACT_READY_URL` to share compiled caches
-as well as weights.
+model's configuration and tokenizer files: mount a shared model cache or
+download the non-weight files before the worker starts.
 
 ## Roll Out
 
-1. Apply the DGD with one worker replica. It loads from storage and publishes
-   itself as a source.
-2. Wait for the DGD to be ready.
-3. Scale the worker service:
-
-   ```bash
-   kubectl patch dgd <dgd-name> -n <namespace> --type merge \
-     -p '{"spec":{"services":{"<WorkerService>":{"replicas":2}}}}'
-   ```
+Deploy the DGD with one replica of the worker component. It loads from storage
+and publishes itself as a source. Once the DGD is ready, scale the worker
+component.
 
 In a disaggregated graph, prefill and decode workers can pull from each other
-only when their full source identities match, for example the same model,
-revision, dtype, quantization, and tensor, pipeline, and expert parallel sizes.
+only when their full source identities match: the same ModelExpress client
+version (for vLLM, also the same vLLM version) and the same model arguments,
+including the model string, revision, dtype or quantization, and tensor,
+pipeline, and expert parallel sizes.
 
 ## Confirm
 
-Worker pods carry `nvidia.com/dynamo-graph-deployment-name=<dgd-name>` and
-`nvidia.com/dynamo-component-type=worker`. On the replica started after the
-first, the `main` container's log should contain `RDMA transfer complete`:
-
-```bash
-kubectl logs -n <namespace> <new-worker-pod> -c main | grep "RDMA transfer complete"
-```
-
-For multi-node workers, read the leader pod.
+On a worker started after the first, the `main` container's log should
+contain `RDMA transfer complete`. For multi-node workers, check the `main`
+container of each of the worker's pods.
 
 ## Relation To `deploy-dynamo-recipe`
 

@@ -27,10 +27,11 @@ SPDX-License-Identifier: Apache-2.0
 Make inference replicas start faster by reading weights over NIXL from a
 replica that already has them in memory, instead of from storage. Weights on
 the accelerator (CUDA or Intel XPU) move accelerator to accelerator; with vLLM
-and SGLang, parameters the engine keeps in host memory move as well. The first
-replica loads from storage and publishes itself as a source; later replicas
-with the same model and layout discover it through ModelExpress (MX) and read
-its weights directly. Weight bytes never pass through the MX server.
+and SGLang, MX clients that support it also move parameters the engine keeps in
+host memory. The first replica loads from storage and publishes itself as a
+source; later replicas with the same model and layout discover it through
+ModelExpress (MX) and read its weights directly. Weight bytes never pass
+through the MX server.
 
 ## Prerequisites
 
@@ -45,8 +46,10 @@ its weights directly. Weight bytes never pass through the MX server.
   runtime images are built with it by default.
 - Every target can read the model's configuration and tokenizer at its model
   path, even when all weights arrive over RDMA.
-- Replicas that should share weights run the same model, revision, dtype or
-  quantization, and parallel layout. Sources pair with targets rank to rank.
+- Replicas that should share weights run the same ModelExpress client version
+  (for vLLM, also the same vLLM version) with the same model arguments: the
+  same model string, revision, dtype or quantization, and parallel layout.
+  Sources pair with targets rank to rank.
 
 ## Instructions
 
@@ -117,18 +120,17 @@ Return:
 
 - P2P is built for RDMA between source and target. MX does not verify the
   fabric before trying it.
-- This skill covers TensorRT-LLM standalone only. Dynamo's TensorRT-LLM runtime
-  image does not include the ModelExpress client.
-- RL weight refit is out of scope; use `modelexpress-rl-refit`.
+- This skill covers TensorRT-LLM standalone only.
+- RL weight refit is out of scope; see `docs/rl/README.md`.
 
 ## Troubleshooting
 
 | Symptom | Likely cause | Next step |
 |---|---|---|
-| `Eligible loaders` lacks `rdma` | No server address, NIXL not importable, an accelerator without RDMA P2P, or transfer disabled for this model | Check each cause; log messages such as `No MX server configured, skipping RDMA` or `RDMA transfer disabled: <reason>` point to some of them |
-| `Strategy rdma failed, trying next: <reason>` | Either no ready source matches this model on this server (`No RDMA source available`), or a source was found but could not be used or its transfer failed | For no source: wait for the first replica, compare the model settings (revision, dtype, quantization, parallel layout), and check the server address. Otherwise: read the warnings logged earlier for each source tried |
+| `Eligible loaders` lacks `rdma` | No server address, or NIXL not importable | Check each cause; log messages such as `No MX server configured, skipping RDMA` point to some of them |
+| `Strategy rdma failed, trying next: <reason>` | Either no ready source matches this model on this server (`No RDMA source available`), or a source was found but could not be used or its transfer failed | For no source: wait for the first replica, compare the ModelExpress client version (and vLLM version) and the model arguments (model string, revision, dtype, quantization, parallel layout), and check the server address. Otherwise: read the warnings logged earlier for each source tried |
 | `NIXL registration failed` | The target could not register its buffers for RDMA | Read the registration error logged just before; check the RDMA device resources and `IPC_LOCK` |
-| `[TIMING] RDMA transfer complete:` with low Gbps | Traffic on TCP or the wrong NIC | Set `MX_RDMA_NIC_PIN=auto` or `UCX_NET_DEVICES`; on AWS EFA set `MX_NIXL_BACKEND=LIBFABRIC` |
+| `[TIMING] RDMA transfer complete:` with low Gbps | Traffic on TCP or the wrong NIC | Set `MX_RDMA_NIC_PIN=auto` or `UCX_NET_DEVICES`; on AWS EFA, follow `references/runtimes.md` for the libfabric setup |
 | Worker reaches a different server than `MX_SERVER_ADDRESS` | `MODEL_EXPRESS_URL` set elsewhere and taking precedence | Set both to the same address |
 
 ## References

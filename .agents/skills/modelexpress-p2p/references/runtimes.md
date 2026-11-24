@@ -16,14 +16,17 @@ as a plain Kubernetes Deployment. For workers managed by NVIDIA Dynamo, see
 - Every replica runs the same command. With no ready source, a replica loads
   from storage and publishes itself; later replicas find it and receive
   weights over P2P.
+- The example manifests point at their own server address; replace it with
+  your server's Service and port before applying them.
 - Give the pod RDMA devices and the `IPC_LOCK` capability. The examples request
   `rdma/ib` and add `IPC_LOCK` under `securityContext.capabilities`.
 - The examples set `MX_RDMA_NIC_PIN=auto` for per-rank NIC pinning, a UCX
   workaround.
 - Fabric: the default NIXL backend (UCX) targets InfiniBand and RoCE, and can
-  fall back to TCP without warning. On AWS EFA, set `MX_NIXL_BACKEND=LIBFABRIC`
-  and request `vpc.amazonaws.com/efa` instead. See
-  `examples/p2p_transfer_k8s/client/vllm/aws_efa/README.md`.
+  fall back to TCP without warning. On AWS EFA, use the libfabric backend
+  instead; the README and manifest in
+  `examples/p2p_transfer_k8s/client/vllm/aws_efa/` show the image, device
+  resource, and environment it needs.
 - The model path must resolve to the configuration and tokenizer files on every
   replica.
 
