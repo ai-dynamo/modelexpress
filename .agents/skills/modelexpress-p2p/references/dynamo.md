@@ -76,7 +76,8 @@ container of each of the worker's pods.
 
 ## Relation To `deploy-dynamo-recipe`
 
-Dynamo's `deploy-dynamo-recipe` skill deploys an assigned DGD as handed off and
-does not change its engine arguments or install cluster services. To use P2P
-there, the DGD it receives must already carry the settings above, and the MX
-server must already be running.
+Dynamo's `deploy-dynamo-recipe` skill deploys an assigned DGD as handed off; it
+does not change engine arguments or install cluster services. To use P2P there,
+add the settings above to the DGD before it is handed off. If the workers use
+the `redis` or `kubernetes` backend, the MX server must also be running before
+the DGD is deployed; the `k8s-service` backend needs no server.

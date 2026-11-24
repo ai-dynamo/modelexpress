@@ -40,7 +40,7 @@
       "id": "sglang-standalone-p2p",
       "expected_skill": "modelexpress-p2p",
       "prompt": "How do I turn on ModelExpress P2P weight loading for a standalone SGLang deployment on Kubernetes?",
-      "expected_output": "Use an SGLang image with the upstream ModelExpress delegation hook (docs/SGLANG.md names a known-good one) and install the ModelExpress client with --no-deps. Set MX_SERVER_ADDRESS and launch every replica with the same command: --load-format remote_instance --remote-instance-weight-loader-backend modelexpress --modelexpress-config '{\"transport\":\"nixl\"}'. Keep --model-path on the model identity or a local path, not an object-storage URI. Give the pod RDMA resources and IPC_LOCK. The first replica loads from storage and publishes; later replicas pull over P2P. Start from examples/p2p_transfer_k8s/client/sglang/sglang-single-node-p2p.yaml.",
+      "expected_output": "Use an SGLang image with the upstream ModelExpress delegation hook (docs/SGLANG.md names a known-good one) and install the ModelExpress client with --no-deps. Set MX_SERVER_ADDRESS and launch every replica with the same command: --host 0.0.0.0 --load-format remote_instance --remote-instance-weight-loader-backend modelexpress --modelexpress-config '{\"transport\":\"nixl\"}'. Keep --model-path on the model identity or a local path, not an object-storage URI. Give the pod RDMA resources and IPC_LOCK. The first replica loads from storage and publishes; later replicas pull over P2P. Start from examples/p2p_transfer_k8s/client/sglang/sglang-single-node-p2p.yaml.",
       "assertions": [
         "Require an SGLang image with the ModelExpress delegation hook and the client installed",
         "Give the remote_instance load format with the modelexpress backend and the nixl transport",
@@ -62,7 +62,7 @@
       "id": "address-precedence-dynamo",
       "expected_skill": "modelexpress-p2p",
       "prompt": "I set MX_SERVER_ADDRESS on my Dynamo workers to our new ModelExpress server, but they keep registering with the old one. What is going on?",
-      "expected_output": "The ModelExpress client reads the deprecated MODEL_EXPRESS_URL before MX_SERVER_ADDRESS. The Dynamo operator injects MODEL_EXPRESS_URL into every pod when the platform chart sets dynamo-operator.modelExpressURL, and that value wins. Set MODEL_EXPRESS_URL in the DGD worker envs to the same address as MX_SERVER_ADDRESS; the operator does not override an env var the container already sets.",
+      "expected_output": "The ModelExpress client reads the deprecated MODEL_EXPRESS_URL before MX_SERVER_ADDRESS. The Dynamo operator injects MODEL_EXPRESS_URL into every pod when the platform chart sets dynamo-operator.modelExpressURL, and that value wins. Set MODEL_EXPRESS_URL in the env of each worker's main container to the same address as MX_SERVER_ADDRESS; the operator does not override an env var the container already sets.",
       "assertions": [
         "Identify MODEL_EXPRESS_URL precedence over MX_SERVER_ADDRESS",
         "Name the operator's dynamo-operator.modelExpressURL injection as a likely source",
@@ -73,9 +73,9 @@
       "id": "slow-transfer-aws-efa",
       "expected_skill": "modelexpress-p2p",
       "prompt": "On AWS the second vLLM replica logs '[TIMING] RDMA transfer complete' but only at a few Gbps. Is P2P working?",
-      "expected_output": "The line is logged whatever transport UCX used, so low Gbps points to the transfer running over TCP rather than the RDMA fabric. On AWS EFA, UCX can fall back to TCP without warning: use the libfabric backend (MX_NIXL_BACKEND=LIBFABRIC) with the image, vpc.amazonaws.com/efa device resource, and environment shown in examples/p2p_transfer_k8s/client/vllm/aws_efa/. Elsewhere, check NIC selection with MX_RDMA_NIC_PIN=auto or UCX_NET_DEVICES.",
+      "expected_output": "The line is logged whatever transport UCX used, and its Gbps figure does not name the transport, so low Gbps is a reason to check the transport rather than proof of TCP. On AWS EFA, UCX can fall back to TCP without warning: use the libfabric backend (MX_NIXL_BACKEND=LIBFABRIC) with the image, vpc.amazonaws.com/efa device resource, and environment shown in examples/p2p_transfer_k8s/client/vllm/aws_efa/. Elsewhere, check NIC selection with MX_RDMA_NIC_PIN=auto or UCX_NET_DEVICES.",
       "assertions": [
-        "Use the Gbps figure, not the presence of the log line, to judge whether RDMA was used",
+        "Treat low Gbps as a prompt to check the transport, and confirm the fabric as the aws_efa README's Verify section describes",
         "Recommend MX_NIXL_BACKEND=LIBFABRIC and the EFA device resource on AWS"
       ]
     },
@@ -94,18 +94,18 @@
       "id": "neg-rl-refit",
       "expected_skill": null,
       "prompt": "After every RL training step I need to push the trainer's new weights into my running vLLM generators. How do I set that up with ModelExpress?",
-      "expected_output": "Live weight refit from an RL trainer belongs to modelexpress-rl-refit, not to P2P initial loading.",
+      "expected_output": "Out of scope for modelexpress-p2p: live RL weight refit is not P2P initial loading (see docs/rl/README.md).",
       "assertions": [
-        "modelexpress-p2p stays silent; modelexpress-rl-refit handles it"
+        "modelexpress-p2p stays inactive"
       ]
     },
     {
       "id": "neg-dynamo-recipe-deploy",
       "expected_skill": null,
       "prompt": "Deploy the Qwen vLLM disaggregated recipe with Dynamo on my cluster and run a smoke test.",
-      "expected_output": "Deploying a Dynamo recipe belongs to deploy-dynamo-recipe; ModelExpress P2P is only relevant if the user asks for it.",
+      "expected_output": "Out of scope for modelexpress-p2p: deploying a Dynamo recipe; P2P applies only if the user asks to enable it.",
       "assertions": [
-        "modelexpress-p2p stays silent; deploy-dynamo-recipe handles it"
+        "modelexpress-p2p stays inactive"
       ]
     }
   ]

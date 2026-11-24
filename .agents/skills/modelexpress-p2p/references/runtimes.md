@@ -23,10 +23,12 @@ as a plain Kubernetes Deployment. For workers managed by NVIDIA Dynamo, see
 - The examples set `MX_RDMA_NIC_PIN=auto` for per-rank NIC pinning, a UCX
   workaround.
 - Fabric: the default NIXL backend (UCX) targets InfiniBand and RoCE, and can
-  fall back to TCP without warning. On AWS EFA, use the libfabric backend
-  instead; the README and manifest in
+  fall back to TCP without warning; the `RDMA transfer complete` line does not
+  name the transport. On AWS EFA, use the libfabric backend
+  (`MX_NIXL_BACKEND=LIBFABRIC`) instead; the README and manifest in
   `examples/p2p_transfer_k8s/client/vllm/aws_efa/` show the image, device
-  resource, and environment it needs.
+  resource, and environment it needs, and the README's Verify section shows how
+  to confirm the EFA fabric was used.
 - The model path must resolve to the configuration and tokenizer files on every
   replica.
 
@@ -53,14 +55,16 @@ installs the client on a vLLM image.
 
 ## SGLang
 
-SGLang delegates its `remote_instance` loader to MX. The image needs SGLang's
-upstream ModelExpress delegation hook and the MX client, installed with
+SGLang delegates its `remote_instance` loader to MX, with no separate source and
+target modes: every replica runs the same command, and MX decides whether to
+load from storage and publish or to receive from a source. The image needs
+SGLang's upstream ModelExpress delegation hook and the MX client, installed with
 `--no-deps` so the base image keeps its own dependency stack. `docs/SGLANG.md`
 names a known-good image.
 
 ```bash
 export MX_SERVER_ADDRESS=<service>:8001
-python -m sglang.launch_server --model-path <model> --tp <n> \
+python -m sglang.launch_server --model-path <model> --tp <n> --host 0.0.0.0 \
   --load-format remote_instance \
   --remote-instance-weight-loader-backend modelexpress \
   --modelexpress-config '{"transport":"nixl"}'
@@ -92,6 +96,11 @@ checkpoint_format: MX
 mx_config:
   server_url: <service>:8001
 ```
+
+With the `redis` or `kubernetes` backend, the worker needs the server address,
+from `mx_config.server_url` or `MX_SERVER_ADDRESS`; without one, it logs
+`No MX server configured, skipping metadata publish` and never becomes a
+source.
 
 The checked-in example (`examples/p2p_transfer_k8s/client/trtllm/`) is beta: it
 covers `LlamaForCausalLM` at TP=4 with the PyTorch backend and pins the

@@ -40,8 +40,8 @@ through the MX server.
   NIXL is importable but not that the fabric is RDMA, so a pod without RDMA
   resources can still attempt P2P. Depending on the UCX configuration, that
   transfer may run over TCP, which works but is much slower and gives no
-  warning. Check transfer throughput in the worker logs to confirm RDMA is in
-  use.
+  warning. Check transfer throughput in the worker logs; low throughput is a
+  reason to check which transport ran.
 - The MX Python client in the worker image. NVIDIA Dynamo's vLLM and SGLang
   runtime images are built with it by default.
 - Every target can read the model's configuration and tokenizer at its model
@@ -130,7 +130,7 @@ Return:
 | `Eligible loaders` lacks `rdma` | No server address, or NIXL not importable | Check each cause; log messages such as `No MX server configured, skipping RDMA` point to some of them |
 | `Strategy rdma failed, trying next: <reason>` | Either no ready source matches this model on this server (`No RDMA source available`), or a source was found but could not be used or its transfer failed | For no source: wait for the first replica, compare the ModelExpress client version (and vLLM version) and the model arguments (model string, revision, dtype, quantization, parallel layout), and check the server address. Otherwise: read the warnings logged earlier for each source tried |
 | `NIXL registration failed` | The target could not register its buffers for RDMA | Read the registration error logged just before; check the RDMA device resources and `IPC_LOCK` |
-| `[TIMING] RDMA transfer complete:` with low Gbps | Traffic on TCP or the wrong NIC | Set `MX_RDMA_NIC_PIN=auto` or `UCX_NET_DEVICES`; on AWS EFA, follow `references/runtimes.md` for the libfabric setup |
+| `[TIMING] RDMA transfer complete:` with low Gbps | Possibly TCP or the wrong NIC; the line does not name the transport | Check the transport. Set `MX_RDMA_NIC_PIN=auto` or `UCX_NET_DEVICES`; on AWS EFA, use `MX_NIXL_BACKEND=LIBFABRIC` and confirm the fabric as in `references/runtimes.md` |
 | Worker reaches a different server than `MX_SERVER_ADDRESS` | `MODEL_EXPRESS_URL` set elsewhere and taking precedence | Set both to the same address |
 
 ## References
