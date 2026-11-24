@@ -1785,3 +1785,40 @@ Receiver-only Qwen3-30B-A3B BF16 experiments measured warm pause reductions with
 this replay strategy, but do not qualify quantization, S3 reconstruction, or
 end-to-end trainer publication. Independent cold-start output variation remains
 unresolved. Keep this option experimental pending integrated GPU qualification.
+
+#### Reproduce receiver installation pause
+
+`examples/rl/checkpoint_replay_benchmark` compares the ordinary loader with the
+experimental checkpoint adapter on four GPUs (TP4), using four active AsyncLLM
+streams with 384 output tokens each. Supply a local, unquantized BF16
+Qwen3-30B-A3B checkpoint and an empty, separate scratch destination. The fixture
+flips low mantissa bits; it is synthetic, not a trainer update.
+
+```bash
+BENCH=examples/rl/checkpoint_replay_benchmark
+python "$BENCH/prepare_target.py" --model /local/seed --target /local/target
+mkdir -p /local/results
+python "$BENCH/pause_ab.py" --model /local/seed --target /local/target \
+  --pairs 1 --output /local/results/pause-pilot.jsonl
+for run in 1 2 3; do
+  python "$BENCH/pause_ab.py" --model /local/seed --target /local/target \
+    --pairs 5 --output "/local/results/pause-run${run}.jsonl" || break
+done
+python "$BENCH/summarize_pause.py" /local/results
+```
+
+Proceed to measured runs only after the pilot succeeds. Use the same pinned
+vLLM/MX source and checkpoint revision for both arms. Record GPU model, driver,
+CPU architecture, package versions and the filesystem backing the checkpoints.
+The harness forces the environment option off so its ordinary arm remains the
+native loader, and calls the adapter explicitly for the mapped arm. It validates
+registered bytes/storage and fresh-request output outside each timed interval.
+Keep mode allows in-flight responses to span weight versions; their contents are
+not a cold-target correctness oracle.
+
+The summary excludes pilot, controls and warmups, requires complete pairs, and
+reports median paired savings separately from arm medians. Failures stop the
+engine rather than resuming into uncertain weights. These scripts test the new
+adapter, whereas the earlier Nscale (7.91 s to 6.52 s) and GB200 (13.10 s to
+9.14 s) results exercised a benchmark-local bridge into the same replay engine.
+Those results must not be presented as GPU qualification of this adapter.
