@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 import gc
 import inspect
 import json
@@ -343,6 +344,67 @@ def _converge_streamer_files(
     return [path for path in files if path in needed]
 
 
+def _own_buffered_indexer_tensors(
+    weights: Iterator[tuple[str, torch.Tensor]],
+    recorded: dict[str, torch.Tensor],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Copy and record FP8 indexer wk tensors, which vLLM pairs across calls.
+
+    Streaming iterators may yield views into reused read buffers.
+    """
+    for name, tensor in weights:
+        if ".indexer.wk." in name and "wk_weights" not in name and (
+            (name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn)
+            or "weight_scale" in name
+        ):
+            tensor = tensor.clone()
+            recorded[name] = tensor
+        yield name, tensor
+
+
+def _pending_indexer_pairs(model: torch.nn.Module) -> Iterator[dict]:
+    """Find buffers on the wrapper and the inner modules vLLM loads."""
+    modules = model.modules() if isinstance(model, torch.nn.Module) else (model,)
+    for module in modules:
+        pending = getattr(module, "_pending_indexer_wk_fp8", None)
+        if pending:
+            yield pending
+
+
+def _clear_pending_indexer_pairs(model: torch.nn.Module) -> None:
+    for pending in _pending_indexer_pairs(model):
+        logger.warning("Clearing pending FP8 indexer wk pairs: %s", sorted(pending))
+        pending.clear()
+
+
+def _rewrite_indexer_wk_pairs(model: torch.nn.Module, recorded: dict[str, torch.Tensor]) -> None:
+    """Feed each streamed FP8 indexer wk weight again together with its scale.
+
+    vLLM writes the fused ``wk_weights_proj`` shard only once both halves are
+    buffered together, so a half the stream stranded would leave it unwritten.
+    """
+    _clear_pending_indexer_pairs(model)
+    pairs: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+    for name, tensor in recorded.items():
+        prefix = name.rsplit(".wk.", 1)[0]
+        pairs.setdefault(prefix, {})["scale" if "weight_scale" in name else "weight"] = (name, tensor)
+    pairs = {prefix: parts for prefix, parts in pairs.items() if "weight" in parts}
+    incomplete = sorted(prefix for prefix, parts in pairs.items() if "scale" not in parts)
+    if incomplete:
+        raise RuntimeError(f"the stream lacks an FP8 indexer wk weight or scale: {incomplete}")
+    if pairs:
+        try:
+            from vllm.model_executor.model_loader.mtp_validation import disable_mtp_completeness_check
+        except ImportError:
+            replay = nullcontext()
+        else:
+            replay = disable_mtp_completeness_check()
+        with replay:
+            model.load_weights(item for _prefix, parts in sorted(pairs.items()) for item in parts.values())
+    if any(_pending_indexer_pairs(model)):
+        raise RuntimeError("FP8 indexer wk pairs remain pending after the rewrite")
+
+
 # Formats vLLM's DefaultModelLoader._prepare_weights accepts; anything else (a typo, or a
 # format served by another loader such as runai_streamer) fails only once a worker reaches
 # the disk fallback, as "Unknown load_format" without naming the variable.
@@ -545,9 +607,13 @@ class VllmAdapter(EngineAdapter):
         result: LoadResult,
         weights_iter: Iterator[tuple[str, torch.Tensor]],
     ) -> LoadResult:
+        """Load streamed tensors, then replay owned FP8 indexer pairs together."""
         if result.model is None:
             raise RuntimeError("vLLM weight iterator loading requires result.model")
-        result.model.load_weights(weights_iter)
+        recorded: dict[str, torch.Tensor] = {}
+        _clear_pending_indexer_pairs(result.model)
+        result.model.load_weights(_own_buffered_indexer_tensors(weights_iter, recorded))
+        _rewrite_indexer_wk_pairs(result.model, recorded)
         return result
 
     def build_model_streamer_weight_iter(

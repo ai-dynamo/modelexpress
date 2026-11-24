@@ -5,14 +5,17 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import mmap
+import os
 import shutil
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +36,7 @@ from modelexpress_rl.object_storage import ObjectStorageType
 from modelexpress_rl.object_storage_reader import ObjectStorageReader
 from modelexpress_rl.train import WeightPayloadFormat
 from modelexpress_rl.utils import (
+    Adler32Checksum,
     checksum_factory,
     index_checkpoint_tensors,
     read_safetensors_header,
@@ -126,6 +130,32 @@ def _source_identity(version: _ObjectStorageVersion) -> dict[str, str]:
 
 
 _Decompressor = Callable[[memoryview], Any]
+
+
+# Delta bytes applied per read and write of the checkpoint file. Tensors larger
+# than _SPREAD_TENSOR_BYTES spread their chunks over the apply workers.
+_APPLY_CHUNK_BYTES = 2 << 20
+_SPREAD_TENSOR_BYTES = 256 << 20
+
+
+def _read_exactly(fd: int, out: memoryview, offset: int) -> None:
+    """Fill a byte view with positional reads, rejecting premature EOF."""
+    done = 0
+    while done < len(out):
+        read = os.preadv(fd, [out[done:]], offset + done)
+        if read <= 0:
+            raise ValueError(f"checkpoint file ended at byte {offset + done}")
+        done += read
+
+
+def _write_all(fd: int, data: memoryview, offset: int) -> None:
+    """Write every byte at a fixed offset, rejecting stalled writes."""
+    done = 0
+    while done < len(data):
+        written = os.pwrite(fd, data[done:], offset + done)
+        if written <= 0:
+            raise OSError("checkpoint write made no progress")
+        done += written
 
 
 def _zstd_stream_reader(data: memoryview) -> Any:
@@ -942,6 +972,9 @@ class _LocalCheckpoint:
         index_download_time: float,
         lock_wait: float,
     ) -> PreparedCheckpoint:
+        """Replay lineage while retaining the last completed state for quota recovery."""
+        restore = self.store.state()
+        assert restore is not None
         # READY -> UPDATING is persisted before any derived checkpoint mutates.
         # A crash therefore makes the next initializer rebuild from lineage.
         self.store.write_state(
@@ -969,15 +1002,22 @@ class _LocalCheckpoint:
                         index_data,
                         metadata,
                         weight_map,
+                        restore_version=restore.version,
                     )
                 download_time += downloaded
                 apply_time += applied
+                restore = CheckpointRecord(
+                    status=CheckpointState.READY,
+                    version=version.version_id,
+                    source=_source_identity(version),
+                )
         except CheckpointCacheCapacityError:
-            self._set_local_checkpoint(self.store.checkpoint_path(active_version))
+            self._set_local_checkpoint(self.store.checkpoint_path(restore.version))
             self.store.write_state(
-                status=CheckpointState.READY,
-                version=active_version,
+                status=restore.status,
+                version=restore.version,
                 checkpoint_paths=self.checkpoint_paths,
+                source=restore.source,
             )
             raise
         except Exception as error:
@@ -1041,12 +1081,17 @@ class _LocalCheckpoint:
         index_data: bytes,
         metadata: dict[str, Any],
         weight_map: dict[str, str],
+        *,
+        restore_version: str | None = None,
     ) -> tuple[float, float]:
+        """Admit a full checkpoint without evicting the checkpoint needed for recovery."""
         # Cached or not, another full checkpoint leaves the active one's working
         # copy unused.
         active_version = _active_version(self.store)
         if active_version not in {None, version.version_id}:
             self.store.drop_unused_working_copy(active_version)
+        if restore_version not in {None, active_version, version.version_id}:
+            self.store.drop_unused_working_copy(restore_version)
         target = self.store.full_path(version.version_id)
         if target.exists():
             source = self.store.artifact_source(target)
@@ -1055,6 +1100,7 @@ class _LocalCheckpoint:
                     protected_versions=_protected_versions(
                         self.store,
                         version.version_id,
+                        restore_version or version.version_id,
                     ),
                 )
                 self.store.verify_artifact_source(
@@ -1081,7 +1127,9 @@ class _LocalCheckpoint:
             non_weight_source = self.local_checkpoint
         # A working copy of the full checkpoint being replaced is stale.
         self.store.drop_working_copy(version.version_id)
-        protected_versions = _protected_versions(self.store, version.version_id)
+        protected_versions = _protected_versions(
+            self.store, version.version_id, restore_version or version.version_id
+        )
         shard_bytes = _full_shard_bytes(self.reader, weight_map, version.uri)
         metadata_bytes = self._non_weight_files_size(non_weight_source) + len(
             index_data
@@ -1145,6 +1193,7 @@ class _LocalCheckpoint:
         metadata: dict[str, Any],
         weight_map: dict[str, str],
     ) -> tuple[float, float]:
+        """Verify and materialize a delta using an eligible working copy when available."""
         assert version.base_version_id is not None
         base_chain = self.store.chain(version.base_version_id)
         if base_chain is None:
@@ -1154,6 +1203,7 @@ class _LocalCheckpoint:
             )
 
         artifact = self.store.delta_path(version.version_id)
+        downloaded = None
         download_started = time.perf_counter()
         if artifact.exists():
             self.store.verify_artifact_source(
@@ -1166,14 +1216,14 @@ class _LocalCheckpoint:
                 version.base_version_id,
                 version.version_id,
             )
-            shards = self._download_deltas(weight_map, version.uri)
+            downloaded = self._download_deltas(weight_map, version.uri)
             self.store.ensure_capacity(
-                len(index_data) + sum(len(data) for data, _names in shards.values()),
+                len(index_data) + sum(len(data) for data, _names in downloaded.values()),
                 protected_versions=protected_versions,
             )
             with self.store.replace_directory(artifact) as temporary:
                 (temporary / Path(version.uri).name).write_bytes(index_data)
-                for filename, (data, _names) in shards.items():
+                for filename, (data, _names) in downloaded.items():
                     (temporary / filename).write_bytes(data)
                 self.store.record_artifact(
                     temporary,
@@ -1211,7 +1261,7 @@ class _LocalCheckpoint:
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
-            self._apply_delta_artifact(artifact, metadata, weight_map)
+            self._apply_delta_artifact(artifact, metadata, weight_map, shards=downloaded)
         else:
             # A full checkpoint without a working copy is copied once so
             # applying the delta cannot modify the canonical full artifact.
@@ -1220,7 +1270,7 @@ class _LocalCheckpoint:
                 copy_from=base_checkpoint,
             ) as temporary:
                 self._set_local_checkpoint(temporary)
-                self._apply_delta_artifact(artifact, metadata, weight_map)
+                self._apply_delta_artifact(artifact, metadata, weight_map, shards=downloaded)
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
@@ -1231,15 +1281,19 @@ class _LocalCheckpoint:
         artifact: Path,
         index_metadata: dict[str, Any],
         weight_map: dict[str, str],
+        *,
+        shards: dict[str, tuple[bytes, list[str]]] | None = None,
     ) -> None:
+        """Apply downloaded shard bytes or read the cached artifact when necessary."""
         self.store.verify_artifact(artifact)
-        shards = {
-            filename: (
-                (artifact / filename).read_bytes(),
-                names,
-            )
-            for filename, names in _group_tensors_by_shard(weight_map).items()
-        }
+        if shards is None:
+            shards = {
+                filename: (
+                    (artifact / filename).read_bytes(),
+                    names,
+                )
+                for filename, names in _group_tensors_by_shard(weight_map).items()
+            }
         self._apply_shards(shards, index_metadata=index_metadata)
 
     def _download_deltas(
@@ -1300,6 +1354,7 @@ class _LocalCheckpoint:
         *,
         index_metadata: dict[str, Any],
     ) -> None:
+        """Apply bounded XOR chunks and verify target checksums in tensor byte order."""
         if not shards:
             return
 
@@ -1338,46 +1393,147 @@ class _LocalCheckpoint:
         if not items:
             return
 
-        maps: dict[Path, tuple[Any, mmap.mmap]] = {}
-        try:
-            for path in {self.locations[name][0] for name, _data, _checksum in items}:
-                file_handle = path.open("r+b")
-                maps[path] = (file_handle, mmap.mmap(file_handle.fileno(), 0))
+        # Take each file's tensors largest first, so a large tensor does not
+        # finish last, and alternate files, since writes to one file serialize.
+        by_file: defaultdict[Path, list] = defaultdict(list)
+        for item in items:
+            by_file[self.locations[item[0]][0]].append(item)
+        for group in by_file.values():
+            group.sort(key=lambda item: -self.locations[item[0]][2])
+        items = [
+            item
+            for row in itertools.zip_longest(*by_file.values())
+            for item in row
+            if item is not None
+        ]
+        checksum_format = index_metadata["checksum_format"]
+        decompress = _DECOMPRESSORS[index_metadata["compression_format"]]
+        chunk_workers = rl_envs.MX_REFIT_DELTA_WORKERS
+        workers = min(chunk_workers, len(items))
+        max_pending = 2 * chunk_workers
+        slots = threading.BoundedSemaphore(max_pending)
+        local = threading.local()
 
-            def apply_one(item) -> None:
-                name, compressed, expected_checksum = item
-                path, file_offset, size = self.locations[name]
-                target = np.frombuffer(
-                    maps[path][1],
-                    dtype=np.uint8,
-                    count=size,
-                    offset=file_offset,
-                )
-                checksum = checksum_factory(index_metadata["checksum_format"])
-                reader = _DECOMPRESSORS[index_metadata["compression_format"]](
-                    compressed
-                )
+        def spread_tensor(size: int) -> bool:
+            return chunk_workers > 1 and size > _SPREAD_TENSOR_BYTES
+
+        def apply_chunk(
+            fd: int, offset: int, block: bytes, position: int
+        ) -> tuple[Adler32Checksum, int]:
+            """XOR one decompressed chunk into the file; checksum the target bytes."""
+            delta = np.frombuffer(block, dtype=np.uint8)
+            if getattr(local, "buffer", None) is None:
+                local.buffer = np.empty(_APPLY_CHUNK_BYTES, dtype=np.uint8)
+            target = local.buffer[: delta.size]
+            view = memoryview(target)
+            _read_exactly(fd, view, offset + position)
+            np.bitwise_xor(target, delta, out=target)
+            checksum = checksum_factory(checksum_format)
+            checksum.update(target)
+            _write_all(fd, view, offset + position)
+            return checksum, delta.size
+
+        def apply_mapped(
+            target: np.ndarray, reader: Any, checksum: Adler32Checksum
+        ) -> int:
+            """Keep small tensors on the native mmap path without copying their base bytes."""
+            try:
                 position = 0
-                extra = b""
+                while position < target.size:
+                    block = reader.read(min(_APPLY_CHUNK_BYTES, target.size - position))
+                    if not block:
+                        break
+                    delta = np.frombuffer(block, dtype=np.uint8)
+                    end = position + delta.size
+                    region = target[position:end]
+                    try:
+                        np.bitwise_xor(region, delta, out=region)
+                        checksum.update(region)
+                    finally:
+                        del region
+                    position = end
+                return position
+            finally:
+                del target
+
+        files: dict[Path, int] = {}
+        maps: dict[Path, mmap.mmap] = {}
+        with ExitStack() as stack:
+            for name, _data, _checksum in items:
+                path, _, size = self.locations[name]
+                if path not in files:
+                    descriptor = os.open(path, os.O_RDWR)
+                    stack.callback(os.close, descriptor)
+                    files[path] = descriptor
+                if not spread_tensor(size) and path not in maps:
+                    maps[path] = stack.enter_context(mmap.mmap(files[path], 0))
+            chunks = stack.enter_context(
+                ThreadPoolExecutor(
+                    max_workers=chunk_workers, thread_name_prefix="modelexpress-delta-chunk"
+                )
+            )
+
+            def release_slot(_future: Future) -> None:
+                slots.release()
+
+            def apply_spread(
+                fd: int, file_offset: int, size: int, reader: Any, checksum: Adler32Checksum
+            ) -> int:
+                """Share a single chunk budget and combine results in tensor byte order."""
+                pending: deque[Future] = deque()
+                position = 0
+
+                def collect() -> None:
+                    part, length = pending.popleft().result()
+                    checksum.extend(part, length)
+
                 try:
                     while position < size:
-                        block = reader.read(min(2 << 20, size - position))
-                        if not block:
-                            break
-                        delta = np.frombuffer(block, dtype=np.uint8)
-                        end = position + delta.size
-                        region = target[position:end]
+                        if len(pending) == max_pending:
+                            collect()
+                        slots.acquire()
                         try:
-                            np.bitwise_xor(region, delta, out=region)
-                            checksum.update(region)
+                            block = reader.read(min(_APPLY_CHUNK_BYTES, size - position))
+                            if not block:
+                                slots.release()
+                                break
+                            length = len(block)
+                            future = chunks.submit(apply_chunk, fd, file_offset, block, position)
+                        except BaseException:
+                            slots.release()
+                            raise
+                        del block
+                        future.add_done_callback(release_slot)
+                        pending.append(future)
+                        position += length
+                    while pending:
+                        collect()
+                    return position
+                finally:
+                    for future in pending:
+                        future.cancel()
+                    wait(pending)
+
+            def apply_one(item) -> None:
+                """Apply one tensor and verify its target checksum."""
+                name, compressed, expected_checksum = item
+                path, file_offset, size = self.locations[name]
+                checksum = checksum_factory(checksum_format)
+                reader = decompress(compressed)
+                try:
+                    if spread_tensor(size):
+                        position = apply_spread(files[path], file_offset, size, reader, checksum)
+                    else:
+                        target = np.frombuffer(
+                            maps[path], dtype=np.uint8, count=size, offset=file_offset
+                        )
+                        try:
+                            position = apply_mapped(target, reader, checksum)
                         finally:
-                            del region
-                        position = end
-                    if position == size:
-                        extra = reader.read(1)
+                            del target
+                    extra = reader.read(1) if position == size else b""
                 finally:
                     reader.close()
-                    del target
                 if position != size or extra:
                     raise ValueError(f"canonical delta byte size differs for {name!r}")
                 if checksum.hexdigest() != expected_checksum:
@@ -1387,14 +1543,10 @@ class _LocalCheckpoint:
                 threadpool_map(
                     items,
                     apply_one,
-                    max_workers=min(rl_envs.MX_REFIT_DELTA_WORKERS, len(items)),
+                    max_workers=workers,
                     thread_name_prefix="modelexpress-delta-apply",
                 )
             )
-        finally:
-            for file_handle, mapped in maps.values():
-                mapped.close()
-                file_handle.close()
 
     def _validate_prepared(
         self,
