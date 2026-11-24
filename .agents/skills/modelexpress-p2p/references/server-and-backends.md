@@ -25,7 +25,8 @@ Install the chart from `helm/` in a ModelExpress checkout. Its image defaults to
 Redis backend. The chart does not bundle Redis. If you do not already run one,
 `examples/p2p_transfer_k8s/server/redis_backend/redis-standalone.yaml` deploys
 a single Redis instance behind a Service named `redis`, which the `REDIS_URL`
-below points at:
+below points at. It runs without authentication; for production, use a Redis
+that requires a password.
 
 ```bash
 kubectl apply -n "${NAMESPACE}" -f examples/p2p_transfer_k8s/server/redis_backend/redis-standalone.yaml
@@ -42,16 +43,23 @@ already has ModelExpress CRDs:
 kubectl apply -f helm/crds/modelexpress-crds.yaml
 helm install modelexpress ./helm -n "${NAMESPACE}" \
   --set env.MX_METADATA_BACKEND=kubernetes \
-  --set serviceAccount.rbac.enabled=true
+  --set serviceAccount.rbac.enabled=true \
+  --set serviceAccount.automount=true
 ```
 
 `serviceAccount.rbac.enabled` creates a ClusterRole and ClusterRoleBinding for
-the metadata resources. The server writes them into `MX_METADATA_NAMESPACE`,
-which defaults to the release namespace.
+the metadata resources. `serviceAccount.automount` defaults to `false` in the
+chart, and the server needs the ServiceAccount token to call the Kubernetes
+API. The server writes the resources into `MX_METADATA_NAMESPACE`, which
+defaults to the release namespace.
 
 `helm/deploy.sh` wraps the same install with preset values files
 (`values-development.yaml`, `values-production.yaml`,
 `values-local-storage.yaml`); see `helm/README.md`.
+
+Server authentication is off by default (`security.enabled: false`), so any
+client that can reach the Service can call its APIs. To restrict access, see
+ServiceAccount Authentication in `docs/DEPLOYMENT.md`.
 
 ## Health Check
 
@@ -74,8 +82,7 @@ without a valid backend setting exits; look for the reason in its logs.
 Workers use `MX_SERVER_ADDRESS=<service>:8001`. A worker in another namespace
 must qualify the name: `<service>.<server-namespace>.svc.cluster.local:8001`.
 All workers that use one server share one source pool, so workers in different
-namespaces can be sources for each other; a separate server per namespace
-splits the pool.
+namespaces can be sources for each other.
 
 `MODEL_EXPRESS_URL` is a deprecated alias that takes precedence over
 `MX_SERVER_ADDRESS` when both are set. Set it to the same value whenever

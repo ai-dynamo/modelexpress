@@ -5,7 +5,7 @@
       "id": "install-server-redis",
       "question": "Install the ModelExpress server in namespace mx with a Redis backend and tell me how to check it is healthy.",
       "expected_skill": "modelexpress-p2p",
-      "ground_truth": "Install the Helm chart from the helm/ directory of a ModelExpress checkout. The chart does not bundle Redis: provide one, for example the checked-in examples/p2p_transfer_k8s/server/redis_backend/redis-standalone.yaml, which creates a Service named redis. Then helm install modelexpress ./helm -n mx --set env.MX_METADATA_BACKEND=redis --set env.REDIS_URL=redis://redis:6379. MX_METADATA_BACKEND is required or the server fails to start. Check health with kubectl rollout status deployment/modelexpress and helm test modelexpress, which runs grpc-health-probe against grpc.health.v1; the pod probes only check that port 8001 accepts connections.",
+      "ground_truth": "Install the Helm chart from the helm/ directory of a ModelExpress checkout. The chart does not bundle Redis: provide one, for example the checked-in examples/p2p_transfer_k8s/server/redis_backend/redis-standalone.yaml, which creates a Service named redis. Then helm install modelexpress ./helm -n mx --set env.MX_METADATA_BACKEND=redis --set env.REDIS_URL=redis://redis:6379. MX_METADATA_BACKEND is required or the server fails to start. Check health with kubectl rollout status deployment/modelexpress -n mx and helm test modelexpress -n mx, which runs grpc-health-probe against grpc.health.v1; the pod probes only check that port 8001 accepts connections.",
       "expected_behavior": [
         "Install from the chart in a ModelExpress checkout and set MX_METADATA_BACKEND=redis and REDIS_URL",
         "Note that the chart does not bundle Redis",
@@ -16,10 +16,10 @@
       "id": "install-server-kubernetes-backend",
       "question": "We do not want to run Redis. How do I install the ModelExpress server so P2P discovery uses Kubernetes resources instead?",
       "expected_skill": "modelexpress-p2p",
-      "ground_truth": "Use the kubernetes metadata backend. Apply helm/crds/modelexpress-crds.yaml first, because Helm installs missing CRDs but never updates existing ones. Install the chart with env.MX_METADATA_BACKEND=kubernetes and serviceAccount.rbac.enabled=true, which creates a ClusterRole and ClusterRoleBinding for the ModelMetadata and ModelCacheEntry resources. The server writes them into MX_METADATA_NAMESPACE, which defaults to the release namespace. Workers need no Kubernetes RBAC; they talk to the server over gRPC.",
+      "ground_truth": "Use the kubernetes metadata backend. Apply helm/crds/modelexpress-crds.yaml first, because Helm installs missing CRDs but never updates existing ones. Install the chart with env.MX_METADATA_BACKEND=kubernetes, serviceAccount.rbac.enabled=true, which creates a ClusterRole and ClusterRoleBinding for the ModelMetadata and ModelCacheEntry resources, and serviceAccount.automount=true, because the chart defaults it to false and the server needs the ServiceAccount token to call the Kubernetes API. The server writes them into MX_METADATA_NAMESPACE, which defaults to the release namespace. Workers need no Kubernetes RBAC; they talk to the server over gRPC.",
       "expected_behavior": [
         "Apply the CRDs before installing or upgrading the chart",
-        "Set MX_METADATA_BACKEND=kubernetes and serviceAccount.rbac.enabled=true",
+        "Set MX_METADATA_BACKEND=kubernetes, serviceAccount.rbac.enabled=true, and serviceAccount.automount=true",
         "Do not add metadata RBAC to the workers"
       ]
     },

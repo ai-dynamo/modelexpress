@@ -106,9 +106,9 @@ as well as weights.
      -p '{"spec":{"services":{"<WorkerService>":{"replicas":2}}}}'
    ```
 
-In a disaggregated graph, prefill and decode workers of the same model publish
-under the same source identity, so a new worker of either service can pull from
-a running worker of either service.
+In a disaggregated graph, prefill and decode workers can pull from each other
+only when their full source identities match, for example the same model,
+revision, dtype, quantization, and tensor, pipeline, and expert parallel sizes.
 
 ## Confirm
 

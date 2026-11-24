@@ -70,12 +70,15 @@ commands and checks: `references/server-and-backends.md`.
 
 ### 3. Configure The Workers
 
-Point every worker at the server with `MX_SERVER_ADDRESS=<service>:<port>`
-(`8001` with the Helm chart) and select the MX loader for its runtime:
+With `redis` or `kubernetes`, point every worker at the server with
+`MX_SERVER_ADDRESS=<service>:<port>` (`8001` with the Helm chart). With
+`k8s-service`, set `MX_METADATA_BACKEND=k8s-service` on the workers instead
+(see `references/server-and-backends.md`). Then select the MX loader for each
+runtime:
 
 | Runtime | Worker setting |
 |---|---|
-| vLLM | `--load-format modelexpress`; standalone vLLM older than 0.23.0 also needs `VLLM_PLUGINS=modelexpress` |
+| vLLM | `--load-format modelexpress`; on standalone vLLM older than 0.23.0, the ModelExpress plugin must load (leave `VLLM_PLUGINS` unset or include `modelexpress`) |
 | SGLang | `--load-format remote_instance --remote-instance-weight-loader-backend modelexpress --modelexpress-config '{"transport":"nixl"}'` |
 | TensorRT-LLM | `checkpoint_format: MX` with `mx_config.server_url` |
 
@@ -96,9 +99,9 @@ is ready also load from storage.
 ### 5. Confirm The Weights Came Over P2P
 
 On a replica started after the first, the worker log should contain
-`RDMA transfer complete`. For SGLang's `transfer_engine` transport, look for
-`SGLang MxModelLoader transfer_engine COMPLETE` instead. If it is missing, see
-Troubleshooting below.
+`RDMA transfer complete`. If it is missing, see Troubleshooting below. SGLang's
+`transfer_engine` transport has no equivalent line: its completion message is
+logged even when it falls back to storage.
 
 ## Output Contract
 

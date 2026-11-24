@@ -30,8 +30,9 @@ as a plain Kubernetes Deployment. For workers managed by NVIDIA Dynamo, see
 ## vLLM
 
 vLLM 0.23.0 and newer recognize the load format natively; the image still needs
-the MX Python client. On older vLLM, also set `VLLM_PLUGINS=modelexpress`.
-`mx` is a backward-compatible alias for the load format.
+the MX Python client. On older vLLM, the ModelExpress plugin must load: leave
+`VLLM_PLUGINS` unset, or include `modelexpress` in it, since it is an
+allowlist.
 
 ```bash
 export MX_SERVER_ADDRESS=<service>:8001
@@ -65,8 +66,8 @@ python -m sglang.launch_server --model-path <model> --tp <n> \
 `--modelexpress-config` takes two keys:
 
 - `transport`: `nixl`, or `transfer_engine` for Mooncake TransferEngine. The
-  `transfer_engine` transport needs a Mooncake-enabled image and logs its own
-  completion line instead of the RDMA strategy's.
+  `transfer_engine` transport needs a Mooncake-enabled image and does not log
+  `RDMA transfer complete`.
 - `url`: overrides the server address for this process. Prefer
   `MX_SERVER_ADDRESS` so the address stays in the environment.
 
