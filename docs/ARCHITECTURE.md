@@ -501,6 +501,11 @@ Runs in a background tokio task on a configurable interval (default 1 hour). LRU
 
 Two families of backends exist: **server-coordinated** (the server owns the metadata store) and **decentralized** (no central server in the loop).
 
+Rust Kubernetes clients use kube 4.2.1 with k8s-openapi 0.28 and schemars 1.
+This includes the OpenSSL cluster-CA trust fix for RUSTSEC-2026-0600 and covers
+both metadata backends and TokenReview authentication. The Kubernetes types
+are generated for the v1.32 API baseline.
+
 Server-coordinated backends live in the Rust server and are selected via `MX_METADATA_BACKEND`:
 
 - **Redis** (`redis`): Source index hashes (`mx:source:{source_id}`) with an `__attributes__` field storing `SourceIdentity` and `{worker_id}` fields as presence markers. Worker data stored in separate hashes (`mx:source:{source_id}:{worker_id}`). Stale detection and cleanup handled by the server-side reaper.

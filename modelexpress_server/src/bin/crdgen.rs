@@ -33,6 +33,10 @@ mod tests {
     fn generated_crds_match_checked_in_manifests() {
         let generated = generate_crds().expect("CRDs should serialize");
         assert_eq!(generated, include_str!("../../../examples/crds.yaml"));
+        assert_eq!(
+            generated,
+            include_str!("../../../helm/crds/modelexpress-crds.yaml")
+        );
     }
 
     #[test]
