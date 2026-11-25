@@ -420,6 +420,31 @@ def test_skipped_version_is_replayed_in_the_worker(harness):
     assert harness.parent_readers[0].reads == []
 
 
+def test_recovery_after_a_failed_install_is_staged_in_the_worker(harness, monkeypatch):
+    client, runner = harness.client()
+    install = _SglangInstaller._install_checkpoint
+
+    def fail(self, prepared):
+        raise RuntimeError("injected install failure")
+
+    monkeypatch.setattr(_SglangInstaller, "_install_checkpoint", fail)
+    handle = client.stage_weight(version=WeightVersionRef("v1"))
+    with pytest.raises(RuntimeError, match="injected install failure"):
+        client.apply_weight(handle)
+    monkeypatch.setattr(_SglangInstaller, "_install_checkpoint", install)
+
+    # The engine may now hold part of v1. Going back to v0, the version it
+    # served last, is a real update: the worker stages it and holds its lease.
+    restore = client.stage_weight(version=WeightVersionRef("v0"))
+
+    assert list(harness.service.leases.values()) == [("v0", "generator-0-stage")]
+    assert harness.shard_reads(os.getpid()) == []
+    client.apply_weight(restore)
+    assert runner.installed == [harness.digests["v0"]]
+    restore.release()
+    _wait_until(lambda: not harness.service.leases, "leases to be released")
+
+
 def test_store_without_a_seed_is_built_by_the_worker(harness):
     # Without a seed, the first full checkpoint builds the checkpoint cache.
     client, runner = harness.client(seed=False)
@@ -649,7 +674,7 @@ def test_close_stops_the_worker(harness):
     _wait_until(lambda: not harness.service.leases, "leases to be released")
     # A closed stage process starts no new worker.
     with pytest.raises(StageProcessError, match="closed"):
-        stage_process.stage("v2", serving_version_id="v1")
+        stage_process.stage("v2", serving_version_id="v1", engine_state="READY")
     assert len(harness.procs) == 1
 
 
@@ -663,6 +688,34 @@ def test_worker_exits_when_its_client_is_gone(harness):
 
     _wait_until(lambda: not _alive(worker_pid), "the worker to exit")
     assert harness.procs[0].wait(WAIT_SECONDS) == 0
+
+
+def test_worker_starts_no_request_once_termination_is_asked():
+    draining = threading.Event()
+    staged = []
+
+    class Connection:
+        def poll(self, _timeout=None):
+            # SIGTERM arrives while the idle worker waits, and then a request.
+            draining.set()
+            return True
+
+        def recv(self):
+            return {
+                "op": "stage",
+                "version_id": "v1",
+                "serving_version_id": "v0",
+                "engine_state": "READY",
+            }
+
+    stage_worker_module._serve(
+        SimpleNamespace(_stage_weight=staged.append),
+        Connection(),
+        parent_pid=os.getppid(),
+        draining=draining,
+    )
+
+    assert staged == []
 
 
 def test_worker_that_cannot_start_fails_client_init(harness, monkeypatch):

@@ -23,7 +23,7 @@ from multiprocessing.connection import Connection
 from typing import Any
 
 from ..version import WeightVersionRef
-from .client import ModelExpressGeneratorClient, StagedWeightHandle
+from .client import ModelExpressGeneratorClient, StagedWeightHandle, _EngineState
 
 logger = logging.getLogger("modelexpress_rl.inference.stage_worker")
 
@@ -79,6 +79,10 @@ def _serve(
             except (EOFError, OSError):
                 logger.info("the client closed the connection; exiting")
                 return
+            if draining.is_set():
+                # SIGTERM came while this waited: the request is not started.
+                logger.info("terminating on SIGTERM")
+                return
             op = request.get("op")
             if op == "shutdown":
                 return
@@ -92,8 +96,11 @@ def _serve(
                 started = time.perf_counter()
                 try:
                     # This client never installs, so each request tells it
-                    # which version the engine serves.
+                    # which version the engine serves and whether the engine is
+                    # known to hold it. After a failed install it is not, and
+                    # staging that version again is a real update.
                     client._serving_version_id = request["serving_version_id"]
+                    client._engine_state = _EngineState(request["engine_state"])
                     handle = client._stage_weight(
                         WeightVersionRef(request["version_id"])
                     )

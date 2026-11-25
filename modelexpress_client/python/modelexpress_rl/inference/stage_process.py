@@ -19,7 +19,8 @@ The two processes exchange Python objects over one socket pair:
     client -> worker   {"op": "init", "config": ModelExpressGeneratorConfig}
     worker -> client   {"event": "ready", "pid", "package"}
                        {"event": "fatal", "error"}
-    client -> worker   {"op": "stage", "version_id", "serving_version_id"}
+    client -> worker   {"op": "stage", "version_id", "serving_version_id",
+                        "engine_state"}
     worker -> client   {"ok": True, "versions", "metrics", "seconds"}
                        {"ok": False, "error"}
     client -> worker   {"op": "release"}    drop what the last stage holds
@@ -127,7 +128,7 @@ class StageProcess:
         return None if proc is None else proc.pid
 
     def stage(
-        self, version_id: str, *, serving_version_id: str | None
+        self, version_id: str, *, serving_version_id: str | None, engine_state: str
     ) -> tuple[dict[str, Any], dict[str, float]]:
         """Have a worker run the staging step for ``version_id``.
 
@@ -135,8 +136,9 @@ class StageProcess:
         and what its staging step measured. The worker holds the staged
         version's leases until ``release``.
 
-        ``serving_version_id`` is the version the caller's engine serves. A
-        worker that is gone is replaced and the request sent again. Raise
+        ``serving_version_id`` is the version the caller's engine serves, and
+        ``engine_state`` whether it is known to hold it: the worker's staging
+        step decides from both, as the caller's own would. A worker that is gone is replaced and the request sent again. Raise
         StageProcessError when the staging step failed or ran out of time, in
         which case it is not tried again, and when every attempt lost its
         worker.
@@ -151,6 +153,7 @@ class StageProcess:
                         "op": "stage",
                         "version_id": version_id,
                         "serving_version_id": serving_version_id,
+                        "engine_state": engine_state,
                     }
                 )
                 reply = self._receive(self._deadline)

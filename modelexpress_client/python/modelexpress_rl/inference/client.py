@@ -411,7 +411,9 @@ class ModelExpressGeneratorClient:
             if self._stage_process is None:
                 return self._stage_weight(version)
             versions, metrics = self._stage_process.stage(
-                version.version_id, serving_version_id=self._serving_version_id
+                version.version_id,
+                serving_version_id=self._serving_version_id,
+                engine_state=self._engine_state.value,
             )
             worker_staged = _WorkerStaged(
                 versions, metrics, _WorkerLease(self._stage_process)
