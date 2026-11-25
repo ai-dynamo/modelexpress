@@ -951,7 +951,7 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default, `rendezvous_hash`, `load_aware`, or `topology_aware`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
-| p1 | `TcpStrategy` | `adaptive` topology policy + main-model first load + CUDA/UCX + direct worker discovery | Forced TCP using the complete compatible list, same-domain first. Shares receive and recovery with `RdmaStrategy`; after successful receive, closes the temporary context and registers the final tensors with the normal publication agent. |
+| p1 | `TcpStrategy` | `adaptive` topology policy + main or compatible draft first load + CUDA/UCX + direct worker discovery | Forced TCP using the complete compatible list, same-domain first. Shares receive and recovery with `RdmaStrategy`; after successful receive, closes the temporary context and registers the final tensors with the normal publication agent. |
 | p2 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
 | p3 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + no object-store `MX_MODEL_URI` + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves and (if needed) downloads the weight files. An `s3://`, `gs://`, or `az://` `MX_MODEL_URI` skips this strategy and proceeds to ModelStreamer. Falls through on other failures. |
 | p4 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
@@ -971,6 +971,16 @@ backend registration failures allow it. Receive registration propagates errors
 to strategy recovery;
 cleanup must succeed before another channel or storage loader runs. Failed
 cleanup retains the manager and terminates loading.
+
+Compatible draft first loads use the same strategy chain, discovering sources
+under the main model's identity and accepting only their own draft namespace.
+Each strategy independently applies `MAX_DRAFT_SOURCE_METADATA_LOOKUPS` to
+manifest probes and `MAX_SOURCE_RETRIES` to receive attempts. Sources without
+the matching draft namespace consume only the lookup budget. Both automatic
+and TCP draft receives use temporary agents with ephemeral metadata ports;
+after post-processing and receiver cleanup, finalized draft tensors join the
+main model's shared publication. Failed attempts never shut down that shared
+agent, and storage fallback uses the same publication path.
 
 ```mermaid
 flowchart TD

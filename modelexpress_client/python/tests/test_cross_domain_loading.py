@@ -189,9 +189,10 @@ def loading(adaptive, monkeypatch):
             raise RuntimeError("cannot initialize channel")
         manager = MagicMock()
         manager.ucx_mode = ucx_mode
+        manager.listen_port = kwargs.get("listen_port")
         manager.tensor_descriptors = []
 
-        def close():
+        def close(*, strict=False):
             events.append(("close", ucx_mode))
             if (ucx_mode, "close") in failures:
                 raise RuntimeError("receiver close failed")
@@ -205,6 +206,7 @@ def loading(adaptive, monkeypatch):
         manager.shutdown.side_effect = close
         manager.register_tensors.side_effect = register
         manager.register_arena.side_effect = register
+        manager.register_additional_tensors.side_effect = register
         manager.add_remote_agent.side_effect = lambda value: value.decode()
 
         def receive(**kwargs):
@@ -213,7 +215,8 @@ def loading(adaptive, monkeypatch):
             if (ucx_mode, source) in failures:
                 raise TimeoutError("READ timed out")
             with torch.no_grad():
-                ctx.tensors["weight"].fill_(7)
+                for tensor in (kwargs["destination_tensors"] or ctx.tensors).values():
+                    tensor.fill_(7)
             return 16, 1, 0
 
         manager.receive_from_source.side_effect = receive
@@ -239,6 +242,55 @@ def loading(adaptive, monkeypatch):
     )
 
 
+@pytest.fixture
+def draft_loading(loading, monkeypatch):
+    case = loading
+    ctx = case.ctx
+    ctx.p2p_role = "draft"
+    ctx.p2p_source_identity = ctx.identity
+    ctx.identity = p2p_pb2.SourceIdentity(model_name="draft", dtype="bfloat16")
+    shared = MagicMock()
+    main_weight = torch.ones(2, 2)
+    shared.tensors = {"main.weight": main_weight}
+    ctx.shared_nixl_manager = shared
+    case.shared = shared
+    case.without_draft = set()
+    case.incomplete_draft = set()
+    metadata = ctx.mx_client.get_metadata.side_effect
+
+    def draft_metadata(**kwargs):
+        response = metadata(**kwargs)
+        if kwargs["worker_id"] not in case.without_draft:
+            tensor = response.worker.tensor_source.tensors.add()
+            tensor.CopyFrom(response.worker.tensor_source.tensors[0])
+            name = "other" if kwargs["worker_id"] in case.incomplete_draft else "weight"
+            tensor.name = ctx.draft_tensor_namespace + name
+        return response
+
+    ctx.mx_client.get_metadata.side_effect = draft_metadata
+    shared.register_additional_tensors.side_effect = shared.tensors.update
+
+    def postprocess(result):
+        result.model.weight = torch.nn.Parameter(result.model.weight.detach().clone())
+        return result
+
+    ctx.adapter.after_rdma_receive = postprocess
+
+    def publish(tensors, **kwargs):
+        assert ctx.nixl_manager is shared
+        assert shared.tensors == {"main.weight": main_weight, **tensors}
+        assert torch.all(main_weight == 1)
+        assert all(manager.shutdown.called for manager in case.managers)
+        shared.shutdown.assert_not_called()
+        case.events.append(("publish",))
+        return True
+
+    monkeypatch.setattr(chain, "publish_source_if_supported", base.publish_source_if_supported)
+    monkeypatch.setattr(base, "extend_published_tensors", publish)
+    monkeypatch.setattr(Storage, "finalize", LoadStrategy.finalize)
+    return case
+
+
 def run_loading(case):
     return execute_load_strategies(
         torch.nn.Linear(2, 2, bias=False),
@@ -249,7 +301,11 @@ def run_loading(case):
 
 @pytest.mark.parametrize("domain", [None, " \t"])
 @pytest.mark.parametrize("auto_fails", [False, True])
-def test_adaptive_without_domain_uses_all_sources(loading, monkeypatch, domain, auto_fails):
+@pytest.mark.parametrize("case_fixture", ["loading", "draft_loading"])
+def test_adaptive_without_domain_uses_all_sources(
+    request, monkeypatch, domain, auto_fails, case_fixture
+):
+    loading = request.getfixturevalue(case_fixture)
     if domain is None:
         monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN")
     else:
@@ -269,6 +325,110 @@ def test_adaptive_without_domain_uses_all_sources(loading, monkeypatch, domain, 
     assert [e for e in loading.events if e[0] == "read"] == expected
     loading.ctx.mx_client.list_sources.assert_called_once()
     assert loading.events[-1] == ("publish",)
+
+
+@pytest.mark.parametrize("namespace", ["mx_draft::", "mx_draft::checkpoint::"])
+@pytest.mark.parametrize("scenario", ["same", "cross", "retry", "peer_failure", "storage"])
+def test_draft_channels_share_discovery_and_publish_final_tensors(
+    draft_loading, namespace, scenario
+):
+    case = draft_loading
+    case.ctx.draft_tensor_namespace = namespace
+    if scenario == "cross":
+        case.ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+            instances=[case.sources[1]]
+        )
+    if scenario in {"retry", "storage"}:
+        case.failures.add(("auto", "same"))
+    if scenario == "storage":
+        case.failures.update([("tcp", "same"), ("tcp", "cross")])
+    if scenario == "peer_failure":
+        case.ctx.adapter.all_gather_state = lambda state: [
+            state, (state[0], "failed") if state[0] == "load:rdma" else state
+        ]
+
+    model = run_loading(case)
+
+    assert torch.all(model.weight == (9 if scenario == "storage" else 7))
+    reads = [event[1:] for event in case.events if event[0] == "read"]
+    assert reads == {
+        "same": [("auto", "same")],
+        "cross": [("tcp", "cross")],
+        "retry": [("auto", "same"), ("tcp", "same")],
+        "peer_failure": [("auto", "same"), ("tcp", "same")],
+        "storage": [("auto", "same"), ("tcp", "same"), ("tcp", "cross")],
+    }[scenario]
+    case.ctx.mx_client.list_sources.assert_called_once_with(
+        identity=case.ctx.p2p_source_identity, status_filter=p2p_pb2.SOURCE_STATUS_READY
+    )
+    assert case.shared.tensors[namespace + "weight"] is model.weight
+    case.shared.register_additional_tensors.assert_called_once()
+    assert case.events.count(("publish",)) == 1
+    assert case.ctx.draft_published
+    for manager in case.managers:
+        assert manager.listen_port == 0
+        manager.shutdown.assert_called_once_with(strict=True)
+        assert list(manager.receive_from_source.call_args.kwargs["destination_tensors"]) == [
+            namespace + "weight"
+        ]
+
+
+@pytest.mark.parametrize("lookups", [1, 4])
+def test_draft_manifest_and_receive_budgets_are_per_channel(draft_loading, monkeypatch, lookups):
+    case = draft_loading
+    monkeypatch.setattr(p2p, "MAX_DRAFT_SOURCE_METADATA_LOOKUPS", lookups)
+    monkeypatch.setattr(p2p, "MAX_SOURCE_RETRIES", 1)
+    case.sources[:] = [ref("empty", "a"), ref("same", "a"), ref("cross", "b")]
+    case.ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=case.sources)
+    case.without_draft.add("empty")
+    case.failures.update([("auto", "same"), ("tcp", "same")])
+
+    assert torch.all(run_loading(case).weight == 9)
+    assert [event[1:] for event in case.events if event[0] == "read"] == (
+        [] if lookups == 1 else [("auto", "same"), ("tcp", "same")]
+    )
+    assert [event[1] for event in case.events if event[0] == "metadata"] == (
+        ["empty", "empty"] if lookups == 1 else ["empty", "same", "empty", "same"]
+    )
+    case.ctx.mx_client.list_sources.assert_called_once()
+    case.shared.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("next_domain", ["a", "b"])
+def test_incomplete_draft_manifest_allows_next_source_or_tcp(draft_loading, next_domain):
+    case = draft_loading
+    case.incomplete_draft.add("same")
+    case.sources[1].topology["fabric"] = next_domain
+    case.ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+        instances=case.sources
+    )
+
+    assert torch.all(run_loading(case).weight == 7)
+    channel = "auto" if next_domain == "a" else "tcp"
+    assert [event for event in case.events if event[0] == "read"] == [
+        ("read", channel, "cross")
+    ]
+    case.ctx.mx_client.list_sources.assert_called_once()
+    case.shared.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("channel", ["auto", "tcp"])
+def test_draft_cleanup_failure_cannot_fall_back_or_close_main(draft_loading, channel):
+    case = draft_loading
+    if channel == "tcp":
+        case.ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(
+            instances=[case.sources[1]]
+        )
+    case.failures.add((channel, "close"))
+
+    with pytest.raises(StrategyRecoveryError, match="receiver"):
+        run_loading(case)
+    case.shared.shutdown.assert_not_called()
+    case.shared.register_additional_tensors.assert_not_called()
+    assert ("publish",) not in case.events
+    assert ("rebuild",) not in case.events
+    assert case.ctx.nixl_manager is case.managers[-1]
+
 
 
 @pytest.mark.parametrize("failure_mode", ["none", "read", "create", "all"])
@@ -472,7 +632,6 @@ def test_domain_change_excludes_auto_but_not_tcp(loading):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("p2p_role", "draft"),
         ("is_reload", True),
         ("skip_rdma", True),
         ("p2p_enabled", False),

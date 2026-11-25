@@ -207,8 +207,7 @@ class NixlP2PStrategy(LoadStrategy):
     def is_available(self, ctx: LoadContext) -> bool:
         if adaptive_enabled():
             if (
-                ctx.p2p_role != "main"
-                or ctx.is_reload
+                ctx.is_reload
                 or ctx.accelerator_backend.name != "cuda"
                 or getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
             ):
@@ -870,10 +869,6 @@ class NixlP2PStrategy(LoadStrategy):
                     raise StrategyFailed(
                         f"NIXL registration failed: {error}", mutated=True
                     ) from error
-            if _is_draft_pass(ctx):
-                # Registration refreshes ctx.tensors with newly prepared buffers.
-                source_tensors = self._scope_source_tensors(ctx, source_tensors)
-
             # Registration can be skipped when the model or metadata path is absent.
             if ctx.nixl_manager is None:
                 raise StrategyFailed(
@@ -882,6 +877,9 @@ class NixlP2PStrategy(LoadStrategy):
                 )
 
             state.last_failure = P2PFailure.SOURCE
+            if _is_draft_pass(ctx):
+                # Registration refreshes ctx.tensors with newly prepared buffers.
+                source_tensors = self._scope_source_tensors(ctx, source_tensors)
 
             if is_p2p:
                 host, port_str = ep.rsplit(":", 1)

@@ -953,10 +953,15 @@ environment is restored afterward. Sources must already enable UCX TCP, advertis
 reachable network addresses, and support GPU reads over TCP with their UCX build.
 Enabling the target policy cannot add TCP support to an RDMA-only source.
 
-This release enables `adaptive` for main-model first loads with CUDA and direct
-worker discovery. With `MX_NIXL_BACKEND=LIBFABRIC`, the target retains P2P through
-LIBFABRIC, restricted to the domain when configured, and skips the UCX-only TCP
-strategy. If no eligible source succeeds, it continues to storage loading. Draft, reload, and Service discovery
+This release enables `adaptive` for main-model and compatible speculative draft
+first loads with CUDA and direct worker discovery. Drafts retain their existing
+engine compatibility and namespace checks; separate-checkpoint vLLM drafts
+still require `MX_ENABLE_SEPARATE_DRAFT_P2P=1`. Draft receives use temporary
+agents and append finalized tensors to the main model's shared publication,
+without another configured metadata port. With `MX_NIXL_BACKEND=LIBFABRIC`,
+the target retains P2P through LIBFABRIC, restricted to the domain when
+configured, and skips the UCX-only TCP strategy. If no eligible source succeeds,
+it continues to storage loading. Reload and Service discovery
 skip P2P under `adaptive` and retain storage loading. SGLang `transfer_engine`
 skips peer transfer. Remote JIT cache fetching is deferred under `adaptive`;
 the engine compiles locally.
