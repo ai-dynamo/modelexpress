@@ -8,6 +8,7 @@ from __future__ import annotations
 from ..adapter import GeneratorEngineContext
 from ..runtime import EngineRuntime
 from .sglang import SglangGeneratorContext
+from .stage_only import StageOnlyGeneratorContext
 from .vllm import VllmGeneratorContext
 
 
@@ -21,6 +22,10 @@ def _create_engine_runtime(engine_context: GeneratorEngineContext) -> EngineRunt
         from .vllm import _create_vllm_engine_runtime
 
         return _create_vllm_engine_runtime(engine_context)
+    if isinstance(engine_context, StageOnlyGeneratorContext):
+        from .stage_only import _create_stage_only_engine_runtime
+
+        return _create_stage_only_engine_runtime(engine_context)
     raise TypeError(f"unsupported generator context {type(engine_context).__name__}")
 
 

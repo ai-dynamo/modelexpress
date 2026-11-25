@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Literal
 
@@ -29,6 +29,7 @@ from .plan import StreamingSettings, WeightSource, parse_weight_source_order
 from .receiver import ObjectStorageGeneratorConfig
 from .runtime import GeneratorRuntime, initialize_generator_runtime
 from .session import SessionUpdate
+from .stage_process import StageProcess
 from .version_chain import resolve_replay_chain
 
 logger = logging.getLogger("modelexpress_rl.inference.client")
@@ -81,9 +82,14 @@ class ModelExpressGeneratorConfig:
     # Ordered source fallback. Canonical object storage may be used alone or
     # combined with generator P2P in either order.
     source_order: tuple[WeightSource, ...] | None = None
+    # Run the staging step in a child process when object storage is the only
+    # source; None follows MX_REFIT_STAGE_PROCESS.
+    stage_process: bool | None = None
 
     def __post_init__(self) -> None:
         """Validate explicit settings before client initialization."""
+        if self.stage_process is not None and not isinstance(self.stage_process, bool):
+            raise TypeError("stage_process must be a bool or None")
         if (
             self.initial_serving_version_id is not None
             and not self.initial_serving_version_id.strip()
@@ -176,10 +182,14 @@ class StagedWeightHandle:
         version_id: str,
         update: SessionUpdate | None,
         timing: RefitTimingRecorder | None = None,
+        stage_process_metrics: dict[str, float] | None = None,
     ) -> None:
         self._client = client
         self.version_id = version_id
         self._update = update
+        # What the stage process measured when it ran this update's staging
+        # step. The update's own metrics are then those of adopting the result.
+        self._stage_process_metrics = stage_process_metrics or {}
         # A refit's stages are measured across two client calls, so the cycle's
         # recorder travels on the handle that connects them.
         self._timing = timing
@@ -193,7 +203,7 @@ class StagedWeightHandle:
         """Return metrics recorded for this update by the selected adapter."""
         if self._update is None:
             return {}
-        return self._update.metrics
+        return {**self._update.metrics, **self._stage_process_metrics}
 
     @property
     def applied(self) -> bool:
@@ -207,6 +217,30 @@ class StagedWeightHandle:
         if self._update is None:
             return False
         return self._update.installation_started and not self._update.applied
+
+
+class _WorkerLease:
+    """The version leases the stage process holds for one staged update."""
+
+    def __init__(self, stage_process: StageProcess) -> None:
+        self._stage_process = stage_process
+        self._closed = False
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._stage_process.release()
+
+
+@dataclass(frozen=True)
+class _WorkerStaged:
+    """What the stage process's staging step leaves for this client."""
+
+    # Every version record its staging step read from the MX server, by id.
+    versions: dict[str, WeightVersion]
+    # What its staging step measured.
+    metrics: dict[str, float]
+    lease: _WorkerLease
 
 
 class _VersionLease:
@@ -256,6 +290,12 @@ class ModelExpressGeneratorClient:
         self._engine_state = _EngineState.READY
         self._runtime: GeneratorRuntime | None = None
         self._streaming: StreamingSettings | None = None
+        self._stage_process: StageProcess | None = None
+        # Set while this client adopts what the stage process staged: its
+        # answers then stand in for the MX server.
+        self._worker_staged: _WorkerStaged | None = None
+        # The version records the current staging step read from the MX server.
+        self._fetched_versions: dict[str, WeightVersion] = {}
         self._closed = False
 
     @classmethod
@@ -339,6 +379,7 @@ class ModelExpressGeneratorClient:
             except Exception:
                 client._registration_thread = None
                 raise
+            client._start_stage_process(config)
         except Exception:
             client.close()
             raise
@@ -352,6 +393,9 @@ class ModelExpressGeneratorClient:
         Otherwise, trainer sources transfer a complete independent staged copy.
         Staging prepares an update; it does not guarantee that weight bytes have
         been transferred. Streaming transfers start during ``apply_weight``.
+        With a stage process, the whole staging step runs there, including its
+        MX server calls, and never in this process: a version the stage process
+        cannot stage raises StageProcessError.
         """
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
@@ -364,43 +408,80 @@ class ModelExpressGeneratorClient:
                 if active.version_id == version.version_id:
                     return active
                 raise RuntimeError("another generator update is still active")
-            runtime = self._require_runtime()
-            if (
-                (
-                    runtime.initial_version_id is not None
-                    or self._has_initial_serving_version
-                )
-                and version.version_id == self._serving_version_id
-                and self._engine_state is _EngineState.READY
-            ):
-                self._fetch_ready_version(
-                    version.version_id,
-                    target_version_id=version.version_id,
-                )
-                self._active_handle = StagedWeightHandle(
-                    client=self,
-                    version_id=version.version_id,
-                    update=None,
-                )
-                return self._active_handle
-            recorder = timing.start_cycle(
-                version_id=version.version_id,
-                rank=rl_envs.LOCAL_RANK,
+            if self._stage_process is None:
+                return self._stage_weight(version)
+            versions, metrics = self._stage_process.stage(
+                version.version_id, serving_version_id=self._serving_version_id
+            )
+            worker_staged = _WorkerStaged(
+                versions, metrics, _WorkerLease(self._stage_process)
             )
             try:
-                with timing.active(recorder):
-                    with refit_span("control_discovery"):
-                        ready = self._get_ready_version(version.version_id)
-                    update = runtime.session.stage(ready)
+                return self._stage_weight(version, worker_staged)
             except BaseException:
-                # Failed preparation has no handle to report the timing later.
-                timing.emit(recorder, logger)
+                worker_staged.lease.close()
                 raise
+
+    def _stage_weight(
+        self,
+        version: WeightVersionRef,
+        worker_staged: _WorkerStaged | None = None,
+    ) -> StagedWeightHandle:
+        """Run the staging step for ``version`` and return its handle.
+
+        The stage process runs this in its own client. The engine's client then
+        runs it with ``worker_staged``, the worker's result, to get a handle it
+        can install. In that run the MX server's answers and the leases come
+        from the worker, so this process asks the server nothing, and the
+        session finds the version already staged.
+        """
+        with self._operation_lock:
+            runtime = self._require_runtime()
+            self._worker_staged = worker_staged
+            self._fetched_versions = {}
+            try:
+                if (
+                    (
+                        runtime.initial_version_id is not None
+                        or self._has_initial_serving_version
+                    )
+                    and version.version_id == self._serving_version_id
+                    and self._engine_state is _EngineState.READY
+                ):
+                    self._fetch_ready_version(
+                        version.version_id,
+                        target_version_id=version.version_id,
+                    )
+                    self._active_handle = StagedWeightHandle(
+                        client=self,
+                        version_id=version.version_id,
+                        update=None,
+                    )
+                    return self._active_handle
+                recorder = timing.start_cycle(
+                    version_id=version.version_id,
+                    rank=rl_envs.LOCAL_RANK,
+                )
+                try:
+                    with timing.active(recorder):
+                        with refit_span("control_discovery"):
+                            ready = self._get_ready_version(version.version_id)
+                        update = runtime.session.stage(ready)
+                except BaseException:
+                    # Failed preparation has no handle to report the timing later.
+                    timing.emit(recorder, logger)
+                    raise
+            finally:
+                self._worker_staged = None
+            stage_process_metrics = (
+                {} if worker_staged is None else worker_staged.metrics
+            )
             self._active_handle = StagedWeightHandle(
                 client=self,
                 version_id=version.version_id,
                 update=update,
                 timing=recorder,
+                stage_process_metrics=stage_process_metrics,
             )
             return self._active_handle
 
@@ -459,12 +540,19 @@ class ModelExpressGeneratorClient:
                 # explain, and dropping the record would leave the failure with
                 # no timing at all.
                 timing.emit(staged._timing, logger)
+            if staged._stage_process_metrics and isinstance(result, dict):
+                # An installer that reports the staging metrics reports this
+                # process's, which found the version already staged.
+                result = {**result, **staged._stage_process_metrics}
             return result
 
     def close(self) -> None:
         """Stop renewal and release control-plane and adapter resources."""
         if self._closed:
             return
+        if self._stage_process is not None:
+            # Before the lock: a stage that waits on the stage process holds it.
+            self._stage_process.close()
         with self._operation_lock:
             if self._active_handle is not None:
                 self._release_staged(self._active_handle)
@@ -500,6 +588,47 @@ class ModelExpressGeneratorClient:
         if self._runtime is None:
             raise RuntimeError("generator client is not initialized")
         return self._runtime
+
+    def _start_stage_process(self, config: ModelExpressGeneratorConfig) -> None:
+        """Start a child process that runs this client's staging step."""
+        enabled = config.stage_process
+        if enabled is None:
+            enabled = rl_envs.MX_REFIT_STAGE_PROCESS
+        if not enabled:
+            return
+        runtime = self._require_runtime()
+        source_order = runtime.session.source_order
+        if (
+            source_order != (WeightSource.OBJECT_STORAGE,)
+            or config.object_storage is None
+        ):
+            # The other sources stage into this process's own memory.
+            logger.info(
+                "ModelExpress stage process not started: object storage is not "
+                "the only source (%s); staging in-process",
+                ", ".join(source.value for source in source_order),
+            )
+            return
+        from .engines.stage_only import StageOnlyGeneratorContext
+
+        # The worker is a generator client like this one, without the engine.
+        worker_config = replace(
+            config,
+            engine_context=StageOnlyGeneratorContext(
+                model_name=runtime.engine.model_name,
+                capabilities=runtime.engine.installer.capabilities,
+            ),
+            # Leases are keyed by version and worker, so it has its own identity.
+            worker_id=f"{self.worker_id}-stage",
+            source_order=source_order,
+            # It joins the checkpoint cache this client has just initialized
+            # and does not reset it from the launch seed.
+            object_storage=replace(config.object_storage, seed_checkpoint_path=None),
+            stage_process=False,
+        )
+        # From here on only the stage process stages. Initialization fails if
+        # it does not start.
+        self._stage_process = StageProcess(worker_config)
 
     def _register_worker(self) -> None:
         self._service.RegisterWorker(
@@ -542,6 +671,15 @@ class ModelExpressGeneratorClient:
         *,
         target_version_id: str,
     ) -> WeightVersion:
+        worker_staged = self._worker_staged
+        if worker_staged is not None:
+            # The stage process asked the MX server; its answers stand in here.
+            if version_id not in worker_staged.versions:
+                raise RuntimeError(
+                    f"target {target_version_id!r}: the stage process did not "
+                    f"resolve revision {version_id!r}"
+                )
+            return worker_staged.versions[version_id]
         try:
             response = self._service.GetWeightVersion(
                 refit_pb2.GetWeightVersionRequest(uid=version_id),
@@ -572,6 +710,7 @@ class ModelExpressGeneratorClient:
                 f"target {target_version_id!r}: revision {version_id!r} model_name "
                 "does not match the generator"
             )
+        self._fetched_versions[version_id] = version
         return version
 
     def _resolve_replay_chain(
@@ -634,7 +773,10 @@ class ModelExpressGeneratorClient:
             logger.exception("unexpected version %s lease renewal failure", version_id)
         return None
 
-    def _start_version_lease(self, version_id: str) -> _VersionLease:
+    def _start_version_lease(self, version_id: str) -> _VersionLease | _WorkerLease:
+        if self._worker_staged is not None:
+            # The stage process holds the leases; closing this releases them.
+            return self._worker_staged.lease
         # A restarted MX server loses registrations until the next renewal tick.
         self._register_worker()
         lease = self._register_lease(version_id)

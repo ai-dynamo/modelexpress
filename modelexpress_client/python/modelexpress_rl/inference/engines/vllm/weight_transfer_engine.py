@@ -56,6 +56,9 @@ class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
     max_transfer_attempts: int = 3
     max_replay_chain_length: int = 64
     rpc_timeout_seconds: float = 30.0
+    # Prepare object-storage versions in a child process; None follows
+    # MX_REFIT_STAGE_PROCESS.
+    stage_process: bool | None = None
 
 
 @dataclass
@@ -171,6 +174,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 rpc_timeout_seconds=init_info.rpc_timeout_seconds,
                 object_storage=object_storage,
                 initial_serving_version_id=init_info.initial_serving_version_id,
+                stage_process=init_info.stage_process,
             )
         )
         logger.info("ModelExpress weight transfer initialized model=%s", model_name)
