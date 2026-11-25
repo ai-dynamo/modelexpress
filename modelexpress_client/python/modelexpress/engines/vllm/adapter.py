@@ -80,9 +80,17 @@ def cold_start_expected_workers(vllm_config) -> int:
     return expected
 
 def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
-    """Identify local state through the attention layer's declared backend."""
+    """Identify local attention and collective state by engine type."""
     tensors = []
     for module in model.modules():
+        if any(
+            cls.__module__ == "vllm.models.kimi_k3.nvidia.latent_moe_runner"
+            and cls.__name__ == "LatentMoERunner"
+            for cls in type(module).__mro__
+        ):
+            residual = getattr(module, "_zero_residual", None)
+            if isinstance(residual, torch.Tensor):
+                tensors.append(residual)
         backend = getattr(module, "attn_backend", None)
         get_name = getattr(backend, "get_name", None)
         if not callable(get_name) or get_name() != "FLASHINFER_MLA":

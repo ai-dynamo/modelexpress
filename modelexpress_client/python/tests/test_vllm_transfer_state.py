@@ -9,6 +9,8 @@ import pytest
 import torch
 from torch import nn
 
+import modelexpress.tensor_utils as tensor_utils
+
 from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.tensor_utils import collect_module_tensors
@@ -154,3 +156,54 @@ def test_empty_local_tensor_does_not_hide_empty_weights(mock_accelerator_backend
     model.weight = nn.Parameter(torch.empty(0))
     catalog = collect_module_tensors(model, backend, preserve_local=[torch.empty(0)])
     assert list(catalog) == ["weight"]
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+@pytest.mark.parametrize("registered", [False, True])
+def test_kimi_zero_residual_stays_local(
+    subclass: bool, registered: bool, mock_accelerator_backend_cls: type
+) -> None:
+    """Match cold and warmed catalogs without transferring the zero residual.
+
+    Args:
+        subclass: Whether the runner is an application subclass.
+        registered: Whether the scratch tensor has already been adopted.
+        mock_accelerator_backend_cls: CPU accelerator fixture.
+    """
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    cls = type("LatentMoERunner", (torch.nn.Module,), {
+        "__module__": "vllm.models.kimi_k3.nvidia.latent_moe_runner",
+    })
+    if subclass:
+        cls = type("ApplicationRunner", (cls,), {"__module__": "application"})
+    source, target = cls(), cls()
+    for model in (source, target):
+        model.weight = torch.nn.Parameter(torch.ones(8))
+        model.register_buffer("scale_recip", torch.tensor([0.5]))
+    target._zero_residual = torch.zeros(32)
+    if registered:
+        tensor_utils.adopt_bare_tensors(target, backend)
+    target.register_buffer("residual_alias", target._zero_residual[4:8])
+    source_catalog = _discover(source, backend)
+    for _ in range(2):
+        target_catalog = _discover(target, backend)
+        assert source_catalog.keys() == target_catalog.keys()
+        assert set(target_catalog) == {"weight", "scale_recip"}
+        with torch.no_grad():
+            for tensor in target_catalog.values():
+                tensor.fill_(9)
+        assert torch.count_nonzero(target._zero_residual) == 0
+
+
+def test_unrelated_zero_residual_is_transferred(
+    mock_accelerator_backend_cls: type,
+) -> None:
+    """Retain a same-named buffer on unrelated modules.
+
+    Args:
+        mock_accelerator_backend_cls: CPU accelerator fixture.
+    """
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = torch.nn.Module()
+    model.register_buffer("_zero_residual", torch.ones(8))
+    assert "_zero_residual" in _discover(model, backend)

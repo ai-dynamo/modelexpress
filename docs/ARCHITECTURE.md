@@ -1161,6 +1161,12 @@ The vLLM adapter passes an exclusion predicate to engine-agnostic hidden-tensor 
 
 The SGLang adapter's predicate skips any object whose class is defined under `sglang.srt.distributed`, `sglang.srt.layers.communication`, or `torch.distributed`. Communication workspaces such as `FinalizePushWorkspace` hold direct references to the communicator's push counter and slabs, so excluding the communicator alone is not enough. SGLang layers keep their `GroupCoordinator` as `tp_group`, so without it the scan reaches the custom all-reduce communicator and copies the donor's epoch counters, symmetric slab, and CUDA-graph pointer table. Those tensors match in size across instances, so the transfer succeeds, but the receiver's ranks then disagree on epoch parity and the first push all-reduce deadlocks.
 
+The vLLM adapter preserves the NVIDIA Kimi `LatentMoERunner` zero-residual
+buffer and its registered aliases on each worker. This lazily allocated
+collective input contains zeros, not model weights; cold and warmed peers
+must publish the same transferable tensor names. Parameters and derived
+weight buffers remain subject to the complete transfer checks.
+
 The vLLM adapter identifies FlashInfer MLA attention layers through
 `attn_backend.get_name() == "FLASHINFER_MLA"`, independently of the implementation
 class name or module path. It preserves the instance-owned
