@@ -4,7 +4,7 @@
 //! Source identity hashing for content-addressed metadata keys.
 //!
 //! Computes a 16-char hex `mx_source_id` from a `SourceIdentity` proto by
-//! normalizing all fields and taking the first 16 chars of SHA256.
+//! preserving opaque identifiers and taking the first 16 chars of SHA256.
 
 use modelexpress_common::digest::{DigestError, sha256_hex};
 use modelexpress_common::grpc::p2p::SourceIdentity;
@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 
 /// Compute the `mx_source_id` for a `SourceIdentity`.
 ///
-/// Normalizes the identity (lowercased strings, sorted map keys) then hashes
-/// with SHA256. Returns the first 16 hex characters of the digest.
+/// Preserves model names, revisions and extra parameters, normalizes compatibility
+/// labels, and hashes sorted-key JSON.
+/// Returns the first 16 hex characters of SHA256.
 pub fn compute_mx_source_id(identity: &SourceIdentity) -> Result<String, DigestError> {
     let canonical = canonical_json(identity);
     Ok(sha256_hex(canonical.as_bytes())?[..16].to_string())
@@ -91,27 +92,12 @@ pub fn validate_worker_id(worker_id: &str) -> Result<(), String> {
 }
 
 fn canonical_json(identity: &SourceIdentity) -> String {
-    // Normalize extra_parameters deterministically:
-    // 1. sort by original key (String::cmp = byte order, matches Python's
-    //    default sorted() on str keys for ASCII content)
-    // 2. lowercase both keys and values
-    // 3. on case-colliding keys, keep the first value we see
-    // HashMap iteration order is non-deterministic in Rust, so relying on
-    // .collect() into BTreeMap would let a case-colliding key's surviving
-    // value flip run-to-run. Explicit sort-then-dedup keeps cross-language
-    // hashes stable with the Python implementation.
-    let mut items: Vec<(&String, &String)> = identity.extra_parameters.iter().collect();
-    items.sort_by(|a, b| a.0.cmp(b.0));
-    let mut sorted_extra: BTreeMap<String, String> = BTreeMap::new();
-    for (k, v) in items {
-        let lk = k.to_lowercase();
-        sorted_extra.entry(lk).or_insert_with(|| v.to_lowercase());
-    }
+    let sorted_extra: BTreeMap<_, _> = identity.extra_parameters.iter().collect();
 
     let mut payload = serde_json::json!({
         "mx_version": identity.mx_version.to_lowercase(),
         "mx_source_type": identity.mx_source_type,
-        "model_name": identity.model_name.to_lowercase(),
+        "model_name": identity.model_name,
         "backend_framework": identity.backend_framework,
         "tensor_parallel_size": identity.tensor_parallel_size,
         "pipeline_parallel_size": identity.pipeline_parallel_size,
@@ -119,7 +105,7 @@ fn canonical_json(identity: &SourceIdentity) -> String {
         "dtype": identity.dtype.to_lowercase(),
         "quantization": identity.quantization.to_lowercase(),
         "extra_parameters": sorted_extra,
-        "revision": identity.revision.to_lowercase(),
+        "revision": identity.revision,
     });
 
     if let Some(object) = payload.as_object_mut() {
@@ -196,12 +182,74 @@ mod tests {
     }
 
     #[test]
-    fn test_case_insensitive() {
-        let mut upper = base_identity();
-        upper.model_name = "DEEPSEEK-AI/DEEPSEEK-V3".to_string();
-        upper.dtype = "BFLOAT16".to_string();
+    fn test_model_name_preserves_case() {
+        for (first, second) in [
+            ("s3://weights/ModelA", "s3://weights/modela"),
+            ("oss://weights/Qwen/Model", "oss://weights/qwen/model"),
+            ("/models/ModelA", "/models/modela"),
+            ("模型/Café", "模型/café"),
+        ] {
+            let mut a = base_identity();
+            let mut b = base_identity();
+            a.model_name = first.to_string();
+            b.model_name = second.to_string();
+            assert_ne!(
+                compute_mx_source_id(&a).expect("source id"),
+                compute_mx_source_id(&b).expect("source id")
+            );
+        }
+    }
+
+    #[test]
+    fn test_extra_parameters_preserve_case() {
+        for (key, value) in [
+            ("path", "s3://weights/modela"),
+            ("Path", "s3://weights/ModelA"),
+        ] {
+            let mut a = base_identity();
+            let mut b = base_identity();
+            a.extra_parameters
+                .insert("path".to_string(), "s3://weights/ModelA".to_string());
+            b.extra_parameters
+                .insert(key.to_string(), value.to_string());
+            assert_ne!(
+                compute_mx_source_id(&a).expect("source id"),
+                compute_mx_source_id(&b).expect("source id")
+            );
+        }
+        let mut a = base_identity();
+        a.extra_parameters
+            .insert("Foo".to_string(), "a".to_string());
+        a.extra_parameters
+            .insert("foo".to_string(), "b".to_string());
+        let mut b = a.clone();
+        b.extra_parameters
+            .insert("foo".to_string(), "c".to_string());
+        assert_ne!(
+            compute_mx_source_id(&a).expect("source id"),
+            compute_mx_source_id(&b).expect("source id")
+        );
+    }
+
+    #[test]
+    fn test_lowercase_identity_preserves_existing_id() {
+        let mut identity = base_identity();
+        identity.model_name = "deepseek-ai/deepseek-v3".to_string();
         assert_eq!(
-            compute_mx_source_id(&base_identity()).expect("source id"),
+            compute_mx_source_id(&identity).expect("source id"),
+            "e0d1bc7459cb4cde"
+        );
+    }
+
+    #[test]
+    fn test_compatibility_labels_are_case_insensitive() {
+        let mut upper = base_identity();
+        upper.dtype = "BFLOAT16".to_string();
+        upper.quantization = "FP8".to_string();
+        let mut lower = base_identity();
+        lower.quantization = "fp8".to_string();
+        assert_eq!(
+            compute_mx_source_id(&lower).expect("source id"),
             compute_mx_source_id(&upper).expect("source id")
         );
     }
@@ -237,10 +285,10 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_artifact_fields_preserve_existing_id() {
+    fn test_empty_artifact_fields_use_case_preserving_id() {
         assert_eq!(
             compute_mx_source_id(&base_identity()).expect("source id"),
-            "e0d1bc7459cb4cde"
+            "c4fef23b039e398e"
         );
     }
 
@@ -316,12 +364,12 @@ mod tests {
     }
 
     #[test]
-    fn test_revision_case_insensitive() {
+    fn test_revision_preserves_case() {
         let mut upper = base_identity();
-        upper.revision = "ABC123DEF4567890".to_string();
+        upper.revision = "Release-A".to_string();
         let mut lower = base_identity();
-        lower.revision = "abc123def4567890".to_string();
-        assert_eq!(
+        lower.revision = "release-a".to_string();
+        assert_ne!(
             compute_mx_source_id(&upper).expect("source id"),
             compute_mx_source_id(&lower).expect("source id")
         );
@@ -335,7 +383,7 @@ mod tests {
     fn test_python_cross_check_base_identity() {
         assert_eq!(
             compute_mx_source_id(&base_identity()).expect("source id"),
-            "e0d1bc7459cb4cde"
+            "c4fef23b039e398e"
         );
     }
 
@@ -345,18 +393,28 @@ mod tests {
         pinned.revision = "abc123def4567890".to_string();
         assert_eq!(
             compute_mx_source_id(&pinned).expect("source id"),
-            "96db7e109daf9e53"
+            "e53adec2a591e2d4"
         );
     }
 
     #[test]
-    fn test_python_cross_check_case_colliding_extra() {
-        // Case-colliding keys (Foo vs foo) with different values. The
-        // deterministic normalization rule: sort original keys (String::cmp
-        // byte order puts "Foo" before "foo"), lowercase, keep the first
-        // value. "Foo"="a" survives over "foo"="b" regardless of insertion
-        // order into the proto's HashMap. Matches Python
-        // test_source_id.py::test_case_colliding_extra_parameters_are_deterministic.
+    fn test_python_cross_check_unicode_identity() {
+        let mut identity = base_identity();
+        identity.model_name = "模型/Café".to_string();
+        identity
+            .extra_parameters
+            .insert("标签".to_string(), "Crème 𐐀".to_string());
+        identity.compile_config_digest = "编译-Ä".to_string();
+        assert_eq!(
+            compute_mx_source_id(&identity).expect("source id"),
+            "26b0bb79a5869efe"
+        );
+    }
+
+    #[test]
+    fn test_python_cross_check_case_distinct_extra() {
+        // Both Foo and foo survive. Matches Python
+        // test_source_id.py::test_case_distinct_extra_parameters_are_order_independent.
         let mut id = base_identity();
         id.extra_parameters
             .insert("Foo".to_string(), "a".to_string());
@@ -364,7 +422,7 @@ mod tests {
             .insert("foo".to_string(), "b".to_string());
         assert_eq!(
             compute_mx_source_id(&id).expect("source id"),
-            "f4eeab03e859b088"
+            "c5e4c884a17fb6d7"
         );
     }
 

@@ -371,6 +371,11 @@ Key message types: `SourceIdentity` (all fields affecting tensor layout compatib
 
 Rust and Python compute `mx_source_id` from the same normalized, sorted-key JSON encoded as UTF-8, preserving non-ASCII identity strings.
 
+Canonicalization preserves case in model names, revisions, and opaque
+extra parameters, while compatibility labels retain lowercase normalization.
+See [source identity canonicalization](metadata.md#source-identity-and-content-addressed-keys)
+for ID compatibility.
+
 ### p2p.proto - WorkerService (P2P, opt-in)
 
 | RPC | Request | Response | Purpose |

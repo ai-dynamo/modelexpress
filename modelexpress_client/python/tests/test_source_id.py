@@ -3,12 +3,13 @@
 
 """Tests for the Python compute_mx_source_id helper.
 
-The pinned ASCII hashes have matching assertions in
-modelexpress_server/src/p2p/source_identity.rs. The Unicode vector was
-cross-checked against that production Rust source in a standalone harness.
+The pinned ASCII and Unicode hashes have matching assertions in
+modelexpress_server/src/p2p/source_identity.rs.
 """
 
 from __future__ import annotations
+
+import pytest
 
 from modelexpress import p2p_pb2
 from modelexpress.metadata.source_id import compute_mx_source_id
@@ -39,11 +40,53 @@ def test_deterministic():
     assert compute_mx_source_id(_base_identity()) == compute_mx_source_id(_base_identity())
 
 
-def test_case_insensitive():
+@pytest.mark.parametrize(
+    ("field", "first", "second"),
+    [
+        ("model_name", "s3://weights/ModelA", "s3://weights/modela"),
+        ("model_name", "oss://weights/Qwen/Model", "oss://weights/qwen/model"),
+        ("model_name", "/models/ModelA", "/models/modela"),
+        ("model_name", "模型/Café", "模型/café"),
+        ("revision", "Release-A", "release-a"),
+    ],
+)
+def test_case_sensitive_identifiers_have_distinct_source_ids(field, first, second):
+    a = _base_identity()
+    b = _base_identity()
+    setattr(a, field, first)
+    setattr(b, field, second)
+    assert compute_mx_source_id(a) != compute_mx_source_id(b)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({"path": "s3://weights/ModelA"}, {"path": "s3://weights/modela"}),
+        ({"Option": "value"}, {"option": "value"}),
+        ({"Foo": "a", "foo": "b"}, {"Foo": "a", "foo": "c"}),
+    ],
+)
+def test_extra_parameters_preserve_case(first, second):
+    a = _base_identity()
+    b = _base_identity()
+    a.extra_parameters.update(first)
+    b.extra_parameters.update(second)
+    assert compute_mx_source_id(a) != compute_mx_source_id(b)
+
+
+def test_lowercase_identity_preserves_existing_source_id():
+    identity = _base_identity()
+    identity.model_name = "deepseek-ai/deepseek-v3"
+    assert compute_mx_source_id(identity) == "e0d1bc7459cb4cde"
+
+
+def test_compatibility_labels_are_case_insensitive():
     upper = _base_identity()
-    upper.model_name = "DEEPSEEK-AI/DEEPSEEK-V3"
     upper.dtype = "BFLOAT16"
-    assert compute_mx_source_id(_base_identity()) == compute_mx_source_id(upper)
+    upper.quantization = "FP8"
+    lower = _base_identity()
+    lower.quantization = "fp8"
+    assert compute_mx_source_id(lower) == compute_mx_source_id(upper)
 
 
 def test_different_tp_gives_different_id():
@@ -58,8 +101,8 @@ def test_different_revision_gives_different_id():
     assert compute_mx_source_id(_base_identity()) != compute_mx_source_id(pinned)
 
 
-def test_empty_artifact_fields_preserve_existing_id():
-    assert compute_mx_source_id(_base_identity()) == "e0d1bc7459cb4cde"
+def test_empty_artifact_fields_use_case_preserving_id():
+    assert compute_mx_source_id(_base_identity()) == "c4fef23b039e398e"
 
 
 def test_artifact_compatibility_fields_affect_id():
@@ -153,21 +196,18 @@ def test_extra_parameters_sorted():
 # ---------------------------------------------------------------------------
 
 def test_pinned_hash_base_identity():
-    assert compute_mx_source_id(_base_identity()) == "e0d1bc7459cb4cde"
+    assert compute_mx_source_id(_base_identity()) == "c4fef23b039e398e"
 
 
 def test_pinned_hash_with_revision():
     pinned = _base_identity()
     pinned.revision = "abc123def4567890"
-    assert compute_mx_source_id(pinned) == "96db7e109daf9e53"
+    assert compute_mx_source_id(pinned) == "e53adec2a591e2d4"
 
 
-def test_case_colliding_extra_parameters_are_deterministic():
-    # Case-colliding keys (Foo vs foo) with different values. The
-    # normalization rule is: sort original keys (ASCII order, so "Foo"
-    # before "foo"), lowercase, keep the first value. "Foo"="a" survives
-    # over "foo"="b" regardless of insertion order. Cross-checked against
-    # source_identity.rs::test_python_cross_check_case_colliding_extra.
+def test_case_distinct_extra_parameters_are_order_independent():
+    # Both Foo and foo survive regardless of insertion order. Matched by
+    # source_identity.rs::test_python_cross_check_case_distinct_extra.
     a = _base_identity()
     a.extra_parameters["Foo"] = "a"
     a.extra_parameters["foo"] = "b"
@@ -175,7 +215,7 @@ def test_case_colliding_extra_parameters_are_deterministic():
     b.extra_parameters["foo"] = "b"
     b.extra_parameters["Foo"] = "a"
     assert compute_mx_source_id(a) == compute_mx_source_id(b)
-    assert compute_mx_source_id(a) == "f4eeab03e859b088"
+    assert compute_mx_source_id(a) == "c5e4c884a17fb6d7"
 
 
 def test_pinned_hash_with_unicode_identity():
@@ -184,4 +224,4 @@ def test_pinned_hash_with_unicode_identity():
     identity.extra_parameters["标签"] = "Crème 𐐀"
     identity.compile_config_digest = "编译-Ä"
     # Cross-checked with Rust compute_mx_source_id, which emits UTF-8 JSON.
-    assert compute_mx_source_id(identity) == "5c25d40f31327f9e"
+    assert compute_mx_source_id(identity) == "26b0bb79a5869efe"
