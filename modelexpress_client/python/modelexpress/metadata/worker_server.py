@@ -128,8 +128,10 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
         artifact_manifests: Mapping[str, p2p_pb2.ArtifactManifest] | None = None,
         artifact_chunk_manager: Any | None = None,
         worker_id: str = "",
+        weight_digests: tuple[p2p_pb2.WeightDigest, ...] = (),
     ):
-        self._tensor_protos = tensor_protos
+        self._tensor_manifest = (tensor_protos, weight_digests)
+        self._tensor_manifest_lock = Lock()
         self._mx_source_id = mx_source_id
         self._metadata_endpoint = metadata_endpoint
         self._agent_name = agent_name
@@ -175,13 +177,18 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             if not source.manifests:
                 self._artifact_sources.pop(mx_source_id, None)
 
-    def extend_tensors(self, tensor_protos: list[p2p_pb2.TensorDescriptor]) -> None:
-        # Copy-on-write rebinding: readers take self._tensor_protos once per
-        # response, so they see either the old or the extended list, never a
-        # list mid-mutation. No lock guards the manifest (the lease Condition
-        # tracks readers, not manifest contents), and none is needed for an
-        # atomic reference swap.
-        self._tensor_protos = [*self._tensor_protos, *tensor_protos]
+    def extend_tensors(
+        self,
+        tensor_protos: list[p2p_pb2.TensorDescriptor],
+        weight_digests: tuple[p2p_pb2.WeightDigest, ...] = (),
+    ) -> None:
+        with self._tensor_manifest_lock:
+            tensors, digests = self._tensor_manifest
+            scopes = {digest.scope for digest in digests}
+            added = {digest.scope for digest in weight_digests}
+            if scopes & added or len(added) != len(weight_digests):
+                raise ValueError("Weight digest scope is already published")
+            self._tensor_manifest = ([*tensors, *tensor_protos], digests + weight_digests)
 
     def GetTensorManifest(self, request, context):
         self._validate_tensor_source(
@@ -195,7 +202,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
         response = self._tensor_manifest_response()
         logger.info(
-            f"GetTensorManifest served: {len(self._tensor_protos)} tensors, "
+            f"GetTensorManifest served: {len(response.tensors)} tensors, "
             f"{response.ByteSize()} bytes (worker_rank={self._worker_rank})"
         )
         return response
@@ -212,7 +219,7 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             manifest=self._tensor_manifest_response(),
         )
         logger.info(
-            f"PrepareTensorRead served: {len(self._tensor_protos)} tensors, "
+            f"PrepareTensorRead served: {len(response.manifest.tensors)} tensors, "
             f"lease_id={lease_id} (worker_rank={self._worker_rank})"
         )
         return response
@@ -248,8 +255,10 @@ class WorkerServiceServicer(p2p_pb2_grpc.WorkerServiceServicer):
             context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
 
     def _tensor_manifest_response(self) -> p2p_pb2.GetTensorManifestResponse:
+        tensors, digests = self._tensor_manifest
         response = p2p_pb2.GetTensorManifestResponse(
-            tensors=self._tensor_protos,
+            tensors=tensors,
+            weight_digests=digests,
             mx_source_id=self._mx_source_id or "",
             metadata_endpoint=self._metadata_endpoint,
             agent_name=self._agent_name,
@@ -503,10 +512,12 @@ class WorkerGrpcServer:
         artifact_chunk_manager: Any | None = None,
         max_workers: int = 4,
         worker_id: str = "",
+        weight_digests: tuple[p2p_pb2.WeightDigest, ...] = (),
     ):
         if max_workers <= 0:
             raise ValueError("worker gRPC max_workers must be positive")
         self._tensor_protos = tensor_protos
+        self._weight_digests = weight_digests
         self._mx_source_id = mx_source_id
         self._requested_port = port
         self._metadata_endpoint = metadata_endpoint
@@ -552,7 +563,11 @@ class WorkerGrpcServer:
             return
         self._servicer.unregister_artifact_source(mx_source_id, artifact_id)
 
-    def extend_tensors(self, tensor_protos: list[p2p_pb2.TensorDescriptor]) -> None:
+    def extend_tensors(
+        self,
+        tensor_protos: list[p2p_pb2.TensorDescriptor],
+        weight_digests: tuple[p2p_pb2.WeightDigest, ...] = (),
+    ) -> None:
         """Append descriptors to the served tensor manifest.
 
         Lets a second in-process load (the speculative draft) join this
@@ -560,9 +575,13 @@ class WorkerGrpcServer:
         port. Callers must register the tensors with NIXL first: peers can
         request any tensor in the manifest as soon as this returns.
         """
-        self._tensor_protos = [*self._tensor_protos, *tensor_protos]
         if self._servicer is not None:
-            self._servicer.extend_tensors(tensor_protos)
+            if weight_digests:
+                self._servicer.extend_tensors(tensor_protos, weight_digests)
+            else:
+                self._servicer.extend_tensors(tensor_protos)
+        self._tensor_protos = [*self._tensor_protos, *tensor_protos]
+        self._weight_digests += weight_digests
         logger.info(
             f"WorkerGrpcServer manifest extended by {len(tensor_protos)} tensors "
             f"({len(self._tensor_protos)} total)"
@@ -586,6 +605,7 @@ class WorkerGrpcServer:
             artifact_manifests=self._artifact_manifests,
             artifact_chunk_manager=self._artifact_chunk_manager,
             worker_id=self._worker_id,
+            weight_digests=self._weight_digests,
         )
         p2p_pb2_grpc.add_WorkerServiceServicer_to_server(self._servicer, self._server)
 
@@ -775,6 +795,19 @@ def fetch_tensor_manifest(
     wire size of the protobuf response (`response.ByteSize()`); callers
     use it to instrument manifest fetch timing.
     """
+    response = fetch_tensor_manifest_response(
+        endpoint, mx_source_id, timeout, worker_id=worker_id
+    )
+    return list(response.tensors), response.ByteSize()
+
+
+def fetch_tensor_manifest_response(
+    endpoint: str,
+    mx_source_id: str,
+    timeout: float = 5.0,
+    *,
+    worker_id: str = "",
+) -> p2p_pb2.GetTensorManifestResponse:
     channel = grpc.insecure_channel(endpoint)
     stub = p2p_pb2_grpc.WorkerServiceStub(channel)
     request = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)
@@ -797,7 +830,7 @@ def fetch_tensor_manifest(
         f"Fetched {len(response.tensors)} tensors from worker at {endpoint} "
         f"({response_bytes} bytes)"
     )
-    return list(response.tensors), response_bytes
+    return response
 
 
 @contextmanager
