@@ -228,22 +228,38 @@ def test_cache_key_is_stable_when_map_entries_are_inserted_differently(
     assert _cache_key(transfer, first) == _cache_key(transfer, second)
 
 
-def test_cache_key_uses_case_insensitive_compatibility_identity(
+def test_cache_key_normalizes_compatibility_labels(
     tmp_path, memory_store
 ):
     transfer = _transfer(tmp_path)
-    upper = _identity("ORG/TEST-MODEL")
-    upper.revision = "MAIN"
+    upper = _identity("org/Test-Model")
+    upper.revision = "Release-A"
     upper.gpu_arch = "SM90"
     upper.backend_framework_version = "VLLM-0.10.0"
     upper.extra_parameters["CACHE_BACKEND"] = "CUDA"
-    lower = _identity("org/test-model")
-    lower.revision = "main"
+    lower = _identity("org/Test-Model")
+    lower.revision = "Release-A"
     lower.gpu_arch = "sm90"
     lower.backend_framework_version = "vllm-0.10.0"
-    lower.extra_parameters["cache_backend"] = "cuda"
+    lower.extra_parameters["CACHE_BACKEND"] = "CUDA"
 
     assert _cache_key(transfer, upper) == _cache_key(transfer, lower)
+
+
+def test_case_distinct_model_does_not_reuse_published_cache(tmp_path, memory_store):
+    source = _transfer(tmp_path, target_name="source-target")
+    target = _transfer(tmp_path, target_name="installed")
+    upper = _identity("s3://weights/ModelA")
+    lower = _identity("s3://weights/modela")
+    _publish(source, upper)
+
+    with pytest.raises(mc.MooncakeArtifactCacheMiss):
+        _fetch(target, lower)
+
+    header = _fetch(target, upper)
+    target.install(header)
+    assert (tmp_path / "installed" / "one.bin").read_bytes() == b"abcdefgh"
+    assert (tmp_path / "installed" / "nested" / "two.bin").read_bytes() == b"0123456789"
 
 
 def test_missing_object_is_logged_only_below_info(tmp_path, memory_store, caplog):
