@@ -114,6 +114,8 @@ class StageProcess:
         self._closed = False
         self._proc: subprocess.Popen | None = None
         self._conn: Any = None
+        # When the stage request in progress, if any, runs out of time.
+        self._deadline: float | None = None
         # Workers replaced on exit since the last reply to a stage request.
         self._replaced = 0
         with self._lock:
@@ -141,6 +143,8 @@ class StageProcess:
         """
 
         def request() -> dict[str, Any]:
+            # The limit outlives close(), which stops waiting for the reply.
+            self._deadline = time.monotonic() + self._timeout_seconds
             try:
                 self._conn.send(
                     {
@@ -149,7 +153,9 @@ class StageProcess:
                         "serving_version_id": serving_version_id,
                     }
                 )
-                return self._receive(time.monotonic() + self._timeout_seconds)
+                reply = self._receive(self._deadline)
+                self._deadline = None
+                return reply
             except _DeadlineExceeded:
                 # More time is unlikely to help: what it waits on is stuck.
                 self._drop(kill=True)
@@ -193,11 +199,15 @@ class StageProcess:
                 logger.debug("stage process did not take a release", exc_info=True)
 
     def close(self) -> None:
-        """Stop the worker without interrupting a staging step; never raises."""
+        """Stop the worker; never raises.
+
+        A staging step in progress is not interrupted while its request's time
+        limit lasts.
+        """
         # A waiting stage() notices this and gives up the lock.
         self._closed = True
         with self._lock:
-            proc, conn = self._proc, self._conn
+            proc, conn, deadline = self._proc, self._conn, self._deadline
             self._proc = self._conn = None
         if proc is None or conn is None:
             return
@@ -213,18 +223,39 @@ class StageProcess:
                 proc.wait(timeout=self._close_grace_seconds)
             except subprocess.TimeoutExpired:
                 # Killing it during a staging step would leave that step's
-                # state half written. It exits once the step ends.
+                # state half written. It exits once the step ends, and the
+                # step keeps the time limit its request had.
                 logger.info(
                     "stage process pid=%d is still staging; it exits on its own",
                     proc.pid,
                 )
                 threading.Thread(
-                    target=proc.wait,
+                    target=self._reap,
+                    args=(proc, deadline),
                     name="modelexpress-refit-stage-process-reaper",
                     daemon=True,
                 ).start()
         except Exception:
             logger.warning("failed to stop the stage process", exc_info=True)
+
+    @staticmethod
+    def _reap(proc: subprocess.Popen, deadline: float | None) -> None:
+        """Wait for a closed worker to exit; kill it once its request is out of time."""
+        try:
+            proc.wait(
+                timeout=None
+                if deadline is None
+                else max(deadline - time.monotonic(), 0.0)
+            )
+        except subprocess.TimeoutExpired:
+            # As for a request that is still waited on: what it waits on is stuck.
+            logger.warning(
+                "stage process pid=%d was closed while staging and did not finish "
+                "within its request's time limit; killing it",
+                proc.pid,
+            )
+            proc.kill()
+            proc.wait()
 
     def _with_worker(self, what: str, request: Callable[[], _T]) -> tuple[_T, int]:
         """Run ``request`` with a ready worker and return its result.
@@ -365,7 +396,7 @@ class StageProcess:
     def _drop(self, *, kill: bool) -> int | None:
         """Forget the worker and return its exit code; ``kill`` does not wait."""
         proc, conn = self._proc, self._conn
-        self._proc = self._conn = None
+        self._proc = self._conn = self._deadline = None
         if proc is None or conn is None:
             return None
         conn.close()

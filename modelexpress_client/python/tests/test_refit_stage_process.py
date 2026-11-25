@@ -425,11 +425,17 @@ def test_store_without_a_seed_is_built_by_the_worker(harness):
     client, runner = harness.client(seed=False)
 
     _stage_apply(harness, client, runner, "v3")
+    # The cache now has a verified head and no initial checkpoint. A worker
+    # that starts later joins it as it is.
+    os.kill(client._stage_process.pid, signal.SIGKILL)
+    _wait_until(lambda: len(harness.procs) == 2, "a new worker to start")
     metrics = _stage_apply(harness, client, runner, "v4")
 
     assert "perf/mx_stage_process_restarts" not in metrics
-    assert harness.shard_reads(client._stage_process.pid)
+    assert client._stage_process.pid == harness.procs[1].pid
+    assert all(harness.shard_reads(proc.pid) for proc in harness.procs)
     assert harness.shard_reads(os.getpid()) == []
+    assert len(harness.procs) == 2
 
 
 def test_two_ranks_share_one_store(harness):
@@ -604,6 +610,30 @@ def test_close_during_a_stage_fails_it_and_lets_the_worker_finish(harness, monke
     harness.unhold()
     _wait_until(lambda: not _alive(worker_pid), "the worker to exit")
     assert harness.head() == (CheckpointState.READY, "v1")
+
+
+def test_close_leaves_a_stage_its_time_limit_and_no_longer(harness, monkeypatch):
+    monkeypatch.setenv("MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS", "0.1")
+    monkeypatch.setenv("MX_REFIT_STAGE_PROCESS_TIMEOUT_SECONDS", "3.0")
+    client, _ = harness.client()
+    worker = harness.procs[0]
+    harness.hold()
+
+    with futures.ThreadPoolExecutor(1) as pool:
+        staging = pool.submit(client.stage_weight, version=WeightVersionRef("v1"))
+        harness.wait_holding()
+        client.close()
+        with pytest.raises(StageProcessError, match="closed"):
+            staging.result(WAIT_SECONDS)
+
+    # The read stays blocked. Nobody waits for the reply any more, and the
+    # worker is still killed when the request's time is up, and reaped.
+    _wait_until(lambda: worker.poll() == -signal.SIGKILL, "the worker to be killed")
+    store = LocalCheckpointStore(root=harness.refit, model_name=STORE_KEY)
+    with store.preparation_locked(blocking=False) as free:
+        # Other ranks on the node can prepare versions again.
+        assert free
+    assert len(harness.procs) == 1
 
 
 def test_close_stops_the_worker(harness):

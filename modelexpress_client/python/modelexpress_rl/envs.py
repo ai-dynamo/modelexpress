@@ -303,7 +303,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MX_REFIT_STAGE_PROCESS_START_TIMEOUT_SECONDS", 60.0
     ),
     # How long closing the client waits for the child before leaving it to
-    # finish its current staging step on its own.
+    # finish its current staging step on its own, within that request's
+    # deadline.
     "MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS": lambda: non_negative_float_env(
         "MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS", 2.0
     ),
