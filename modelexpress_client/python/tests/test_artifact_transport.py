@@ -58,9 +58,14 @@ def clear_mooncake_pending_publications():
     module._pending_publications.clear()
 
 
-def test_nixl_transport_fetch_keeps_discovery_inside_adapter(monkeypatch):
+@pytest.mark.parametrize("enforcement", [None, "required", "preferred"])
+def test_nixl_transport_fetch_reuses_existing_manager(monkeypatch, enforcement):
     import modelexpress.metadata.nixl_artifact_transport as module
 
+    if enforcement is None:
+        monkeypatch.delenv("MX_P2P_TOPOLOGY_ENFORCEMENT", raising=False)
+    else:
+        monkeypatch.setenv("MX_P2P_TOPOLOGY_ENFORCEMENT", enforcement)
     artifact = _FakeArtifact()
     artifact.discovery_header = p2p_pb2.GetArtifactManifestHeaderResponse(
         artifact_id="nixl-artifact"
@@ -68,7 +73,7 @@ def test_nixl_transport_fetch_keeps_discovery_inside_adapter(monkeypatch):
     artifact.discovery_error = None
     identity = p2p_pb2.SourceIdentity()
     mx_client = object()
-    nixl_manager = object()
+    nixl_manager = MagicMock()
     context = ArtifactTransportContext(
         node_rank=2,
         accelerator="cuda",
@@ -82,6 +87,8 @@ def test_nixl_transport_fetch_keeps_discovery_inside_adapter(monkeypatch):
         )
     )
     transfer = MagicMock(return_value=artifact.discovery_header)
+    receiver_factory = MagicMock()
+    monkeypatch.setattr(module, "NixlTransferManager", receiver_factory)
     monkeypatch.setattr(module, "discover_artifact_source", discover)
     monkeypatch.setattr(module, "transfer_artifact_from_worker", transfer)
 
@@ -102,6 +109,9 @@ def test_nixl_transport_fetch_keeps_discovery_inside_adapter(monkeypatch):
         nixl_manager,
         target_file_paths=[],
     )
+    receiver_factory.assert_not_called()
+    nixl_manager.initialize.assert_not_called()
+    nixl_manager.shutdown.assert_not_called()
 
 
 def test_nixl_transport_maps_discovery_miss(monkeypatch):

@@ -74,6 +74,7 @@ def test_auto_creation_waits_for_tcp_environment(monkeypatch):
     monkeypatch.setenv('MX_NIXL_BACKEND', 'UCX')
     monkeypatch.setenv('NIXL_UCX_TLS', 'rc,cuda')
     monkeypatch.delenv('UCX_NET_DEVICES', raising=False)
+    monkeypatch.setenv("UCX_TLS", "rc,cuda")
     entered, release, auto_waiting = Event(), Event(), Event()
     seen = []
 
@@ -110,6 +111,8 @@ def test_auto_creation_waits_for_tcp_environment(monkeypatch):
                 second = pool.submit(auto.initialize)
                 assert auto_waiting.wait(5)
                 assert not second.done()
+                assert os.environ["UCX_TLS"] == "tcp,cuda_copy"
+                assert os.environ["UCX_NET_DEVICES"] == "all"
             finally:
                 release.set()
             first.result(timeout=5)

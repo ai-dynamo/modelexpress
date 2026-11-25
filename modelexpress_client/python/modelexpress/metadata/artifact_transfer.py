@@ -61,6 +61,10 @@ _RESOURCE_EXHAUSTED_PREPARE_DELAY_SECONDS = 0.05
 _SKIPPED_ENTRY_PREVIEW = 5
 
 
+class ArtifactTransferCleanupError(RuntimeError):
+    """Receiving resources could not be safely released; loading must stop."""
+
+
 @dataclass
 class _ArtifactChunkLease:
     artifact_id: str
@@ -579,6 +583,82 @@ def publish_artifact_source(
     )
 
 
+def list_artifact_sources(
+    mx_client,
+    identity: p2p_pb2.SourceIdentity,
+    *,
+    worker_rank: int | None = None,
+    accelerator: str = "",
+) -> list[p2p_pb2.SourceInstanceRef]:
+    """List ready, compatible sources without discarding topology fallbacks."""
+    sources = mx_client.list_sources(
+        identity=identity,
+        status_filter=p2p_pb2.SOURCE_STATUS_READY,
+    )
+    return [
+        source
+        for source in sources.instances
+        if (worker_rank is None or source.worker_rank == worker_rank)
+        and accelerators_compatible(
+            accelerator,
+            source.accelerator,
+            mx_source_type=identity.mx_source_type,
+        )
+    ]
+
+
+def resolve_artifact_source(
+    mx_client,
+    source: p2p_pb2.SourceInstanceRef,
+    identity: p2p_pb2.SourceIdentity,
+    *,
+    policy=None,
+    channel: str = "auto",
+    node_rank: int | None = None,
+    artifact_id: str = "",
+    accelerator: str = "",
+) -> ArtifactSourceEndpoint | None:
+    """Recheck a candidate's current metadata before a channel attempt."""
+    metadata = mx_client.get_metadata(source.mx_source_id, source.worker_id)
+    if (
+        not metadata.found
+        or not metadata.mx_source_id
+        or not metadata.worker_id
+        or metadata.mx_source_id != source.mx_source_id
+        or metadata.worker_id != source.worker_id
+    ):
+        return None
+    worker = metadata.worker
+    if worker.status != p2p_pb2.SOURCE_STATUS_READY:
+        return None
+    if worker.worker_rank != source.worker_rank:
+        return None
+    if not apply_policy([worker], policy, channel=channel):
+        return None
+    if worker.WhichOneof("source_payload") != "artifact_source":
+        return None
+    if not accelerators_compatible(
+        accelerator,
+        worker.accelerator,
+        mx_source_type=identity.mx_source_type,
+    ):
+        return None
+    if node_rank is not None and worker.artifact_source.node_rank != node_rank:
+        return None
+    if not worker.worker_grpc_endpoint:
+        return None
+    published_artifact_id = worker.artifact_source.artifact_id
+    if not published_artifact_id or (artifact_id and published_artifact_id != artifact_id):
+        return None
+    return ArtifactSourceEndpoint(
+        mx_source_id=metadata.mx_source_id,
+        worker_id=metadata.worker_id,
+        worker_rank=worker.worker_rank,
+        worker_grpc_endpoint=worker.worker_grpc_endpoint,
+        artifact_id=published_artifact_id,
+    )
+
+
 def discover_artifact_source(
     mx_client,
     identity: p2p_pb2.SourceIdentity,
@@ -592,61 +672,29 @@ def discover_artifact_source(
 
     Artifact sources are not rank-matched by default. Pass node_rank for
     node-scoped artifacts or worker_rank for worker-specific artifacts. Pass
-    accelerator to skip sources published by an incompatible runtime; engine
-    JIT/compile caches (Torch compile, Triton, DeepGEMM, FlashInfer, etc.) are
-    accelerator-specific, so a cache bundle from a different accelerator family
-    must not be installed. Empty means unknown and is accepted for backward
-    compatibility, matching RDMA tensor source selection.
-    Transfer-domain policy filters source refs before fetching metadata and
-    rechecks required domains on the fetched worker.
+    accelerator to skip incompatible engine JIT/compile caches; an empty
+    accelerator remains compatible with legacy sources. Transfer-domain policy
+    filters source refs and is checked again against current worker metadata.
     """
     policy = resolve_policy()
     if blocks_selection(policy):
         raise LookupError("required artifact source topology is unknown")
-    sources = mx_client.list_sources(
-        identity=identity,
-        status_filter=p2p_pb2.SOURCE_STATUS_READY,
+    candidates = list_artifact_sources(
+        mx_client, identity, worker_rank=worker_rank, accelerator=accelerator
     )
-    candidates = [
-        source
-        for source in sources.instances
-        if (worker_rank is None or source.worker_rank == worker_rank)
-        and accelerators_compatible(
-            accelerator,
-            source.accelerator,
-            mx_source_type=identity.mx_source_type,
-        )
-    ]
     warn_if_no_domain_match(candidates, policy, worker_rank)
     for source in apply_policy(candidates, policy):
-        metadata = mx_client.get_metadata(source.mx_source_id, source.worker_id)
-        if not metadata.found:
-            continue
-        worker = metadata.worker
-        if policy is not None and policy.required and not in_domain(worker, policy):
-            continue
-        if worker.WhichOneof("source_payload") != "artifact_source":
-            continue
-        if not accelerators_compatible(
-            accelerator,
-            worker.accelerator,
-            mx_source_type=identity.mx_source_type,
-        ):
-            continue
-        if node_rank is not None and worker.artifact_source.node_rank != node_rank:
-            continue
-        if not worker.worker_grpc_endpoint:
-            continue
-        published_artifact_id = worker.artifact_source.artifact_id
-        if artifact_id and published_artifact_id != artifact_id:
-            continue
-        return ArtifactSourceEndpoint(
-            mx_source_id=metadata.mx_source_id,
-            worker_id=metadata.worker_id,
-            worker_rank=worker.worker_rank,
-            worker_grpc_endpoint=worker.worker_grpc_endpoint,
-            artifact_id=published_artifact_id,
+        endpoint = resolve_artifact_source(
+            mx_client,
+            source,
+            identity,
+            policy=policy,
+            node_rank=node_rank,
+            artifact_id=artifact_id,
+            accelerator=accelerator,
         )
+        if endpoint is not None:
+            return endpoint
     raise LookupError("no ready artifact source found")
 
 
@@ -844,28 +892,17 @@ def transfer_artifact_from_worker(
         _validate_fetched_artifact_manifest(header, chunks, artifact_id)
         target_header = _header_with_target_file_paths(header, target_file_paths)
         target_files = target_header.files
-        _prepare_target_files(target_files)
-        if not chunks:
-            elapsed = time.perf_counter() - start
-            logger.info(
-                "[TIMING] Artifact transfer complete: artifact_id=%s source=%s "
-                "files=%d chunks=0 size=%.2f MiB elapsed=%.3fs throughput=%.2f Gbps",
-                header.artifact_id,
-                endpoint,
-                header.file_count,
-                _mib(header.total_size),
-                elapsed,
-                _gbps(header.total_size, elapsed),
-            )
-            return target_header
-
-        target_slots = _register_target_buffers(
-            nixl_manager,
-            buffer_size=max(int(chunk.length) for chunk in chunks),
-            buffer_count=min(max_inflight_chunks, len(chunks)),
-        )
+        target_slots: list[_TargetBufferSlot] = []
         remote_agent_name = ""
+        receive_safe = True
         try:
+            _prepare_target_files(target_files)
+            if chunks:
+                target_slots = _register_target_buffers(
+                    nixl_manager,
+                    buffer_size=max(int(chunk.length) for chunk in chunks),
+                    buffer_count=min(max_inflight_chunks, len(chunks)),
+                )
             next_chunk = 0
             while next_chunk < len(chunks):
                 batch = chunks[next_chunk : next_chunk + max_inflight_chunks]
@@ -890,6 +927,13 @@ def transfer_artifact_from_worker(
                         timeout,
                     )
                 finally:
+                    try:
+                        nixl_manager.cleanup_dram_reads()
+                    except Exception as exc:
+                        receive_safe = False
+                        raise ArtifactTransferCleanupError(
+                            "Artifact READ cleanup failed; receiving resources are retained"
+                        ) from exc
                     _release_prepared_chunks(
                         endpoint,
                         mx_source_id,
@@ -898,11 +942,14 @@ def transfer_artifact_from_worker(
                         channel=channel,
                     )
                 next_chunk += len(prepared)
+        except ArtifactTransferCleanupError:
+            raise
         except Exception:
             _cleanup_target_files(target_files)
             raise
         finally:
-            _close_target_buffers(nixl_manager, target_slots)
+            if receive_safe:
+                _close_target_buffers(nixl_manager, target_slots)
 
     elapsed = time.perf_counter() - start
     logger.info(
@@ -993,13 +1040,20 @@ def _close_target_buffers(
     nixl_manager: NixlTransferManager,
     slots: list[_TargetBufferSlot],
 ) -> None:
+    first_error = None
     for slot in slots:
         if slot.registered is None:
             continue
         try:
             nixl_manager.deregister_memory(slot.registered)
-        except Exception:
-            logger.warning("Failed to deregister target artifact buffer", exc_info=True)
+            slot.registered = None
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+    if first_error is not None:
+        raise ArtifactTransferCleanupError(
+            "Failed to deregister artifact receive buffers"
+        ) from first_error
 
 
 @dataclass(frozen=True)

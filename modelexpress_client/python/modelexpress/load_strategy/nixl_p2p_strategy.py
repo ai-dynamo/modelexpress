@@ -22,6 +22,7 @@ from ..metadata.source_id import compute_mx_source_id
 from ..metrics import metrics as selection_metrics
 from ..nixl_transfer import is_nixl_available
 from ..source_selection import (
+    MAX_SOURCE_RETRIES,
     configured_policy_label,
     get_configured_selector,
 )
@@ -56,7 +57,6 @@ from .context import (
 
 logger = logging.getLogger("modelexpress.strategy_rdma")
 
-MAX_SOURCE_RETRIES = 3
 MAX_DRAFT_SOURCE_METADATA_LOOKUPS = 10
 
 
@@ -346,10 +346,9 @@ class NixlP2PStrategy(LoadStrategy):
                     worker_id,
                 )
             except StrategyFailed as e:
-                if adaptive_enabled() and state.last_failure is not P2PFailure.SOURCE:
-                    raise
                 has_next_candidate = (
-                    transfer_attempts < MAX_SOURCE_RETRIES
+                    (not adaptive_enabled() or state.last_failure is P2PFailure.SOURCE)
+                    and transfer_attempts < MAX_SOURCE_RETRIES
                     and attempt_index + 1 < len(attempts)
                 )
                 selection_metrics.observe_transfer_seconds(
@@ -645,6 +644,8 @@ class NixlP2PStrategy(LoadStrategy):
             )
             return None
         worker = metadata_resp.worker
+        if worker.status != p2p_pb2.SOURCE_STATUS_READY:
+            return None
         has_tensor_descriptors = bool(worker_tensor_descriptors(worker))
         if not has_tensor_descriptors and not worker.worker_grpc_endpoint:
             logger.debug(

@@ -958,9 +958,19 @@ worker discovery. With `MX_NIXL_BACKEND=LIBFABRIC`, the target retains P2P throu
 LIBFABRIC, restricted to the domain when configured, and skips the UCX-only TCP
 strategy. If no eligible source succeeds, it continues to storage loading. Draft, reload, and Service discovery
 skip P2P under `adaptive` and retain storage loading. SGLang `transfer_engine`
-skips peer transfer. Remote JIT cache fetching is deferred under `adaptive`;
-the engine compiles locally.
+skips peer transfer.
 `required` and `preferred` retain their existing behavior.
+
+With `MX_ARTIFACT_TRANSFER=1` and `MX_ARTIFACT_BACKEND=nixl`, SGLang and vLLM
+fetch JIT caches before loading weights. Under `adaptive`, one source lookup
+serves automatic UCX followed by forced TCP, each with up to
+`MAX_SOURCE_RETRIES` receives. This requires UCX, direct worker discovery, and
+reachable source TCP endpoints. Other artifact backends compile locally.
+
+Only `adaptive` uses private receive Agents. `required`, `preferred`, and
+deployments without a topology policy retain the existing worker Agent.
+If all sources fail after safe cleanup, the engine compiles locally.
+Outstanding or unknown READs and cleanup failures stop loading.
 
 ### Collective Refit (NCCL M2N) Topology
 

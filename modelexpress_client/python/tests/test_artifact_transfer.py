@@ -161,6 +161,49 @@ def test_transfer_artifact_from_worker_reuses_one_channel(tmp_path, monkeypatch)
     assert artifact_file.read_bytes() == b"x" * (16 * chunk_count)
 
 
+@pytest.mark.parametrize("failure_kind", ["read", "pending", "registration"])
+def test_failed_read_is_cleaned_before_releasing_leases_or_buffers(tmp_path, failure_kind):
+    from modelexpress.metadata.artifact_transfer import ArtifactTransferCleanupError
+
+    artifact_file = tmp_path / "cache.bin"
+    artifact_file.write_bytes(b"cache")
+    manifest = build_artifact_manifest(tmp_path, chunk_size=5,
+        mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE)
+    artifact_id = artifact_manifest_id(manifest)
+    source = _FakeArtifactChunkManager({f.path: b"cache" for f in manifest.files})
+    receiver = _FakeTargetNixlManager(source)
+    events = []
+    cleanup_fails = failure_kind == "pending"
+
+    def cleanup():
+        events.append("cleanup")
+        assert source.leases
+        assert receiver.deregistered_count == 0
+        if cleanup_fails:
+            raise RuntimeError("READ still pending")
+
+    receiver.cleanup_dram_reads = cleanup
+    receiver.receive_dram_into_buffer = MagicMock(side_effect=TimeoutError("READ timed out"))
+    if failure_kind == "registration":
+        receiver.register_dram_buffer = MagicMock(side_effect=RuntimeError("registration failed"))
+    servicer = WorkerServiceServicer(tensor_protos=[], mx_source_id="source",
+        artifact_manifests={artifact_id: manifest}, artifact_chunk_manager=source,
+        metadata_endpoint="127.0.0.1:5555", agent_name="source", worker_rank=0)
+    server, port = _start_server(servicer)
+    try:
+        expected = ArtifactTransferCleanupError if cleanup_fails else (
+            RuntimeError if failure_kind == "registration" else TimeoutError
+        )
+        with pytest.raises(expected):
+            transfer_artifact_from_worker(f"127.0.0.1:{port}", "source", artifact_id, receiver)
+        assert events == ([] if failure_kind == "registration" else ["cleanup"])
+        assert bool(source.leases) is cleanup_fails
+        assert receiver.deregistered_count == (1 if failure_kind == "read" else 0)
+        assert artifact_file.exists() is cleanup_fails
+    finally:
+        server.stop(grace=None)
+
+
 def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path):
     artifact_file = tmp_path / "cache.bin"
     artifact_file.write_bytes(b"compiled-cache")
@@ -1426,6 +1469,7 @@ def test_discover_artifact_source_does_not_rank_match_by_default(tmp_path):
         host="127.0.0.1",
     )
     try:
+        mx_client.published_worker.status = p2p_pb2.SOURCE_STATUS_READY
         assert discover_artifact_source(mx_client, identity) == published.endpoint
         with pytest.raises(LookupError):
             discover_artifact_source(mx_client, identity, worker_rank=0)
@@ -1453,6 +1497,7 @@ def test_discover_artifact_source_matches_node_rank():
             mx_source_id=mx_source_id,
             worker_id=f"source-pod-{node_rank}",
             worker=p2p_pb2.WorkerMetadata(
+                status=p2p_pb2.SOURCE_STATUS_READY,
                 worker_rank=worker_rank,
                 worker_grpc_endpoint=f"source-pod-{node_rank}:6555",
                 artifact_source=p2p_pb2.ArtifactSourceMetadata(
@@ -1508,6 +1553,7 @@ def _artifact_discovery_client(instances_and_workers):
 
 def _artifact_worker(worker_grpc_endpoint, artifact_id, accelerator=""):
     return p2p_pb2.WorkerMetadata(
+        status=p2p_pb2.SOURCE_STATUS_READY,
         worker_grpc_endpoint=worker_grpc_endpoint,
         accelerator=accelerator,
         artifact_source=p2p_pb2.ArtifactSourceMetadata(artifact_id=artifact_id),
@@ -1528,6 +1574,90 @@ def _artifact_topology_source(worker_id, topology, metadata_topology=None):
     worker = _artifact_worker(f"{worker_id}:6555", "artifact-id")
     worker.topology.update(topology if metadata_topology is None else metadata_topology)
     return ref, worker
+
+
+def test_list_artifact_sources_retains_all_compatible_topologies(monkeypatch):
+    _artifact_topology_policy(monkeypatch, enforcement="adaptive")
+    sources = [
+        _artifact_topology_source("cross", {"site": "site-b"}),
+        _artifact_topology_source("unknown", {}),
+        _artifact_topology_source("same", {"site": "site-a"}),
+        _artifact_topology_source("incompatible", {"site": "site-a"}),
+        _artifact_topology_source("other-rank", {"site": "site-a"}),
+    ]
+    sources[3][0].accelerator = "xpu"
+    sources[4][0].worker_rank = 1
+    client, identity = _artifact_discovery_client(sources)
+
+    candidates = artifact_transfer_module.list_artifact_sources(
+        client, identity, worker_rank=0, accelerator="cuda"
+    )
+
+    assert [source.worker_id for source in candidates] == ["cross", "unknown", "same"]
+    client.list_sources.assert_called_once_with(
+        identity=identity, status_filter=p2p_pb2.SOURCE_STATUS_READY
+    )
+    client.get_metadata.assert_not_called()
+
+
+@pytest.mark.parametrize("metadata_topology", [{"site": "site-b"}, {}, {"site": " \t"}])
+def test_resolve_artifact_source_adaptive_rechecks_fresh_topology(
+    monkeypatch, metadata_topology
+):
+    _artifact_topology_policy(monkeypatch, enforcement="adaptive")
+    ref, worker = _artifact_topology_source(
+        "drifted", {"site": "site-a"}, metadata_topology
+    )
+    client, identity = _artifact_discovery_client([(ref, worker)])
+    policy = artifact_transfer_module.resolve_policy()
+
+    assert artifact_transfer_module.resolve_artifact_source(
+        client, ref, identity, policy=policy, channel="auto"
+    ) is None
+    endpoint = artifact_transfer_module.resolve_artifact_source(
+        client, ref, identity, policy=policy, channel="tcp"
+    )
+
+    assert endpoint.worker_id == "drifted"
+    assert endpoint.artifact_id == "artifact-id"
+    assert client.get_metadata.call_count == 2
+    client.list_sources.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("found", False),
+        ("mx_source_id", ""),
+        ("mx_source_id", "changed-source"),
+        ("worker_id", ""),
+        ("worker_id", "changed-worker"),
+        ("worker.status", p2p_pb2.SOURCE_STATUS_STALE),
+        ("worker.worker_rank", 1),
+        ("worker.worker_grpc_endpoint", ""),
+        ("worker.accelerator", "xpu"),
+        ("worker.artifact_source", None),
+        ("worker.artifact_source.node_rank", 1),
+        ("worker.artifact_source.artifact_id", ""),
+        ("worker.artifact_source.artifact_id", "changed-artifact"),
+    ],
+)
+def test_resolve_artifact_source_rejects_invalid_or_changed_metadata(field, value):
+    ref, worker = _artifact_topology_source("source", {})
+    client, identity = _artifact_discovery_client([(ref, worker)])
+    metadata = client.get_metadata(ref.mx_source_id, ref.worker_id)
+    target = metadata
+    parts = field.split(".")
+    for part in parts[:-1]:
+        target = getattr(target, part)
+    if value is None:
+        target.ClearField(parts[-1])
+    else:
+        setattr(target, parts[-1], value)
+
+    assert artifact_transfer_module.resolve_artifact_source(
+        client, ref, identity, node_rank=0, artifact_id="artifact-id", accelerator="cuda"
+    ) is None
 
 
 @pytest.mark.parametrize("domain", ["datacenter", "site"])
@@ -1802,6 +1932,7 @@ def test_torch_compile_cache_transfer_discovers_source_through_mx_server(tmp_pat
     mx_client.publish_metadata(
         identity,
         p2p_pb2.WorkerMetadata(
+            status=p2p_pb2.SOURCE_STATUS_READY,
             worker_rank=0,
             metadata_endpoint="127.0.0.1:7010",
             agent_name="source-agent",
@@ -1988,6 +2119,9 @@ class _FakeTargetNixlManager:
         del registered
         self.deregistered_count += 1
 
+    def cleanup_dram_reads(self):
+        pass
+
     def receive_dram_into_buffer(
         self,
         remote_agent_name: str,
@@ -2052,7 +2186,8 @@ class _FakeMxClient:
             worker_id=worker_id,
         )
 
-    def update_status(self, mx_source_id, worker_id, worker_rank, status):
+    def update_status(self, mx_source_id, worker_id, worker_rank, status, source_load=0.0):
+        self.published_worker.status = status
         self.status_updates.append((mx_source_id, worker_id, worker_rank, status))
         return True
 

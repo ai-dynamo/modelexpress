@@ -289,6 +289,7 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
     monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
     monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_ENFORCEMENT", raising=False)
 
     ctx = _rdma_ctx([])
     assert RdmaStrategy()._find_source_instances(ctx) == []
@@ -441,6 +442,7 @@ def test_find_source_instances_without_policy_omits_topology_stage(monkeypatch):
     m = MagicMock()
     monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
+    monkeypatch.delenv("MX_P2P_TOPOLOGY_ENFORCEMENT", raising=False)
     RdmaStrategy()._find_source_instances(_rdma_ctx([_zone_ref("s0aaaaaaaaaaaaaa", "w0", "az2")]))
     stages = {call.args[1] for call in m.observe_candidates.call_args_list}
     assert "topology_matched" not in stages
@@ -773,8 +775,11 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch, mismatch):
     cands = _sources(2)
     strat._find_source_instances = MagicMock(return_value=cands)
     workers = [
-        p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6555"),
         p2p_pb2.WorkerMetadata(
+            status=p2p_pb2.SOURCE_STATUS_READY, worker_grpc_endpoint="source:6555"
+        ),
+        p2p_pb2.WorkerMetadata(
+            status=p2p_pb2.SOURCE_STATUS_READY,
             worker_grpc_endpoint="source:6556",
             tensor_source=p2p_pb2.TensorSourceMetadata(
                 tensors=[p2p_pb2.TensorDescriptor(name="stale")],
@@ -833,9 +838,27 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch, mismatch):
     ]
 
 
+def test_fetch_worker_metadata_skips_stale_before_manifest(monkeypatch):
+    ctx = MagicMock(global_rank=0)
+    ctx.mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
+        found=True,
+        worker=p2p_pb2.WorkerMetadata(
+            status=p2p_pb2.SOURCE_STATUS_STALE, worker_grpc_endpoint="source:6555"
+        ),
+    )
+    fetch_manifest = MagicMock()
+    monkeypatch.setattr(
+        "modelexpress.metadata.worker_server.fetch_tensor_manifest", fetch_manifest
+    )
+    assert RdmaStrategy()._fetch_worker_metadata(ctx, "source", "worker") is None
+    fetch_manifest.assert_not_called()
+
+
 def test_fetch_worker_metadata_fetches_missing_manifest(monkeypatch):
     strat = RdmaStrategy()
-    worker = p2p_pb2.WorkerMetadata(worker_grpc_endpoint="source:6555")
+    worker = p2p_pb2.WorkerMetadata(
+        status=p2p_pb2.SOURCE_STATUS_READY, worker_grpc_endpoint="source:6555"
+    )
     ctx = MagicMock(global_rank=0)
     ctx.mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
         found=True,
@@ -860,6 +883,7 @@ def test_fetch_worker_metadata_fetches_missing_manifest(monkeypatch):
 def test_fetch_worker_metadata_reuses_empty_worker_id_manifest(monkeypatch):
     strat = RdmaStrategy()
     worker = p2p_pb2.WorkerMetadata(
+        status=p2p_pb2.SOURCE_STATUS_READY,
         worker_grpc_endpoint="service:6555",
         tensor_source=p2p_pb2.TensorSourceMetadata(
             tensors=[p2p_pb2.TensorDescriptor(name="weight")],
@@ -1504,9 +1528,7 @@ def test_a_successful_attempt_records_every_phase_once_and_they_nest_in_the_tran
     }, phases
     assert all(outcome == "ok" for _, outcome in phases), phases
     assert all(count == 1.0 for count, _ in phases.values()), phases
-    # prepare and finalize are run by the chain around the strategy, so unlike
-    # the rest they sit outside the transfer span rather than nested in it.
-    outside = {"metadata", "prepare", "finalize"}
+    outside = {"metadata"}
     inside = sum(s for (p, _), (_, s) in phases.items() if p not in outside)
     assert inside <= transfer, (
         f"phases inside the transfer summed to {inside:.6f}s but the transfer took "

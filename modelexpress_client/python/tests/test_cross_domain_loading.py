@@ -166,6 +166,7 @@ def loading(adaptive, monkeypatch):
         return p2p_pb2.GetMetadataResponse(
             found=True,
             worker=p2p_pb2.WorkerMetadata(
+                status=p2p_pb2.SOURCE_STATUS_READY,
                 accelerator="cuda",
                 topology=source.topology,
                 nixl_metadata=worker_id.encode(),
@@ -413,12 +414,15 @@ def test_model_failure_retry_depends_on_policy(loading, monkeypatch, hook, error
 
 
 @pytest.mark.parametrize("arena", [False, True])
-def test_backend_registration_failure_allows_tcp(loading, arena):
+def test_backend_registration_failure_allows_tcp(loading, monkeypatch, arena):
+    record = MagicMock()
+    monkeypatch.setattr(p2p.selection_metrics, "record_attempt", record)
     if arena:
         loading.ctx.vmm_arena = object()
     loading.failures.add(("auto", "register"))
 
     assert torch.all(run_loading(loading).weight == 7)
+    assert any(call.args[1] == "transfer_fallback" for call in record.call_args_list)
     assert [e for e in loading.events if e[0] == "read"] == [("read", "tcp", "same")]
     assert loading.events.index(("close", "auto")) < loading.events.index(("create", "tcp"))
     assert ("rebuild",) in loading.events
@@ -551,20 +555,21 @@ def test_service_discovery_skips_adaptive_p2p(loading):
 
 
 @pytest.mark.parametrize("domain", [None, "fabric"])
-def test_adaptive_artifacts_skip_before_allocating_receive_resources(
+def test_adaptive_unsupported_artifact_backend_skips_receive_resources(
     adaptive, monkeypatch, domain
 ):
-    from modelexpress.metadata.artifact_lifecycle import install_artifacts
-    from modelexpress.metadata.nixl_artifact_transport import NixlArtifactTransport
-    from modelexpress.metadata.artifact_transport import ArtifactCacheMiss
+    from modelexpress.metadata import artifact_lifecycle
 
+    monkeypatch.setenv("MX_ARTIFACT_TRANSFER", "1")
+    create_transport = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(artifact_lifecycle, "_create_artifact_transport", create_transport)
     if domain is None:
         monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN")
+    monkeypatch.setenv("MX_ARTIFACT_BACKEND", "mooncake")
     factory = MagicMock()
-    install_artifacts(context([]), factory, engine_label="test")
+    artifact_lifecycle.install_artifacts(context([]), factory, engine_label="test")
+    create_transport.assert_not_called()
     factory.assert_not_called()
-    with pytest.raises(ArtifactCacheMiss, match="adaptive"):
-        NixlArtifactTransport().fetch(None, None, None)
 
 
 @pytest.mark.parametrize("cleanup_fails", [False, True])

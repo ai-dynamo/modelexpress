@@ -5,20 +5,29 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
-from .. import p2p_pb2
+from .. import envs, p2p_pb2
+from ..nixl_transfer import NixlTransferManager
+from ..source_selection import MAX_SOURCE_RETRIES
 from ..topology import (
     adaptive_enabled,
+    apply_policy,
     blocks_selection,
     resolve_policy,
 )
 from .artifact_transfer import (
     ArtifactBundle,
     ArtifactTransfer,
+    ArtifactTransferCleanupError,
+    ArtifactSourceEndpoint,
     PublishedArtifactSource,
     discover_artifact_source,
+    list_artifact_sources,
+    resolve_artifact_source,
     publish_artifact_source,
     transfer_artifact_from_worker,
 )
@@ -36,8 +45,9 @@ from .artifact_transport import (
 from .publish import _get_worker_server
 
 if TYPE_CHECKING:
-    from ..nixl_transfer import NixlTransferManager
     from .worker_server import WorkerGrpcServer
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -109,11 +119,22 @@ class NixlArtifactTransport(ArtifactTransport):
         identity: p2p_pb2.SourceIdentity,
         context: ArtifactTransportContext,
     ) -> StagedArtifact:
-        if adaptive_enabled():
-            raise ArtifactCacheMiss("adaptive artifact fetching is not yet supported")
-        if self._mx_client is None or self._nixl_manager is None:
+        if self._mx_client is None:
             raise ArtifactTransportUnavailable(
-                "NIXL artifact fetch requires ModelExpress client and NIXL manager"
+                "NIXL artifact fetch requires a ModelExpress client"
+            )
+        if adaptive_enabled():
+            if (
+                envs.MX_NIXL_BACKEND != "UCX"
+                or getattr(self._mx_client, "REQUIRES_P2P_METADATA", False) is True
+            ):
+                raise ArtifactCacheMiss(
+                    "adaptive artifacts require UCX and direct worker discovery"
+                )
+            return self._fetch_adaptive(artifact, identity, context)
+        if self._nixl_manager is None:
+            raise ArtifactTransportUnavailable(
+                "NIXL artifact fetch requires a NIXL manager"
             )
         try:
             source = discover_artifact_source(
@@ -130,12 +151,86 @@ class NixlArtifactTransport(ArtifactTransport):
                 self._nixl_manager,
                 target_file_paths=artifact.target_file_paths(),
             )
+        except ArtifactTransferCleanupError:
+            raise
         except LookupError as exc:
             raise ArtifactCacheMiss(str(exc)) from exc
         except Exception as exc:
             raise ArtifactTransportUnavailable(
                 f"NIXL artifact fetch failed for {artifact.name}: {exc}"
             ) from exc
+        return StagedArtifact(header=header, transport=self.name)
+
+    def _fetch_adaptive(
+        self,
+        artifact: ArtifactTransfer,
+        identity: p2p_pb2.SourceIdentity,
+        context: ArtifactTransportContext,
+    ) -> StagedArtifact:
+        policy = resolve_policy()
+        candidates = list_artifact_sources(
+            self._mx_client, identity, accelerator=context.accelerator
+        )
+        for channel in ("auto", "tcp"):
+            attempts = 0
+            for candidate in apply_policy(candidates, policy, channel=channel):
+                if attempts >= MAX_SOURCE_RETRIES:
+                    break
+                try:
+                    source = resolve_artifact_source(
+                        self._mx_client,
+                        candidate,
+                        identity,
+                        policy=policy,
+                        channel=channel,
+                        node_rank=context.node_rank,
+                        accelerator=context.accelerator,
+                    )
+                    if source is not None:
+                        attempts += 1
+                        return self._fetch_source(artifact, source, channel)
+                except ArtifactTransferCleanupError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Artifact %s from worker %s via %s failed: %s",
+                        artifact.name,
+                        candidate.worker_id,
+                        channel,
+                        exc,
+                    )
+        raise ArtifactCacheMiss(f"no usable NIXL source for {artifact.name}")
+
+    def _fetch_source(
+        self, artifact: ArtifactTransfer, source: ArtifactSourceEndpoint, channel: str
+    ) -> StagedArtifact:
+        receiver = NixlTransferManager(
+            agent_name=f"mx-artifact-recv-{uuid4().hex[:8]}",
+            device_id=self._device_id,
+            accelerator_backend=getattr(self._nixl_manager, "accelerator_backend", None),
+            ucx_mode=channel,
+        )
+        cleanup_failed = False
+        try:
+            receiver.initialize()
+            header = transfer_artifact_from_worker(
+                source.worker_grpc_endpoint,
+                source.mx_source_id,
+                source.artifact_id,
+                receiver,
+                target_file_paths=artifact.target_file_paths(),
+            )
+        except ArtifactTransferCleanupError:
+            cleanup_failed = True
+            raise
+        finally:
+            if not cleanup_failed:
+                try:
+                    receiver.shutdown()
+                except Exception as exc:
+                    raise ArtifactTransferCleanupError(
+                        "Failed to close artifact receiver"
+                    ) from exc
         return StagedArtifact(header=header, transport=self.name)
 
     def publish(

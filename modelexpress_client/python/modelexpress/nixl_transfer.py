@@ -49,10 +49,12 @@ logger = logging.getLogger("modelexpress.nixl_transfer")
 NIXL_AVAILABLE = False
 NixlAgent = None
 nixl_agent_config = None
+_NIXL_NOT_POSTED_ERRORS: tuple[type[Exception], ...] = ()
 _nixl_api = load_nixl_api()
 if _nixl_api is not None:
     NixlAgent = _nixl_api.nixl_agent
     nixl_agent_config = _nixl_api.nixl_agent_config
+    _NIXL_NOT_POSTED_ERRORS = (_nixl_api.nixlBind.nixlNotPostedError,)
     NIXL_AVAILABLE = True
 
 
@@ -150,6 +152,20 @@ class PostedRead:
     posted_at: float = field(default_factory=time.perf_counter)
 
 
+class NixlReadCleanupError(RuntimeError):
+    """A DRAM READ or registration still owns resources that cannot be freed."""
+
+
+@dataclass(eq=False)
+class _PendingDramRead:
+    buffer: torch.Tensor
+    source: Any = None
+    destination: Any = None
+    handle: Any = None
+    submitted: bool = False
+    completed: bool = False
+
+
 def _has_memory_range(size: int, addr: int) -> bool:
     """True when a tensor owns allocated bytes that can be registered and read."""
     return size > 0 and addr != 0
@@ -238,6 +254,10 @@ class NixlTransferManager:
         # has been observed on a transfer this manager issued.
         self._data_plane_error: str | None = None
         self._atexit_registered = False
+        self._dram_lock = threading.RLock()
+        self._pending_dram_reads: list[_PendingDramRead] = []
+        self._dram_registrations: list[tuple[Any, torch.Tensor]] = []
+        self._dram_read_error: str | None = None
 
     @property
     def agent_name(self) -> str:
@@ -1665,6 +1685,8 @@ class NixlTransferManager:
             raise RuntimeError("NIXL DRAM buffer must be contiguous")
 
         registered = self._agent.register_memory([buffer], backends=self._backends)
+        with self._dram_lock:
+            self._dram_registrations.append((registered, buffer))
         self._metadata = self._agent.get_agent_metadata()
         return registered
 
@@ -1680,8 +1702,73 @@ class NixlTransferManager:
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
         if registered is not None:
-            self._agent.deregister_memory(registered)
-            self._metadata = self._agent.get_agent_metadata()
+            with self._dram_lock:
+                if self._pending_dram_reads and any(
+                    entry[0] is registered for entry in self._dram_registrations
+                ):
+                    raise NixlReadCleanupError("DRAM READ cleanup is incomplete")
+                self._agent.deregister_memory(registered)
+                self._dram_registrations = [
+                    entry
+                    for entry in self._dram_registrations
+                    if entry[0] is not registered
+                ]
+            try:
+                self._metadata = self._agent.get_agent_metadata()
+            except Exception:
+                self._metadata = b""
+                logger.warning(
+                    "Failed to refresh NIXL metadata after deregistration",
+                    exc_info=True,
+                )
+
+    def _release_dram_read(self, read: _PendingDramRead) -> None:
+        with self._dram_lock:
+            try:
+                if read.handle is not None:
+                    self._agent.release_xfer_handle(read.handle)
+                    read.handle = None
+                for name in ("destination", "source"):
+                    descriptor = getattr(read, name)
+                    if descriptor is not None:
+                        self._agent.release_dlist_handle(descriptor)
+                        setattr(read, name, None)
+            except Exception as exc:
+                self._dram_read_error = str(exc)
+                raise NixlReadCleanupError(f"DRAM READ release failed: {exc}") from exc
+            self._pending_dram_reads.remove(read)
+
+    def cleanup_dram_reads(self) -> None:
+        """After receive tasks join, release completed or explicitly unposted READs.
+
+        Active or unknown requests retain their memory; this does not cancel
+        or wait for them.
+        """
+        first_error = None
+        with self._dram_lock:
+            for read in list(self._pending_dram_reads):
+                try:
+                    if read.submitted and not read.completed:
+                        try:
+                            status = self._agent.check_xfer_state(read.handle)
+                        except _NIXL_NOT_POSTED_ERRORS:
+                            read.submitted = False
+                        else:
+                            if status not in ("DONE", "SUCCESS"):
+                                raise NixlReadCleanupError(
+                                    f"DRAM READ cleanup is incomplete: {status}"
+                                )
+                            read.completed = True
+                    self._release_dram_read(read)
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                self._dram_read_error = str(first_error)
+                raise NixlReadCleanupError(
+                    f"DRAM READ cleanup failed: {first_error}"
+                ) from first_error
+            self._dram_read_error = None
 
     def receive_dram_into_buffer(
         self,
@@ -1713,35 +1800,43 @@ class NixlTransferManager:
             return 0.0
 
         start_time = time.perf_counter()
-        handle = None
+        read = _PendingDramRead(local_buffer)
+        with self._dram_lock:
+            if self._dram_read_error is not None:
+                raise NixlReadCleanupError(self._dram_read_error)
+            self._pending_dram_reads.append(read)
         try:
-            src_prepped = self._agent.prep_xfer_dlist(
+            read.source = self._agent.prep_xfer_dlist(
                 agent_name=remote_agent_name,
                 xfer_list=[(remote_addr, size, remote_device_id)],
                 mem_type=remote_mem_type,
                 backends=self._backends,
             )
-            dst_prepped = self._agent.prep_xfer_dlist(
+            read.destination = self._agent.prep_xfer_dlist(
                 agent_name="",
                 xfer_list=[(local_buffer.data_ptr(), size, 0)],
                 mem_type=NIXL_DRAM_MEM_TYPE,
                 backends=self._backends,
             )
-            handle = self._agent.make_prepped_xfer(
+            read.handle = self._agent.make_prepped_xfer(
                 operation="READ",
-                local_xfer_side=dst_prepped,
+                local_xfer_side=read.destination,
                 local_indices=[0],
-                remote_xfer_side=src_prepped,
+                remote_xfer_side=read.source,
                 remote_indices=[0],
                 backends=self._backends,
             )
-            self._agent.transfer(handle)
+            # Posting can raise after the native operation has already started.
+            read.submitted = True
+            self._agent.transfer(read.handle)
 
             self._wait_for_xfer(
-                handle,
+                read.handle,
                 timeout_seconds,
                 "NIXL DRAM transfer",
             )
+            read.completed = True
+            self._release_dram_read(read)
             duration = time.perf_counter() - start_time
             logger.info(
                 "NIXL DRAM READ complete: %.2f MiB in %.3fs",
@@ -1749,9 +1844,13 @@ class NixlTransferManager:
                 duration,
             )
             return duration
-        finally:
-            if handle is not None:
-                self._agent.release_xfer_handle(handle)
+        except BaseException as exc:
+            if not read.submitted:
+                self._release_dram_read(read)
+            else:
+                with self._dram_lock:
+                    self._dram_read_error = str(exc)
+            raise
 
     def is_healthy(self) -> bool:
         """Whether the agent is initialized and has no observed transfer failure."""
@@ -1765,7 +1864,18 @@ class NixlTransferManager:
         return self._data_plane_error
 
     def shutdown(self) -> None:
-        """Disconnect remote agents before releasing local NIXL resources."""
+        """Release DRAM reads before disconnecting and releasing the Agent."""
+        self.cleanup_dram_reads()
+        with self._dram_lock:
+            while self._dram_registrations:
+                registered, _buffer = self._dram_registrations[0]
+                try:
+                    self._agent.deregister_memory(registered)
+                except Exception as exc:
+                    raise NixlReadCleanupError(
+                        f"DRAM deregistration failed: {exc}"
+                    ) from exc
+                del self._dram_registrations[0]
         if self._atexit_registered:
             atexit.unregister(self.shutdown)
             self._atexit_registered = False

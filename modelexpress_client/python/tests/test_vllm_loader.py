@@ -191,6 +191,8 @@ class _FakeAdapter(EngineAdapter):
 
 def _make_metadata_resp(found=True, rank=0, mx_source_id="abc123def456abcd", worker_id="inst-1"):
     worker = _make_worker(rank=rank) if found else None
+    if worker is not None:
+        worker.status = p2p_pb2.SOURCE_STATUS_READY
     return p2p_pb2.GetMetadataResponse(
         found=found,
         worker=worker,
@@ -2732,7 +2734,9 @@ class TestFetchWorkerMetadata:
     def test_returns_none_when_worker_has_no_tensors(self):
         strategy = self._make_strategy()
         ctx = _make_load_context()
-        empty_worker = p2p_pb2.WorkerMetadata(worker_rank=0, tensors=[])
+        empty_worker = p2p_pb2.WorkerMetadata(
+            status=p2p_pb2.SOURCE_STATUS_READY, worker_rank=0, tensors=[]
+        )
         ctx.mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
             found=True, worker=empty_worker,
         )

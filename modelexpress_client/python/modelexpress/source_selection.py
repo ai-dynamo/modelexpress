@@ -41,6 +41,7 @@ logger = logging.getLogger("modelexpress.source_selection")
 # warning and fall back to DEFAULT_SELECTOR.
 ENV_SELECTOR = "MX_P2P_SOURCE_SELECTOR"
 DEFAULT_SELECTOR = "random"
+MAX_SOURCE_RETRIES = 3
 
 
 @runtime_checkable

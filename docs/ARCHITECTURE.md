@@ -1260,6 +1260,20 @@ in the catalog. All registration paths share the same memory-range predicate.
 A manifest made entirely of zero-byte tensors completes as a successful no-op
 transfer, including in exact-match mode.
 
+Under `adaptive`, cache fetching lists compatible sources once: automatic UCX
+uses same-domain sources, then forced TCP tries same-domain sources first.
+Without a configured domain, both use all compatible sources. Each channel
+allows `MAX_SOURCE_RETRIES` receives after worker metadata and node-rank checks.
+Each attempt owns a receive Agent; other policies and cache publication keep
+the worker's existing Agent. The installation lock covers discovery, all
+attempts, and installation. Failed attempts discard staging after safe cleanup.
+
+After a chunk batch finishes, DRAM cleanup releases only completed or explicitly
+unposted READs, before releasing source leases and receive buffers. Successful
+cleanup unblocks later reads; Agent health resets only after a successful
+transfer. Active or unknown READs and cleanup failures retain resources and
+raise `ArtifactTransferCleanupError`, stopping model loading.
+
 Tarred cache artifacts carry regular files and directories only. The source
 side enumerates members explicitly and hands tar that list, so nothing else can
 enter the archive regardless of how a cache directory is laid out; the target
