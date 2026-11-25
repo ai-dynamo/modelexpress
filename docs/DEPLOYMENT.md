@@ -1822,3 +1822,40 @@ engine rather than resuming into uncertain weights. These scripts test the new
 adapter, whereas the earlier Nscale (7.91 s to 6.52 s) and GB200 (13.10 s to
 9.14 s) results exercised a benchmark-local bridge into the same replay engine.
 Those results must not be presented as GPU qualification of this adapter.
+
+#### Combining checkpoint replay with child-process staging
+
+The local integration draft is based on PR #1063 at
+`4d1678ca657f1ba44bb0b1b3da22da85ec67eded`. Configure object storage as the only
+refit source and use:
+
+```bash
+export MX_REFIT_STAGE_PROCESS=true
+export MX_REFIT_CHECKPOINT_SOURCE_REPLAY=true
+export MX_REFIT_FULL_STREAMING=false
+export MX_REFIT_DELTA_SURGICAL=false
+```
+
+Full-checkpoint streaming and surgical delta installation use separate installer
+routes; disable both for a controlled ordinary-versus-mapped checkpoint comparison.
+A successful non-streaming, non-surgical checkpoint install reports
+`installation_checkpoint_source_replay` as 1 for mapped or 0 for ordinary.
+Child staging time remains available as `perf/mx_stage_process_time`.
+
+Qualification should compare all four combinations of stage process off/on and
+checkpoint source replay off/on on the same node, seed, target sequence and warm
+cache. Use Qwen3-30B-A3B BF16, TP4, four concurrent generation streams, alternating
+paired arms, three engine starts and five pairs per start. Include full checkpoints,
+consecutive deltas and skipped-version replay. Report staging, installation RPC,
+actual pause/resume interval and token gaps separately; exclude first capture from
+warm measurements and report it separately. The standalone checkpoint benchmark
+above isolates installation and does not exercise the child process: use the MX
+`stage_weight`/`apply_weight` path for the combined qualification.
+
+CPU integration tests exercise real child staging, checkpoint reconstruction and
+source-write replay with stubbed vLLM reload hooks. They verify staging leaves live
+weights unchanged, application matches each target, addresses remain stable, the
+parent performs no object-storage reads with child staging, and leases release.
+These tests do not qualify CUDA graphs, PWAL kernels or serving pause performance.
+The earlier B200 and GB200 performance results must not be attributed to this
+combined revision until it has been measured on GPUs.

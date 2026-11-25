@@ -478,6 +478,9 @@ class _VllmInstaller(EngineInstaller):
                 )
                 if changed is None:
                     self.install_checkpoint(checkpoint.path)
+                    metrics["installation_checkpoint_source_replay"] = float(
+                        rl_envs.MX_REFIT_CHECKPOINT_SOURCE_REPLAY
+                    )
                 else:
                     metrics.update(self.install_changed_tensors(checkpoint.path, changed))
             self._live_version = checkpoint.target_version

@@ -1431,3 +1431,28 @@ ordinary replay path's native post-load processing, storage validation and final
 device fence. Source file handles remain alive through the fence. This is a
 checkpoint input adapter for the existing source install plan, not a new mapping
 engine. See `MX_REFIT_CHECKPOINT_SOURCE_REPLAY` in [deployment](DEPLOYMENT.md).
+
+### Checkpoint source replay with a stage process
+
+Checkpoint source replay composes with the generator stage process from PR #1063.
+The child owns object-storage download, XOR reconstruction and its version leases.
+The parent adopts the result through `stage_weight`, then consumes the existing
+`PreparedCheckpointArtifact` in `apply_weight` under the method's installation
+context. No checkpoint path, GPU address or mapping is sent through a new IPC
+protocol. The installation context protects the checkpoint while its mmap-backed
+sources are in use; successful installation synchronizes before resources are
+released.
+
+Mapping capture and replay stay in the engine process at its paused safe point.
+Capture temporarily changes the live model's load-time skeleton, so it cannot be
+moved to the CPU-only child or run concurrently with inference. Cache reuse avoids
+recapture when the source schema and engine layout match. Native PWAL and
+finalization still run. Quantized checkpoints remain unsupported by the opt-in
+checkpoint source replay adapter.
+
+The combined path does not itself overlap staging with inference: the current
+vLLM adapter stages inside the paused update. A future engine staging hook can
+call `stage_weight` earlier and pass its exact handle to `apply_weight` at the
+safe point. That requires the stage-process lease recovery and shutdown issues
+to be resolved before enabling long-lived staged handles. A new stage request
+must not replace a checkpoint still being installed.
