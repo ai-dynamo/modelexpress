@@ -19,6 +19,15 @@ from ..metadata.payload import (
     worker_tensor_descriptors,
 )
 from ..metadata.source_id import compute_mx_source_id
+from ..metadata.weight_integrity import (
+    agree_load_phase,
+    integrity_enabled,
+    manifest_digest,
+    registered_tensors,
+    validate_transfer,
+    verify_digest,
+    weight_scope,
+)
 from ..metrics import metrics as selection_metrics
 from ..nixl_transfer import is_nixl_available
 from ..source_selection import (
@@ -34,6 +43,7 @@ from ..topology import (
 )
 from ..transfer_safety import check_transfer_allowed
 from ..types import TensorDescriptor
+from . import _gather_all_ranks
 from .base import (
     LoadContext,
     LoadStrategy,
@@ -194,6 +204,8 @@ class RdmaStrategy(LoadStrategy):
                 ctx.nixl_manager.shutdown()
         ctx.tensors = {}
         ctx.nixl_manager = None
+        ctx.verified_weight_digest = None
+        ctx.weight_load_from_legacy = False
 
     def is_available(self, ctx: LoadContext) -> bool:
         if not ctx.p2p_enabled or getattr(ctx, "skip_rdma", False) is True:
@@ -246,15 +258,19 @@ class RdmaStrategy(LoadStrategy):
         the model, the adapter first replaces the model with a fresh instance.
         """
         result = _as_load_result(result)
-        if _is_draft_pass(ctx) and ctx.shared_nixl_manager is None:
-            logger.info(
-                f"[Worker {ctx.global_rank}] Speculative draft pass has no "
-                "main-load NIXL agent to share, skipping RDMA"
-            )
-            raise StrategyFailed(
-                "No main-load NIXL agent for the draft pass", mutated=False
-            )
-        candidates = self._find_source_instances(ctx)
+        check_weights = integrity_enabled(ctx) and not self.requires_tensor_read_lease
+        with agree_load_phase(ctx, check_weights, "RDMA source discovery"):
+            if _is_draft_pass(ctx) and ctx.shared_nixl_manager is None:
+                logger.info(
+                    f"[Worker {ctx.global_rank}] Speculative draft pass has no "
+                    "main-load NIXL agent to share, skipping RDMA"
+                )
+                raise StrategyFailed(
+                    "No main-load NIXL agent for the draft pass", mutated=False
+                )
+            candidates = self._find_source_instances(ctx)
+        if check_weights:
+            return self._load_checked(result, ctx, candidates)
         if not candidates:
             logger.info(
                 f"[Worker {ctx.global_rank}] No RDMA source available, skipping"
@@ -394,6 +410,99 @@ class RdmaStrategy(LoadStrategy):
             "No RDMA source succeeded",
             mutated=False,
         )
+
+    def _load_checked(
+        self,
+        result: LoadResult,
+        ctx: LoadContext,
+        candidates: list[p2p_pb2.SourceInstanceRef],
+    ) -> LoadResult:
+        """Try verified reads in lockstep so a peer failure rejects the attempt."""
+        policy = configured_policy_label()
+        is_draft = _is_draft_pass(ctx)
+        max_lookups = MAX_DRAFT_SOURCE_METADATA_LOOKUPS if is_draft else MAX_SOURCE_RETRIES
+        refs = iter(enumerate(candidates[:max_lookups]))
+        for _ in range(MAX_SOURCE_RETRIES):
+            candidate = None
+            for index, ref in refs:
+                logger.info(
+                    "[Worker %s] Source attempt: source_attempt_index=%s "
+                    "source_worker_id=%s mx_source_id=%s",
+                    ctx.global_rank,
+                    index,
+                    ref.worker_id,
+                    ref.mx_source_id,
+                )
+                try:
+                    with selection_metrics.time_source_attempt_phase(policy, "metadata"):
+                        worker, digest = self._fetch_worker_snapshot(
+                            ctx, ref.mx_source_id, ref.worker_id, with_integrity=True
+                        )
+                    if (
+                        worker is not None
+                        and self._accelerator_compatible(ctx, worker, ref.worker_id)
+                        and (not is_draft or self._may_serve_draft(ctx, worker))
+                    ):
+                        candidate = ref, worker, digest
+                        break
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Skipping RDMA source %s: %s", ref.worker_id, exc)
+                    selection_metrics.record_metadata_failure(policy)
+                selection_metrics.record_attempt(policy, "metadata_miss")
+
+            available = _gather_all_ranks("RDMA source candidate", candidate is not None, ctx)
+            if candidate is None or not all(available):
+                break
+            ref, worker, digest = candidate
+            if digest is None:
+                logger.info(
+                    "MX weight digest absent: source_worker_id=%s scope=%s; using legacy RDMA",
+                    ref.worker_id,
+                    weight_scope(ctx),
+                )
+            selection_metrics.record_selection(policy, ref.worker_id)
+            start = time.perf_counter()
+            try:
+                loaded = self._load_as_target(
+                    result,
+                    ctx,
+                    worker,
+                    ref.mx_source_id,
+                    ref.worker_id,
+                    weight_digest=digest,
+                    rank_agreement=True,
+                )
+            except StrategyFailed as exc:
+                logger.warning("RDMA source %s failed: %s", ref.worker_id, exc)
+                selection_metrics.record_attempt(policy, "transfer_retry")
+                selection_metrics.observe_transfer_seconds(
+                    policy, "retry", time.perf_counter() - start
+                )
+                clear_exception_tracebacks(exc)
+                with agree_load_phase(ctx, True, "RDMA target cleanup", recovering=True):
+                    self.rollback(ctx)
+                with agree_load_phase(ctx, True, "RDMA target reset", recovering=True):
+                    restored = ctx.adapter.reinit_for_retry(result)
+                    if restored is not result:
+                        vars(result).update(vars(restored))
+            else:
+                ctx.weight_load_from_legacy = digest is None
+                # The base post-receive hook is read-only and RDMA finalize is a
+                # no-op, so the same registration can publish the verified bytes.
+                if (
+                    getattr(type(ctx.adapter), "after_rdma_receive", None)
+                    is EngineAdapter.after_rdma_receive
+                    and type(self).finalize is RdmaStrategy.finalize
+                ):
+                    ctx.verified_weight_digest = digest
+                selection_metrics.observe_transfer_seconds(
+                    policy, "success", time.perf_counter() - start
+                )
+                selection_metrics.record_attempt(policy, "success")
+                return loaded
+
+        selection_metrics.record_attempt(policy, "transfer_fallback")
+        raise StrategyFailed("No RDMA source succeeded for the load group", mutated=False)
 
     def _find_source_instances(
         self,
@@ -600,6 +709,17 @@ class RdmaStrategy(LoadStrategy):
         worker_id: str,
     ) -> p2p_pb2.WorkerMetadata | None:
         """Fetch tensor metadata for one worker."""
+        worker, _ = self._fetch_worker_snapshot(ctx, mx_source_id, worker_id)
+        return worker
+
+    def _fetch_worker_snapshot(
+        self,
+        ctx: LoadContext,
+        mx_source_id: str,
+        worker_id: str,
+        *,
+        with_integrity: bool = False,
+    ) -> tuple[p2p_pb2.WorkerMetadata | None, p2p_pb2.WeightDigest | None]:
         fetch_start = time.perf_counter()
         metadata_resp = ctx.mx_client.get_metadata(
             mx_source_id=mx_source_id,
@@ -609,7 +729,7 @@ class RdmaStrategy(LoadStrategy):
             logger.debug(
                 f"[Worker {ctx.global_rank}] Metadata not found for worker {worker_id}, skipping"
             )
-            return None
+            return None, None
         worker = metadata_resp.worker
         has_tensor_descriptors = bool(worker_tensor_descriptors(worker))
         if not has_tensor_descriptors and not worker.worker_grpc_endpoint:
@@ -617,11 +737,22 @@ class RdmaStrategy(LoadStrategy):
                 f"[Worker {ctx.global_rank}] Worker {worker_id} has no tensors "
                 f"and no P2P endpoint, skipping"
             )
-            return None
+            return None, None
         # A worker ID requires endpoint validation. Without one, fetch only
         # when the metadata response did not already include the manifest.
         needs_manifest_prefetch = worker_id != "" or not has_tensor_descriptors
-        if worker.worker_grpc_endpoint and needs_manifest_prefetch:
+        digest = None
+        if worker.worker_grpc_endpoint and with_integrity:
+            manifest = self._prefetch_tensor_manifest(
+                ctx, worker, mx_source_id, worker_id, with_integrity=True
+            )
+            digest = manifest_digest(manifest, ctx, mx_source_id, worker_id)
+            if digest is not None:
+                worker.metadata_endpoint = manifest.metadata_endpoint
+                worker.agent_name = manifest.agent_name
+                if manifest.accelerator:
+                    worker.accelerator = manifest.accelerator
+        elif worker.worker_grpc_endpoint and needs_manifest_prefetch:
             self._prefetch_tensor_manifest(ctx, worker, mx_source_id, worker_id)
         fetch_time = time.perf_counter() - fetch_start
         mode = "P2P (lightweight)" if worker.worker_grpc_endpoint else "centralized"
@@ -630,7 +761,7 @@ class RdmaStrategy(LoadStrategy):
             f"[Worker {ctx.global_rank}] [TIMING] GetMetadata ({mode}): "
             f"{fetch_time:.3f}s, {tensor_count} tensors"
         )
-        return worker
+        return worker, digest
 
     def _prefetch_tensor_manifest(
         self,
@@ -638,16 +769,27 @@ class RdmaStrategy(LoadStrategy):
         source_worker: p2p_pb2.WorkerMetadata,
         mx_source_id: str,
         worker_id: str,
-    ) -> None:
+        *,
+        with_integrity: bool = False,
+    ) -> p2p_pb2.GetTensorManifestResponse | None:
         """Fetch once before target preparation and retain it for the transfer."""
-        from ..metadata.worker_server import fetch_tensor_manifest
+        from ..metadata.worker_server import (
+            fetch_tensor_manifest,
+            fetch_tensor_manifest_response,
+        )
 
         manifest_start = time.perf_counter()
-        tensor_protos, manifest_bytes = fetch_tensor_manifest(
-            endpoint=source_worker.worker_grpc_endpoint,
-            mx_source_id=mx_source_id,
-            worker_id=worker_id,
-        )
+        args = {
+            "endpoint": source_worker.worker_grpc_endpoint,
+            "mx_source_id": mx_source_id,
+            "worker_id": worker_id,
+        }
+        if with_integrity:
+            manifest = fetch_tensor_manifest_response(**args)
+            tensor_protos, manifest_bytes = manifest.tensors, manifest.ByteSize()
+        else:
+            manifest = None
+            tensor_protos, manifest_bytes = fetch_tensor_manifest(**args)
         # Store the validated descriptors on the metadata object so the
         # transfer can reuse them without a second manifest RPC.
         source_worker.tensor_source.ClearField("tensors")
@@ -658,6 +800,7 @@ class RdmaStrategy(LoadStrategy):
             f"{manifest_time:.3f}s ({len(tensor_protos)} tensors, "
             f"{manifest_bytes} bytes)"
         )
+        return manifest
 
     @staticmethod
     def _use_prefetched_manifest(source_worker):
@@ -701,6 +844,9 @@ class RdmaStrategy(LoadStrategy):
         source_worker,
         mx_source_id: str,
         source_worker_id: str,
+        *,
+        weight_digest: p2p_pb2.WeightDigest | None = None,
+        rank_agreement: bool = False,
     ) -> LoadResult:
         """Receive fully-processed weights via RDMA from an existing source."""
         # The source-selection policy (random, rendezvous_hash, load_aware, ...)
@@ -708,24 +854,28 @@ class RdmaStrategy(LoadStrategy):
         # phase duration can be read against the policy that picked the peer.
         policy = configured_policy_label()
         try:
-            with selection_metrics.time_source_attempt_phase(policy, "prepare"):
+            with (
+                agree_load_phase(ctx, rank_agreement, "RDMA target preparation"),
+                selection_metrics.time_source_attempt_phase(policy, "prepare"),
+            ):
                 # A reload target is already prepared; see prepare().
                 if not ctx.is_reload:
                     result = ctx.adapter.prepare_rdma_target(result)
                     result = ctx.adapter.before_rdma_receive(result)
-            self._receive_from_peer(
-                result,
-                ctx,
-                source_worker,
-                mx_source_id,
-                source_worker_id,
-            )
-            with selection_metrics.time_source_attempt_phase(policy, "finalize"):
+            with agree_load_phase(ctx, rank_agreement, "RDMA receive"):
+                digest_args = {"weight_digest": weight_digest} if weight_digest is not None else {}
+                self._receive_from_peer(
+                    result, ctx, source_worker, mx_source_id, source_worker_id, **digest_args
+                )
+            with (
+                agree_load_phase(ctx, rank_agreement, "RDMA target finalization"),
+                selection_metrics.time_source_attempt_phase(policy, "finalize"),
+            ):
                 # A reload target is already finalized; see finalize().
                 if not ctx.is_reload:
                     result = ctx.adapter.after_rdma_receive(result)
-                return result
-        except StrategyFailed:
+            return result
+        except (StrategyFailed, StrategyRecoveryError):
             raise
         except Exception as e:
             # The chain clears tracebacks on a mutated StrategyFailed before
@@ -746,6 +896,8 @@ class RdmaStrategy(LoadStrategy):
         source_worker,
         mx_source_id: str,
         source_worker_id: str,
+        *,
+        weight_digest: p2p_pb2.WeightDigest | None = None,
     ) -> None:
         """Receive fully-processed tensors via RDMA from the detected source."""
         receive_start = time.perf_counter()
@@ -819,6 +971,11 @@ class RdmaStrategy(LoadStrategy):
                     mutated=True,
                 )
 
+            destination_tensors = ctx.tensors if _is_draft_pass(ctx) else None
+            if weight_digest is not None:
+                destination_tensors = registered_tensors(ctx)
+                source_tensors = validate_transfer(source_tensors, destination_tensors)
+
             if is_p2p:
                 host, port_str = ep.rsplit(":", 1)
                 # Claimed before the dial so a fetch that fails part-way, leaving
@@ -875,7 +1032,8 @@ class RdmaStrategy(LoadStrategy):
                 target_accelerator = ctx.accelerator_backend.name
                 source_accelerator = source_worker.accelerator
                 require_exact_match = (
-                    ctx.require_exact_tensor_catalog
+                    weight_digest is not None
+                    or ctx.require_exact_tensor_catalog
                     or ctx.adapter.requires_exact_tensor_catalog()
                     or bool(
                         target_accelerator
@@ -900,9 +1058,7 @@ class RdmaStrategy(LoadStrategy):
                             require_exact_match=require_exact_match,
                             # The shared agent's catalog also holds the main
                             # load's tensors; match only the draft's.
-                            destination_tensors=(
-                                ctx.tensors if _is_draft_pass(ctx) else None
-                            ),
+                            destination_tensors=destination_tensors,
                         )
                 except Exception as e:
                     raise SourceTransferError(f"RDMA receive failed: {e}") from e
@@ -920,6 +1076,8 @@ class RdmaStrategy(LoadStrategy):
                 )
 
                 ctx.accelerator_backend.synchronize()
+                if weight_digest is not None:
+                    verify_digest(destination_tensors, ctx.worker_rank, weight_digest)
             finally:
                 # A weight load is one-shot, so release the source here instead of at
                 # process exit: the engine process is torn down without running atexit

@@ -19,6 +19,7 @@ from ..adapter import EngineAdapter, StrategyFailed
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary, undiscovered_parameters
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
+from ..metadata.weight_integrity import integrity_enabled, source_digest
 from .context import LoadContext, LoadResult
 
 if TYPE_CHECKING:
@@ -445,6 +446,20 @@ def publish_metadata(ctx: LoadContext) -> None:
             f"[Worker {ctx.global_rank}] No MX server configured, skipping metadata publish"
         )
         return
+    digest_args = {}
+    if (
+        integrity_enabled(ctx)
+        and envs.MX_P2P_METADATA == "1"
+        and not ctx.weight_load_from_legacy
+    ):
+        try:
+            digest_args["weight_digest"] = source_digest(ctx)
+        except Exception:
+            logger.exception(
+                "[Worker %s] Weight digest failed for %s; skipping source publication",
+                ctx.global_rank, ctx.p2p_role,
+            )
+            return
     if ctx.p2p_role == "draft":
         # Same checkpoint, same SourceIdentity: extend the main load's
         # publication instead of starting a second worker gRPC server on
@@ -455,6 +470,7 @@ def publish_metadata(ctx: LoadContext) -> None:
                 device_id=ctx.device_id,
                 worker_rank=ctx.worker_rank,
                 accelerator_backend=ctx.accelerator_backend,
+                **digest_args,
             )
         except Exception as e:
             logger.warning(
@@ -477,6 +493,7 @@ def publish_metadata(ctx: LoadContext) -> None:
             accelerator=ctx.accelerator_backend.name,
             ready_fn=ctx.source_ready_fn,
             accelerator_backend=ctx.accelerator_backend,
+            **digest_args,
         )
     except Exception as e:
         logger.warning(

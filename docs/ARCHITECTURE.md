@@ -1096,6 +1096,21 @@ The arena path does not require `MX_POOL_REG=1`. Pool-reg remains the optimizati
 
 Empirical validation on B200 + ConnectX showed that a dmabuf MR over a multi-handle VMM range remains valid when holes exist inside the registered VA range. That is the property that lets `process_weights_after_loading` allocate replacement tensors, free discarded tensors, and still finish with one MR for the surviving used arena range. That property is specific to the dmabuf/IB path: `cuda_ipc` cannot address a single MR spanning several `cuMemCreate` handles, so multi-allocation arenas fall back to per-tensor registration there. See [Multi-handle arenas](DEPLOYMENT.md#multi-handle-arenas).
 
+### GPU weight verification
+
+With `MX_WEIGHT_INTEGRITY=1`, static SGLang CUDA workers can attach a
+versioned SHA-256 tree digest to a scope of their worker manifest before
+publication. The digest covers the registered tensor bytes for that scope.
+Those ranges and their contents must stay stable while the source serves the
+publication. A target that receives a digest validates its tensor coverage,
+then recomputes the digest after READ and GPU synchronization, before engine
+post-receive processing. A failure rejects the attempt across the load group,
+which resets the target for peer retry or strategy fallback.
+
+The coordinator continues to use the existing discovery and source identity
+APIs. Sources without a digest continue to use the legacy receive behavior. A
+scope adopted from a legacy source carries no digest when republished.
+
 ## NIXL Integration
 
 ### What is NIXL?
