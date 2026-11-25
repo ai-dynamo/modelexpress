@@ -70,6 +70,7 @@ if TYPE_CHECKING:
     MX_P2P_METADATA: str
     MX_P2P_COLD_START: bool
     MX_P2P_COLD_START_WAIT_TIMEOUT_SECS: float
+    MX_WEIGHT_INTEGRITY: bool
     MX_DISABLE_DRAFT_P2P: bool
     MX_ENABLE_SEPARATE_DRAFT_P2P: bool
     # Kubernetes service backend
@@ -301,6 +302,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_LOAD_STRATEGY_CHAIN", "INFERENCE").strip().upper()
     ),
     "MX_P2P_METADATA": lambda: os.environ.get("MX_P2P_METADATA", "1"),
+    "MX_WEIGHT_INTEGRITY": lambda: _env_bool("MX_WEIGHT_INTEGRITY", False),
     "MX_DISABLE_DRAFT_P2P": lambda: _env_bool("MX_DISABLE_DRAFT_P2P", False),
     "MX_ENABLE_SEPARATE_DRAFT_P2P": lambda: _env_bool(
         "MX_ENABLE_SEPARATE_DRAFT_P2P", False
