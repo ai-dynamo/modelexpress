@@ -816,6 +816,23 @@ The central-coordinator backends (`redis`, `kubernetes`) are the default. Reach 
 
 See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale, limitations, and the structural reasons these backend families differ.
 
+### RDMA-only Loading
+
+Set `MX_LOAD_STRATEGY_CHAIN=RDMA_ONLY` in a Python inference worker to run only
+the built-in RDMA strategy. Missing or incompatible peers, unavailable RDMA,
+and exhausted transfer attempts raise `RuntimeError`; no storage strategy runs.
+Fatal recovery errors propagate unchanged. Ranks use the same availability and
+phase agreement as the default `INFERENCE` policy. `MX_LOAD_PLUGIN` must be
+unset or empty; selecting a plugin with this policy raises `ValueError` before
+loading.
+
+For a vLLM process restore, map the captured weight allocations before calling
+`reload_model(..., restore=True)`, pin the model revision, and select this policy
+only in the restoring process. A fresh source still needs `INFERENCE` or another
+loading path. This prevents storage fallback from rebuilding derived tensors
+at addresses different from those referenced by captured CUDA graphs. It does
+not compare received bytes with the captured weights or provide peers itself.
+
 ### Loading Strategy Plugins
 
 External loading strategies run after RDMA and before ServerCache by default in the shared `INFERENCE` chain. In that order, RDMA success skips the plugin's `load()`; plugin failure follows the existing recovery and fallback lifecycle. RL and SGLang's `transfer_engine` path are unchanged.

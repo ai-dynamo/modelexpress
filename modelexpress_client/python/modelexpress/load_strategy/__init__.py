@@ -83,6 +83,11 @@ class LoadStrategyChain:
         from .. import envs
         from ..plugins import get_plugin, initialize_plugins, validate_plugin_names
 
+        if envs.MX_LOAD_STRATEGY_CHAIN == "RDMA_ONLY":
+            if envs.MX_LOAD_PLUGIN:
+                raise ValueError("RDMA_ONLY does not allow MX_LOAD_PLUGIN")
+            return execute_load_strategies(model, ctx, [RdmaStrategy()])
+
         all_strategies: list[LoadStrategy] = [
             RdmaStrategy(),
             ServerCacheStrategy(),
@@ -441,10 +446,10 @@ def validate_load_strategy_chain() -> None:
     """Reject policies that require a separate engine integration."""
     from .. import envs
 
-    if envs.MX_LOAD_STRATEGY_CHAIN != "INFERENCE":
+    if envs.MX_LOAD_STRATEGY_CHAIN not in ("INFERENCE", "RDMA_ONLY"):
         raise ValueError(
             f"Loading policy {envs.MX_LOAD_STRATEGY_CHAIN!r} requires its engine "
-            "integration plugin; the base loader supports only 'INFERENCE'"
+            "integration plugin; the base loader supports 'INFERENCE' and 'RDMA_ONLY'"
         )
 
 
