@@ -1171,6 +1171,12 @@ tensors. Parameters, partial buffer overlaps, and widened storage transfers that
 overlap local state raise a classification error. This bounded compatibility rule
 does not classify arbitrary runtime buffers or implementations without a declared
 backend; versions using a module-global counter need no instance-field exclusion.
+For `FLASHINFER_MLA_SPARSE` and `FLASHINFER_MLA_SPARSE_SM120`, the adapter also
+preserves `impl.topk_indices_buffer` and `impl._workspace_buffer`, including
+registered aliases. These hold request-local indices and attention scratch space,
+not weight-derived values. A restored model may have allocated its workspace and
+adopted the shared index buffer under different names from a cold source; neither
+buffer belongs in the transferable weight catalog.
 
 ```mermaid
 graph TD
