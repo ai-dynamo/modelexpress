@@ -11,9 +11,12 @@ use std::sync::Arc;
 
 use crate::registry::backend::ModelRecord;
 use crate::registry::cache_cleanup::{CleanupPlan, execute_cleanup_plan, plan_cleanup_for_entry};
+use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
 use modelexpress_common::config::DurationConfig;
+use modelexpress_common::download::canonical_model_name;
 use modelexpress_common::models::ModelStatus;
+use modelexpress_common::providers::lock_file::LockFile;
 
 /// Configuration for cache eviction policies
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,7 +349,8 @@ impl CacheEvictionService {
                 }
                 Ok(false) => {
                     debug!(
-                        "Skipped eviction of '{model_name}': record is no longer DOWNLOADED",
+                        "Skipped eviction of '{model_name}': record is no longer DOWNLOADED or \
+                         model file lock is busy",
                         model_name = model_name
                     );
                 }
@@ -395,7 +399,7 @@ impl CacheEvictionService {
     /// deletion fails after the record is gone, this logs at `error!` and returns
     /// `Err` so the eviction is not counted as successful; operators can reclaim
     /// leftover files with `model clear`.
-    async fn evict_model(
+    pub(crate) async fn evict_model(
         &self,
         entry_key: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -414,13 +418,40 @@ impl CacheEvictionService {
         }
 
         // Validate target before removing the record so we know if it is malformed,
-        // while still deleting the invalid record without touching disk.
+        // while still deleting the invalid record without touching disk or taking a lock.
         if let CleanupPlan::InvalidTarget { reason } =
             plan_cleanup_for_entry(record.provider, entry_key, &[])
         {
             warn!("Evicting invalid registry entry '{entry_key}' without touching disk: {reason}");
             self.registry.delete_model(entry_key).await?;
             return Ok(true);
+        }
+
+        let parsed = EntryKey::parse(entry_key);
+        let canonical_name = canonical_model_name(&parsed.model_name, record.provider)?;
+        let lock_path =
+            LockFile::model_lock_path(&self.cache_directory, record.provider, &canonical_name)?;
+        let Some(exclusive_lock) = LockFile::try_acquire_exclusive(&lock_path).await? else {
+            debug!("Skipping eviction of '{entry_key}': model file lock is busy");
+            return Ok(false);
+        };
+
+        // Re-verify under the exclusive lock that the entry is still DOWNLOADED and still
+        // belongs to the locked provider before deleting its registry record or cached files.
+        let latest = match self.registry.get_model_record(entry_key).await? {
+            Some(latest) => latest,
+            None => {
+                debug!("Skipping eviction of '{entry_key}': record disappeared before lock");
+                return Ok(false);
+            }
+        };
+        if latest.status != ModelStatus::DOWNLOADED || latest.provider != record.provider {
+            debug!(
+                "Skipping eviction of '{entry_key}': record changed under lock (status={:?}, \
+                 provider={:?})",
+                latest.status, latest.provider
+            );
+            return Ok(false);
         }
 
         // Delete the registry record first. If this fails, leave all files intact.
@@ -441,8 +472,8 @@ impl CacheEvictionService {
             }
         };
 
-        let plan = plan_cleanup_for_entry(record.provider, entry_key, &live_records);
-        if let Err(err) = execute_cleanup_plan(&plan, &self.cache_directory).await {
+        let plan = plan_cleanup_for_entry(latest.provider, entry_key, &live_records);
+        if let Err(err) = execute_cleanup_plan(&plan, &self.cache_directory, exclusive_lock).await {
             error!(
                 "Removed evicted registry entry '{entry_key}', but failed to delete cached \
                  files: {err}. Run 'model clear' to reclaim leftover files."
@@ -815,7 +846,7 @@ mod tests {
     ) -> Vec<String> {
         let mut mock = MockRegistryBackend::new();
         mock.expect_get_model_record()
-            .once()
+            .times(2)
             .returning(move |name| Ok(Some(downloaded_record(name))));
         mock.expect_delete_model().once().returning(|_| Ok(()));
         // Eviction deletes the registry record before listing surviving live records.
@@ -1064,7 +1095,7 @@ mod tests {
         let entry = key(Some("abc123"), false);
         let mut mock = MockRegistryBackend::new();
         mock.expect_get_model_record()
-            .once()
+            .times(2)
             .returning(move |name| Ok(Some(downloaded_record(name))));
         mock.expect_delete_model()
             .once()
@@ -1118,7 +1149,7 @@ mod tests {
             .times(1)
             .returning(move |_| Ok(initial_list.clone()));
         mock.expect_get_model_record()
-            .once()
+            .times(2)
             .returning(move |name| Ok(Some(downloaded_record(name))));
         mock.expect_delete_model().once().returning(|_| Ok(()));
         mock.expect_get_models_by_last_used()
@@ -1190,7 +1221,7 @@ mod tests {
         let downloading_sibling = key(Some("rev2"), false);
         let mut mock = MockRegistryBackend::new();
         mock.expect_get_model_record()
-            .once()
+            .times(2)
             .returning(move |name| Ok(Some(downloaded_record(name))));
         mock.expect_delete_model().once().returning(|_| Ok(()));
         mock.expect_get_models_by_last_used()
@@ -1236,7 +1267,7 @@ mod tests {
     async fn test_evict_s3_overlap_and_ngc_canonical_survivor_protection() {
         // 1. S3 child evicted while ancestor lives -> keeps files.
         let mut mock = MockRegistryBackend::new();
-        mock.expect_get_model_record().once().returning(|_| {
+        mock.expect_get_model_record().times(2).returning(|_| {
             Ok(Some(record_with(
                 "s3://bkt/org/child",
                 ModelProvider::S3,
@@ -1271,7 +1302,7 @@ mod tests {
         // 2. NGC raw spelling evicted while canonical URI metadata-only entry lives -> keeps files.
         let mut ngc_mock = MockRegistryBackend::new();
         let ngc_meta = EntryKey::new("ngc://nim/nvidia/llama:1", None, true).to_string();
-        ngc_mock.expect_get_model_record().once().returning(|_| {
+        ngc_mock.expect_get_model_record().times(2).returning(|_| {
             Ok(Some(record_with(
                 "nim/nvidia/llama/1",
                 ModelProvider::Ngc,
@@ -1389,5 +1420,151 @@ mod tests {
         let encoded = crate::metrics::encode_text(&metrics_registry)
             .unwrap_or_else(|_| String::from("<encode failed>"));
         assert_eq!(evictions_for(&encoded, "time_threshold"), 0, "{encoded}");
+    }
+
+    #[tokio::test]
+    async fn test_evict_skips_busy_model_lock_and_fails_closed_on_lock_io_error() {
+        let entry = key(Some("rev1"), false);
+
+        // 1. Busy model lock: non-blocking try-lock skips eviction without deleting
+        //    the registry record or files.
+        let mut busy_mock = MockRegistryBackend::new();
+        busy_mock
+            .expect_get_model_record()
+            .once()
+            .returning(|name| {
+                Ok(Some(record_with(
+                    name,
+                    ModelProvider::HuggingFace,
+                    ModelStatus::DOWNLOADED,
+                    10,
+                )))
+            });
+        busy_mock.expect_delete_model().times(0);
+
+        let (busy_service, busy_cache) =
+            service_with_mock(busy_mock, CacheEvictionConfig::default());
+        let snap = busy_cache.path().join("models--test--model/snapshots/rev1");
+        std::fs::create_dir_all(&snap).expect("create snapshot");
+        std::fs::write(snap.join("config.json"), b"{}").expect("write config");
+
+        let lock_path =
+            LockFile::model_lock_path(busy_cache.path(), ModelProvider::HuggingFace, "test/model")
+                .expect("lock path");
+        let shared =
+            LockFile::acquire_shared_timeout(&lock_path, std::time::Duration::from_secs(1))
+                .await
+                .expect("hold shared lock");
+
+        let evicted = busy_service
+            .evict_model(&entry)
+            .await
+            .expect("busy lock must skip cleanly");
+        assert!(!evicted, "busy model lock must skip eviction");
+        assert!(
+            snap.join("config.json").is_file(),
+            "files must remain untouched when model lock is busy"
+        );
+        drop(shared);
+
+        // 2. Lock I/O error: fails closed without deleting the registry record or files.
+        let mut io_mock = MockRegistryBackend::new();
+        io_mock.expect_get_model_record().once().returning(|name| {
+            Ok(Some(record_with(
+                name,
+                ModelProvider::HuggingFace,
+                ModelStatus::DOWNLOADED,
+                10,
+            )))
+        });
+        io_mock.expect_delete_model().times(0);
+
+        let (io_service, io_cache) = service_with_mock(io_mock, CacheEvictionConfig::default());
+        let io_snap = io_cache.path().join("models--test--model/snapshots/rev1");
+        std::fs::create_dir_all(&io_snap).expect("create snapshot");
+        std::fs::write(io_snap.join("config.json"), b"{}").expect("write config");
+        std::fs::write(io_cache.path().join(".mx"), b"blocker").expect("block lock dir");
+
+        let err = io_service
+            .evict_model(&entry)
+            .await
+            .expect_err("lock I/O error must fail closed");
+        assert!(
+            err.to_string().contains("lock"),
+            "expected lock error, got: {err}"
+        );
+        assert!(
+            io_snap.join("config.json").is_file(),
+            "files must remain untouched on lock I/O error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_evict_cancelled_caller_keeps_exclusive_lock_until_blocking_cleanup_ends() {
+        let entry = key(Some("rev1"), false);
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_model_record()
+            .times(2)
+            .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(|_| Ok(Vec::new()));
+
+        let (service, cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
+        let snap = cache_dir.path().join("models--test--model/snapshots/rev1");
+        std::fs::create_dir_all(&snap).expect("create snapshot");
+        std::fs::write(snap.join("config.json"), b"{}").expect("write config");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        crate::registry::cache_cleanup::register_before_cleanup_hook(cache_dir.path(), move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+
+        let cancelled = {
+            let evict_fut = service.evict_model(&entry);
+            tokio::pin!(evict_fut);
+            tokio::select! {
+                _ = &mut evict_fut => false,
+                res = entered_rx => {
+                    res.expect("blocking cleanup should enter before first file op");
+                    true
+                }
+            }
+        };
+        assert!(
+            cancelled,
+            "evict_model future must be dropped while cleanup is held"
+        );
+        assert!(
+            snap.join("config.json").is_file(),
+            "files must still exist while blocking cleanup is held before its first op"
+        );
+
+        let lock_path =
+            LockFile::model_lock_path(cache_dir.path(), ModelProvider::HuggingFace, "test/model")
+                .expect("lock path");
+        let busy =
+            LockFile::acquire_shared_timeout(&lock_path, std::time::Duration::from_millis(120))
+                .await;
+        assert!(
+            matches!(
+                busy,
+                Err(modelexpress_common::providers::lock_file::LockFileError::Busy { .. })
+            ),
+            "shared lock must stay busy while cancelled eviction's blocking cleanup runs: {busy:?}"
+        );
+
+        release_tx.send(()).expect("release blocking cleanup");
+        let _shared =
+            LockFile::acquire_shared_timeout(&lock_path, std::time::Duration::from_secs(2))
+                .await
+                .expect("shared lock must succeed once blocking cleanup finishes");
+        assert!(
+            !cache_dir.path().join("models--test--model").exists(),
+            "blocking cleanup should remove model files before releasing exclusive lock"
+        );
     }
 }

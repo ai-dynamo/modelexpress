@@ -333,7 +333,7 @@ pub fn is_weight_file(filename: &str) -> bool {
 #[cfg(feature = "gcs")]
 pub mod gcs;
 pub mod huggingface;
-pub(crate) mod lock_file;
+pub mod lock_file;
 pub mod ngc;
 #[cfg(feature = "s3")]
 pub mod s3;

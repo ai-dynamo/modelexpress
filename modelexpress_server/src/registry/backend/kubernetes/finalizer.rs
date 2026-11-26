@@ -28,15 +28,21 @@ use tracing::{debug, error, info, warn};
 
 use crate::registry::backend::ModelRecord;
 use crate::registry::backend::kubernetes::{CACHE_FILES_FINALIZER, KubernetesRegistryBackend};
-use crate::registry::cache_cleanup::{execute_cleanup_plan, plan_cleanup_for_entry};
+use crate::registry::cache_cleanup::{CleanupPlan, execute_cleanup_plan, plan_cleanup_for_entry};
+use crate::registry::entry_key::EntryKey;
 use crate::registry::k8s_types::{ModelCacheEntry, phase};
 use crate::services::DOWNLOAD_LEASE_DURATION;
+use modelexpress_common::download::canonical_model_name;
+use modelexpress_common::providers::lock_file::LockFile;
 
 /// Maximum JSON Patch retries when `resourceVersion` changes concurrently.
 const MAX_PATCH_RETRIES: usize = 5;
 
 /// Short requeue delay when a status patch loses an optimistic concurrency race.
 const REQUEUE_CONFLICT_DELAY: Duration = Duration::from_secs(1);
+
+/// Short requeue delay when the per-model advisory file lock is currently busy.
+const REQUEUE_LOCK_BUSY_DELAY: Duration = Duration::from_secs(1);
 
 /// Backoff delay when reconciliation returns an error (for example, disk cleanup failure).
 const REQUEUE_ERROR_DELAY: Duration = Duration::from_secs(5);
@@ -441,9 +447,101 @@ pub async fn reconcile_entry(
         }
     }
 
-    // Perform a single live-CR list and survivor-aware cleanup.
+    // Perform survivor-aware cleanup and finalizer removal under the per-model
+    // exclusive advisory file lock. Unknown providers and malformed targets skip
+    // disk access and never acquire a lock so invalid CRs do not wedge termination.
     match KubernetesRegistryBackend::provider_from_str(&latest.spec.provider) {
         Ok(provider) => {
+            if let CleanupPlan::InvalidTarget { reason } =
+                plan_cleanup_for_entry(provider, &latest.spec.model_name, &[])
+            {
+                warn!(
+                    "Skipping disk cleanup for terminating ModelCacheEntry '{name}' (uid={uid}) \
+                     with invalid target '{}': {reason}",
+                    latest.spec.model_name
+                );
+                remove_finalizer(&api, name, uid, latest).await?;
+                ctx.clear_writer_wait(uid);
+                return Ok(Action::await_change());
+            }
+
+            let parsed = EntryKey::parse(&latest.spec.model_name);
+            let canonical_name =
+                canonical_model_name(&parsed.model_name, provider).map_err(|e| {
+                    FinalizerError::Cleanup {
+                        name: name.to_string(),
+                        source: e,
+                    }
+                })?;
+            let lock_path =
+                LockFile::model_lock_path(&ctx.cache_directory, provider, &canonical_name)
+                    .map_err(|e| FinalizerError::Cleanup {
+                        name: name.to_string(),
+                        source: anyhow::Error::new(e),
+                    })?;
+
+            let exclusive_lock = match LockFile::try_acquire_exclusive(&lock_path).await {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    debug!(
+                        "Terminating ModelCacheEntry '{name}' (uid={uid}) model lock is busy; \
+                         requeueing in {:?}",
+                        REQUEUE_LOCK_BUSY_DELAY
+                    );
+                    return Ok(Action::requeue(REQUEUE_LOCK_BUSY_DELAY));
+                }
+                Err(err) => {
+                    error!(
+                        "Failed to acquire exclusive model lock for terminating ModelCacheEntry \
+                         '{name}' (model='{}', uid={uid}); keeping finalizer for retry: {err}",
+                        latest.spec.model_name
+                    );
+                    return Err(FinalizerError::Cleanup {
+                        name: name.to_string(),
+                        source: anyhow::Error::new(err),
+                    });
+                }
+            };
+
+            // Re-fetch and re-verify UID, terminating state, finalizer, and locked
+            // model identity under the exclusive lock before listing survivors or
+            // touching cached files.
+            let locked_latest = match api.get(name).await {
+                Ok(cr) => cr,
+                Err(err) if is_not_found(&err) => {
+                    ctx.clear_writer_wait(uid);
+                    return Ok(Action::await_change());
+                }
+                Err(err) => return Err(err.into()),
+            };
+            if locked_latest.metadata.uid.as_deref() != Some(uid)
+                || !KubernetesRegistryBackend::is_terminating(&locked_latest)
+                || !has_cache_files_finalizer(&locked_latest)
+            {
+                ctx.clear_writer_wait(uid);
+                return Ok(Action::await_change());
+            }
+
+            let spec_matches_lock =
+                KubernetesRegistryBackend::provider_from_str(&locked_latest.spec.provider)
+                    .ok()
+                    .filter(|locked_provider| *locked_provider == provider)
+                    .and_then(|locked_provider| {
+                        let locked_parsed = EntryKey::parse(&locked_latest.spec.model_name);
+                        canonical_model_name(&locked_parsed.model_name, locked_provider).ok()
+                    })
+                    .is_some_and(|locked_canonical| locked_canonical == canonical_name);
+            if !spec_matches_lock {
+                warn!(
+                    "Terminating ModelCacheEntry '{name}' (uid={uid}) changed provider or model \
+                     from ({provider:?}, '{canonical_name}') to ('{}', '{}') before lock \
+                     acquisition; releasing lock and requeueing",
+                    locked_latest.spec.provider, locked_latest.spec.model_name
+                );
+                drop(exclusive_lock);
+                return Ok(Action::requeue(REQUEUE_CONFLICT_DELAY));
+            }
+
             let list = api.list(&ListParams::default()).await?;
             let mut live_records: Vec<ModelRecord> = Vec::with_capacity(list.items.len());
             for cr in &list.items {
@@ -461,18 +559,30 @@ pub async fn reconcile_entry(
                 }
             }
 
-            let plan = plan_cleanup_for_entry(provider, &latest.spec.model_name, &live_records);
-            if let Err(err) = execute_cleanup_plan(&plan, &ctx.cache_directory).await {
-                error!(
-                    "Failed to remove cached files for terminating ModelCacheEntry '{name}' \
-                     (model='{}', uid={uid}); keeping finalizer for retry: {err}",
-                    latest.spec.model_name
-                );
-                return Err(FinalizerError::Cleanup {
-                    name: name.to_string(),
-                    source: err,
-                });
-            }
+            let plan =
+                plan_cleanup_for_entry(provider, &locked_latest.spec.model_name, &live_records);
+            let (_deleted, _exclusive_lock) = match execute_cleanup_plan(
+                &plan,
+                &ctx.cache_directory,
+                exclusive_lock,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    error!(
+                        "Failed to remove cached files for terminating ModelCacheEntry '{name}' \
+                             (model='{}', uid={uid}); keeping finalizer for retry: {err}",
+                        locked_latest.spec.model_name
+                    );
+                    return Err(FinalizerError::Cleanup {
+                        name: name.to_string(),
+                        source: err,
+                    });
+                }
+            };
+
+            remove_finalizer(&api, name, uid, locked_latest).await?;
         }
         Err(err) => {
             warn!(
@@ -480,10 +590,10 @@ pub async fn reconcile_entry(
                  with unknown provider '{}': {err}",
                 latest.spec.provider
             );
+            remove_finalizer(&api, name, uid, latest).await?;
         }
     }
 
-    remove_finalizer(&api, name, uid, latest).await?;
     ctx.clear_writer_wait(uid);
     Ok(Action::await_change())
 }
@@ -791,10 +901,11 @@ mod tests {
                 json_response(StatusCode::OK, &cr_list_json(std::slice::from_ref(&old_h)))
             }
             Method::GET => {
-                // First GET returns the terminating old CR; second GET (after 422)
-                // returns the recreated CR with a new UID.
+                // First two GETs (initial check + under-lock re-fetch) return the
+                // terminating old CR; third GET (after 422) returns the recreated CR
+                // with a new UID.
                 let call = get_c.fetch_add(1, Ordering::SeqCst);
-                if call == 0 {
+                if call < 2 {
                     json_response(StatusCode::OK, &cr_json(&old_h))
                 } else {
                     json_response(StatusCode::OK, &cr_json(&new_h))
@@ -825,7 +936,7 @@ mod tests {
             .expect("reconcile aborts cleanly on UID change");
         assert_eq!(action, Action::await_change());
         assert_eq!(patch_count.load(Ordering::SeqCst), 1);
-        assert_eq!(get_count.load(Ordering::SeqCst), 2);
+        assert_eq!(get_count.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]
@@ -856,9 +967,9 @@ mod tests {
                 Method::GET => {
                     let call = get_c.fetch_add(1, Ordering::SeqCst);
                     let resp = json_response(StatusCode::OK, &cr_json(&cr));
-                    if call == 0 {
+                    if call == 1 {
                         // Simulate concurrent foreign finalizer insertion right
-                        // after our initial read.
+                        // after the under-lock read.
                         cr.metadata.finalizers = Some(vec![
                             "foreign.io/keep".to_string(),
                             CACHE_FILES_FINALIZER.to_string(),
@@ -1177,5 +1288,585 @@ mod tests {
             model_dir.join("weights.bin").exists(),
             "surviving live CR must protect cached files"
         );
+    }
+
+    #[tokio::test]
+    async fn busy_model_lock_requeues_finalizer_and_lock_io_error_fails_closed() {
+        // 1. Held shared lock causes immediate 1 s requeue without deleting files or
+        //    removing the finalizer; once released, reconcile cleans up cleanly.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = temp_dir.path().join("s3/bucket/model");
+        fs::create_dir_all(&model_dir).expect("mkdir");
+        fs::write(model_dir.join(S3_MODEL_MARKER), b"").expect("marker");
+        fs::write(model_dir.join("weights.bin"), b"data").expect("weights");
+
+        let cr = base_cr("s3-my-model", "uid-lock-busy", "80", true);
+        let state = Arc::new(Mutex::new(cr.clone()));
+        let patch_count = Arc::new(AtomicUsize::new(0));
+        let state_h = Arc::clone(&state);
+        let patch_c = Arc::clone(&patch_count);
+
+        let client = mock_client(move |method, path, _body| {
+            let mut cur = state_h.lock().expect("lock state");
+            match method {
+                Method::GET if path.ends_with("/modelcacheentries") => {
+                    json_response(StatusCode::OK, &cr_list_json(std::slice::from_ref(&cur)))
+                }
+                Method::GET => json_response(StatusCode::OK, &cr_json(&cur)),
+                Method::PATCH => {
+                    patch_c.fetch_add(1, Ordering::SeqCst);
+                    cur.metadata.finalizers = Some(Vec::new());
+                    json_response(StatusCode::OK, &cr_json(&cur))
+                }
+                other => panic!("unexpected HTTP method {other}"),
+            }
+        });
+
+        let lock_path = LockFile::model_lock_path(
+            temp_dir.path(),
+            modelexpress_common::models::ModelProvider::S3,
+            "s3://bucket/model",
+        )
+        .expect("lock path");
+        let shared = LockFile::acquire_shared_timeout(&lock_path, Duration::from_secs(1))
+            .await
+            .expect("hold shared lock");
+
+        let ctx = Arc::new(FinalizerControllerContext::with_writer_wait(
+            client,
+            "test-ns".to_string(),
+            temp_dir.path().to_path_buf(),
+            Duration::ZERO,
+        ));
+        let busy_action = reconcile_entry(Arc::new(cr.clone()), Arc::clone(&ctx))
+            .await
+            .expect("busy lock should requeue without error");
+        assert_eq!(busy_action, Action::requeue(REQUEUE_LOCK_BUSY_DELAY));
+        assert_eq!(patch_count.load(Ordering::SeqCst), 0);
+        assert!(
+            model_dir.join("weights.bin").exists(),
+            "files must stay intact while model lock is busy"
+        );
+
+        drop(shared);
+
+        let done_action = reconcile_entry(Arc::new(cr), ctx)
+            .await
+            .expect("reconcile succeeds once lock is free");
+        assert_eq!(done_action, Action::await_change());
+        assert_eq!(patch_count.load(Ordering::SeqCst), 1);
+        assert!(
+            !model_dir.exists(),
+            "files should be removed once lock is free"
+        );
+
+        // 2. Lock I/O error fails closed, keeping finalizer attached and files intact.
+        let io_dir = tempfile::tempdir().expect("io tempdir");
+        let io_model_dir = io_dir.path().join("s3/bucket/model");
+        fs::create_dir_all(&io_model_dir).expect("mkdir");
+        fs::write(io_model_dir.join(S3_MODEL_MARKER), b"").expect("marker");
+        fs::write(io_model_dir.join("weights.bin"), b"data").expect("weights");
+        fs::write(io_dir.path().join(".mx"), b"blocker").expect("block lock dir");
+
+        let io_cr = base_cr("s3-my-model", "uid-lock-io", "81", true);
+        let io_cr_h = io_cr.clone();
+        let io_client = mock_client(move |method, _path, _body| match method {
+            Method::GET => json_response(StatusCode::OK, &cr_json(&io_cr_h)),
+            Method::PATCH => panic!("must not remove finalizer on lock I/O error"),
+            other => panic!("unexpected HTTP method {other}"),
+        });
+        let io_ctx = Arc::new(FinalizerControllerContext::with_writer_wait(
+            io_client,
+            "test-ns".to_string(),
+            io_dir.path().to_path_buf(),
+            Duration::ZERO,
+        ));
+        let err = reconcile_entry(Arc::new(io_cr), io_ctx)
+            .await
+            .expect_err("lock I/O error must fail closed");
+        assert!(matches!(err, FinalizerError::Cleanup { .. }));
+        assert!(io_model_dir.join("weights.bin").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reconcile_keeps_exclusive_lock_until_blocking_cleanup_ends() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = temp_dir.path().join("s3/bucket/model");
+        fs::create_dir_all(&model_dir).expect("mkdir");
+        fs::write(model_dir.join(S3_MODEL_MARKER), b"").expect("marker");
+        fs::write(model_dir.join("weights.bin"), b"data").expect("weights");
+
+        let cr = base_cr("s3-cancel", "uid-cancel", "82", true);
+        let cr_h = cr.clone();
+        let client = mock_client(move |method, path, _body| match method {
+            Method::GET if path.ends_with("/modelcacheentries") => {
+                json_response(StatusCode::OK, &cr_list_json(std::slice::from_ref(&cr_h)))
+            }
+            Method::GET => json_response(StatusCode::OK, &cr_json(&cr_h)),
+            Method::PATCH => panic!("cancelled reconcile must not reach finalizer patch"),
+            other => panic!("unexpected HTTP method {other}"),
+        });
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        crate::registry::cache_cleanup::register_before_cleanup_hook(temp_dir.path(), move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let ctx = Arc::new(FinalizerControllerContext::with_writer_wait(
+            client,
+            "test-ns".to_string(),
+            temp_dir.path().to_path_buf(),
+            Duration::ZERO,
+        ));
+        let cancelled = {
+            let reconcile_fut = reconcile_entry(Arc::new(cr), ctx);
+            tokio::pin!(reconcile_fut);
+            tokio::select! {
+                _ = &mut reconcile_fut => false,
+                res = entered_rx => {
+                    res.expect("blocking cleanup should enter before first file op");
+                    true
+                }
+            }
+        };
+        assert!(
+            cancelled,
+            "reconcile_entry future must be dropped while blocking cleanup is held"
+        );
+        assert!(
+            model_dir.join("weights.bin").exists(),
+            "files must still exist while blocking cleanup is held before its first op"
+        );
+
+        let lock_path = LockFile::model_lock_path(
+            temp_dir.path(),
+            modelexpress_common::models::ModelProvider::S3,
+            "s3://bucket/model",
+        )
+        .expect("lock path");
+        let busy = LockFile::acquire_shared_timeout(&lock_path, Duration::from_millis(120)).await;
+        assert!(
+            matches!(
+                busy,
+                Err(modelexpress_common::providers::lock_file::LockFileError::Busy { .. })
+            ),
+            "shared lock must stay busy while cancelled reconcile's blocking cleanup runs: {busy:?}"
+        );
+
+        release_tx.send(()).expect("release blocking cleanup");
+        let _shared = LockFile::acquire_shared_timeout(&lock_path, Duration::from_secs(2))
+            .await
+            .expect("shared lock must succeed once blocking cleanup finishes");
+        assert!(
+            !model_dir.exists(),
+            "blocking cleanup should remove model files before dropping exclusive lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn spec_change_between_two_gets_requeues_without_touching_new_model_while_same_model_revision_change_proceeds()
+     {
+        // 1. Model changes from model-a to model-b between GET 1 and locked GET 2:
+        //    must release A's lock, touch neither A nor B, keep finalizer, and requeue.
+        {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let dir_a = temp_dir.path().join("s3/bucket/model-a");
+            let dir_b = temp_dir.path().join("s3/bucket/model-b");
+            for dir in [&dir_a, &dir_b] {
+                fs::create_dir_all(dir).expect("mkdir");
+                fs::write(dir.join(S3_MODEL_MARKER), b"").expect("marker");
+                fs::write(dir.join("weights.bin"), b"keep").expect("weights");
+            }
+
+            let mut cr_a = base_cr("s3-mutated", "uid-mut", "90", true);
+            cr_a.spec.model_name = "s3://bucket/model-a".to_string();
+            let mut cr_b = cr_a.clone();
+            cr_b.spec.model_name = "s3://bucket/model-b".to_string();
+            cr_b.metadata.resource_version = Some("91".to_string());
+
+            let get_count = Arc::new(AtomicUsize::new(0));
+            let list_count = Arc::new(AtomicUsize::new(0));
+            let patch_count = Arc::new(AtomicUsize::new(0));
+            let cr_a_h = cr_a.clone();
+            let cr_b_h = cr_b.clone();
+            let get_c = Arc::clone(&get_count);
+            let list_c = Arc::clone(&list_count);
+            let patch_c = Arc::clone(&patch_count);
+
+            let client = mock_client(move |method, path, _body| match method {
+                Method::GET if path.ends_with("/modelcacheentries") => {
+                    list_c.fetch_add(1, Ordering::SeqCst);
+                    panic!("must not list survivors after model identity changed under lock");
+                }
+                Method::GET => {
+                    if get_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        json_response(StatusCode::OK, &cr_json(&cr_a_h))
+                    } else {
+                        json_response(StatusCode::OK, &cr_json(&cr_b_h))
+                    }
+                }
+                Method::PATCH => {
+                    patch_c.fetch_add(1, Ordering::SeqCst);
+                    panic!("must not remove finalizer when spec changed under wrong lock");
+                }
+                other => panic!("unexpected HTTP method {other}"),
+            });
+
+            let ctx = Arc::new(FinalizerControllerContext::with_writer_wait(
+                client,
+                "test-ns".to_string(),
+                temp_dir.path().to_path_buf(),
+                Duration::ZERO,
+            ));
+            let action = reconcile_entry(Arc::new(cr_a), ctx)
+                .await
+                .expect("spec change should requeue cleanly");
+            assert_eq!(action, Action::requeue(REQUEUE_CONFLICT_DELAY));
+            assert_eq!(get_count.load(Ordering::SeqCst), 2);
+            assert_eq!(list_count.load(Ordering::SeqCst), 0);
+            assert_eq!(patch_count.load(Ordering::SeqCst), 0);
+            assert!(
+                dir_a.join("weights.bin").exists(),
+                "A files must stay intact"
+            );
+            assert!(
+                dir_b.join("weights.bin").exists(),
+                "B files must stay intact"
+            );
+
+            let lock_a = LockFile::model_lock_path(
+                temp_dir.path(),
+                modelexpress_common::models::ModelProvider::S3,
+                "s3://bucket/model-a",
+            )
+            .expect("lock path A");
+            assert!(
+                LockFile::try_acquire_exclusive(&lock_a)
+                    .await
+                    .expect("try_acquire_exclusive A")
+                    .is_some(),
+                "lock A must be released on requeue"
+            );
+        }
+
+        // 2. Provider changes between GET 1 (S3) and GET 2 (GCS): same requeue guard.
+        {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let cr_s3 = base_cr("provider-mutated", "uid-prov", "92", true);
+            let mut cr_gcs = cr_s3.clone();
+            cr_gcs.spec.provider = "Gcs".to_string();
+            cr_gcs.spec.model_name = "gs://bucket/model".to_string();
+
+            let get_count = Arc::new(AtomicUsize::new(0));
+            let cr_s3_h = cr_s3.clone();
+            let cr_gcs_h = cr_gcs.clone();
+            let get_c = Arc::clone(&get_count);
+            let client = mock_client(move |method, path, _body| match method {
+                Method::GET if path.ends_with("/modelcacheentries") => {
+                    panic!("must not list survivors after provider changed under lock");
+                }
+                Method::GET => {
+                    if get_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        json_response(StatusCode::OK, &cr_json(&cr_s3_h))
+                    } else {
+                        json_response(StatusCode::OK, &cr_json(&cr_gcs_h))
+                    }
+                }
+                Method::PATCH => panic!("must not remove finalizer when provider changed"),
+                other => panic!("unexpected HTTP method {other}"),
+            });
+
+            let ctx = Arc::new(FinalizerControllerContext::with_writer_wait(
+                client,
+                "test-ns".to_string(),
+                temp_dir.path().to_path_buf(),
+                Duration::ZERO,
+            ));
+            let action = reconcile_entry(Arc::new(cr_s3), ctx)
+                .await
+                .expect("provider change should requeue cleanly");
+            assert_eq!(action, Action::requeue(REQUEUE_CONFLICT_DELAY));
+        }
+
+        // 3. Same-model revision change (HuggingFace rev1 -> rev2) keeps the same lock key
+        //    and proceeds without requeueing.
+        {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let snap_rev1 = temp_dir.path().join("models--org--model/snapshots/rev1");
+            let snap_rev2 = temp_dir.path().join("models--org--model/snapshots/rev2");
+            for snap in [&snap_rev1, &snap_rev2] {
+                fs::create_dir_all(snap).expect("mkdir");
+                fs::write(snap.join("config.json"), b"{}").expect("write config");
+            }
+
+            let rev1_key = EntryKey::new("org/model", Some("rev1".to_string()), false).to_string();
+            let rev2_key = EntryKey::new("org/model", Some("rev2".to_string()), false).to_string();
+            let mut cr_rev1 = base_cr("hf-same-model", "uid-hf", "94", true);
+            cr_rev1.spec.provider = "HuggingFace".to_string();
+            cr_rev1.spec.model_name = rev1_key.clone();
+            let mut cr_rev2 = cr_rev1.clone();
+            cr_rev2.spec.model_name = rev2_key;
+
+            let mut survivor_rev1 = base_cr("hf-survivor", "uid-surv", "95", false);
+            survivor_rev1.spec.provider = "HuggingFace".to_string();
+            survivor_rev1.spec.model_name = rev1_key;
+
+            let get_count = Arc::new(AtomicUsize::new(0));
+            let patch_count = Arc::new(AtomicUsize::new(0));
+            let cr_rev1_h = cr_rev1.clone();
+            let cr_rev2_h = cr_rev2.clone();
+            let surv_h = survivor_rev1.clone();
+            let get_c = Arc::clone(&get_count);
+            let patch_c = Arc::clone(&patch_count);
+            let client = mock_client(move |method, path, _body| match method {
+                Method::GET if path.ends_with("/modelcacheentries") => json_response(
+                    StatusCode::OK,
+                    &cr_list_json(&[cr_rev2_h.clone(), surv_h.clone()]),
+                ),
+                Method::GET => {
+                    if get_c.fetch_add(1, Ordering::SeqCst) == 0 {
+                        json_response(StatusCode::OK, &cr_json(&cr_rev1_h))
+                    } else {
+                        json_response(StatusCode::OK, &cr_json(&cr_rev2_h))
+                    }
+                }
+                Method::PATCH => {
+                    patch_c.fetch_add(1, Ordering::SeqCst);
+                    let mut patched = cr_rev2_h.clone();
+                    patched.metadata.finalizers = Some(Vec::new());
+                    json_response(StatusCode::OK, &cr_json(&patched))
+                }
+                other => panic!("unexpected HTTP method {other}"),
+            });
+
+            let ctx = Arc::new(FinalizerControllerContext::with_writer_wait(
+                client,
+                "test-ns".to_string(),
+                temp_dir.path().to_path_buf(),
+                Duration::ZERO,
+            ));
+            let action = reconcile_entry(Arc::new(cr_rev1), ctx)
+                .await
+                .expect("same-model revision change should proceed without requeue");
+            assert_eq!(action, Action::await_change());
+            assert_eq!(patch_count.load(Ordering::SeqCst), 1);
+            assert!(
+                snap_rev1.join("config.json").exists(),
+                "surviving rev1 stays"
+            );
+            assert!(
+                !snap_rev2.exists(),
+                "locked rev2 snapshot should be removed"
+            );
+        }
+    }
+
+    /// Ruling ^138 P2 / ^140 / ^141 item 8: many concurrent waiters polling a terminating
+    /// CR (60 waiters x 20 ms claim latency, 20 ms poll interval) must hold ZERO shared
+    /// file locks, so the Kubernetes finalizer acquires the exclusive lock on its very
+    /// first try, deletes the files, and strips the finalizer without requeueing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn many_waiters_on_terminating_cr_hold_no_shared_lock_and_finalizer_acquires_exclusive() {
+        use crate::metrics::registry::{DownloadMetrics, RegistryMetrics};
+        use crate::registry::backend::{ClaimOutcome, RegistryBackend, RegistryResult};
+        use crate::registry::state::RegistryManager;
+        use crate::services::{DownloadTarget, LeaseTimings, ModelDownloadTracker};
+        use modelexpress_common::models::{ModelProvider, ModelStatus};
+
+        struct SlowTerminatingBackend {
+            claim_polls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl RegistryBackend for SlowTerminatingBackend {
+            async fn connect(&self) -> RegistryResult<()> {
+                Ok(())
+            }
+            async fn get_status(&self, _model_name: &str) -> RegistryResult<Option<ModelStatus>> {
+                Ok(Some(ModelStatus::DOWNLOADING))
+            }
+            async fn get_model_record(
+                &self,
+                _model_name: &str,
+            ) -> RegistryResult<Option<ModelRecord>> {
+                Ok(None)
+            }
+            async fn set_status(
+                &self,
+                _model_name: &str,
+                _provider: ModelProvider,
+                _status: ModelStatus,
+                _message: Option<String>,
+            ) -> RegistryResult<()> {
+                Ok(())
+            }
+            async fn touch_model(&self, _model_name: &str) -> RegistryResult<()> {
+                Ok(())
+            }
+            async fn delete_model(&self, _model_name: &str) -> RegistryResult<()> {
+                Ok(())
+            }
+            async fn get_models_by_last_used(
+                &self,
+                _limit: Option<u32>,
+            ) -> RegistryResult<Vec<ModelRecord>> {
+                Ok(Vec::new())
+            }
+            async fn get_status_counts(&self) -> RegistryResult<(u32, u32, u32)> {
+                Ok((1, 0, 0))
+            }
+            async fn try_claim_for_download(
+                &self,
+                _model_name: &str,
+                _provider: ModelProvider,
+                _claim_id: &str,
+                _lease_duration: Duration,
+            ) -> RegistryResult<ClaimOutcome> {
+                // Emulate a 20 ms API server round-trip returning DOWNLOADING while
+                // the CR is terminating (Odo ^138 starvation setup).
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                self.claim_polls.fetch_add(1, Ordering::SeqCst);
+                Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING))
+            }
+            async fn try_reset_error_for_retry(
+                &self,
+                _model_name: &str,
+                _provider: ModelProvider,
+                _claim_id: &str,
+                _lease_duration: Duration,
+            ) -> RegistryResult<bool> {
+                Ok(false)
+            }
+            async fn try_reclaim_downloaded(
+                &self,
+                _model_name: &str,
+                _provider: ModelProvider,
+                _claim_id: &str,
+                _lease_duration: Duration,
+            ) -> RegistryResult<bool> {
+                Ok(false)
+            }
+            async fn refresh_download_claim(
+                &self,
+                _model_name: &str,
+                _provider: ModelProvider,
+                _claim_id: &str,
+                _lease_duration: Duration,
+            ) -> RegistryResult<bool> {
+                Ok(false)
+            }
+            async fn finish_download_claim(
+                &self,
+                _model_name: &str,
+                _provider: ModelProvider,
+                _claim_id: &str,
+                _status: ModelStatus,
+                _message: Option<String>,
+            ) -> RegistryResult<bool> {
+                Ok(false)
+            }
+        }
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let model_dir = temp_dir.path().join("s3/bucket/model");
+        fs::create_dir_all(&model_dir).expect("mkdir");
+        fs::write(model_dir.join(S3_MODEL_MARKER), b"").expect("marker");
+        fs::write(model_dir.join("weights.bin"), b"data").expect("weights");
+
+        let claim_polls = Arc::new(AtomicUsize::new(0));
+        let registry = Arc::new(RegistryManager::with_backend(Arc::new(
+            SlowTerminatingBackend {
+                claim_polls: Arc::clone(&claim_polls),
+            },
+        )));
+        let mut metrics_reg = crate::metrics::new_registry();
+        let tracker = ModelDownloadTracker::new(
+            registry,
+            temp_dir.path().to_path_buf(),
+            DownloadMetrics::register(&mut metrics_reg),
+            RegistryMetrics::register(&mut metrics_reg),
+        )
+        .with_lease_timings(LeaseTimings {
+            poll_interval: Duration::from_millis(20),
+            ..LeaseTimings::default()
+        });
+
+        let target = DownloadTarget {
+            model_name: "s3://bucket/model".to_string(),
+            provider: ModelProvider::S3,
+            revision: None,
+            ignore_weights: true,
+        };
+        let mut waiter_rxs = Vec::with_capacity(60);
+        let mut waiter_handles = Vec::with_capacity(60);
+        for _ in 0..60 {
+            let (tx, rx) = tokio::sync::mpsc::channel(4);
+            let t = tracker.clone();
+            let tgt = target.clone();
+            waiter_rxs.push(rx);
+            waiter_handles.push(tokio::spawn(async move {
+                t.ensure_model_downloaded(&tgt, &tx).await
+            }));
+        }
+
+        // Wait until the 60 waiters are actively polling concurrently.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while claim_polls.load(Ordering::SeqCst) < 120 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "waiters should complete at least 120 polls"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Finalizer reconciles the terminating CR while all 60 waiters continue polling:
+        // must acquire the exclusive lock on attempt 1 without requeueing.
+        let cr = base_cr("s3-many-waiters", "uid-many-waiters", "99", true);
+        let state = Arc::new(Mutex::new(cr.clone()));
+        let state_h = Arc::clone(&state);
+        let patch_count = Arc::new(AtomicUsize::new(0));
+        let patch_c = Arc::clone(&patch_count);
+        let client = mock_client(move |method, path, _body| {
+            let mut cur = state_h.lock().expect("lock");
+            match method {
+                Method::GET if path.ends_with("/modelcacheentries") => {
+                    json_response(StatusCode::OK, &cr_list_json(std::slice::from_ref(&cur)))
+                }
+                Method::GET => json_response(StatusCode::OK, &cr_json(&cur)),
+                Method::PATCH => {
+                    patch_c.fetch_add(1, Ordering::SeqCst);
+                    cur.metadata.finalizers = Some(Vec::new());
+                    json_response(StatusCode::OK, &cr_json(&cur))
+                }
+                other => panic!("unexpected HTTP method {other}"),
+            }
+        });
+        let ctx = Arc::new(FinalizerControllerContext::with_writer_wait(
+            client,
+            "test-ns".to_string(),
+            temp_dir.path().to_path_buf(),
+            Duration::ZERO,
+        ));
+
+        let action = reconcile_entry(Arc::new(cr), ctx)
+            .await
+            .expect("finalizer must succeed while 60 waiters poll");
+        assert_eq!(
+            action,
+            Action::await_change(),
+            "finalizer must acquire exclusive lock immediately, not requeue due to waiter lock starvation"
+        );
+        assert_eq!(patch_count.load(Ordering::SeqCst), 1);
+        assert!(!model_dir.exists(), "cached files must be removed");
+
+        // Disconnect all waiters so their tasks exit cleanly.
+        drop(waiter_rxs);
+        for handle in waiter_handles {
+            let _ = tokio::time::timeout(Duration::from_secs(2), handle)
+                .await
+                .expect("waiter exit timeout");
+        }
     }
 }

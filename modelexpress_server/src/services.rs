@@ -5,7 +5,7 @@ use crate::metrics::grpc::RpcOutcome;
 use crate::metrics::registry::{DownloadMetrics, RegistryMetrics, StatusLabel};
 use crate::registry::backend::ClaimOutcome;
 use crate::registry::cache_cleanup::{
-    execute_cleanup_plan, plan_cleanup_for_model, record_belongs_to_model,
+    CleanupPlan, execute_cleanup_plan, plan_cleanup_for_model, record_belongs_to_model,
 };
 use crate::registry::entry_key::EntryKey;
 use crate::registry::state::RegistryManager;
@@ -23,7 +23,7 @@ use modelexpress_common::{
         },
     },
     models::{ModelProvider, ModelStatus},
-    providers::is_weight_file,
+    providers::{is_weight_file, lock_file::LockFile},
 };
 use std::{
     collections::HashMap,
@@ -793,14 +793,17 @@ impl UpdateIdentity<'_> {
     }
 }
 
-/// Lease, poll, and fence timings for download ownership and deferred deletion.
+/// Lease, poll, lock, and fence timings for download ownership and deferred deletion.
 #[derive(Clone, Copy, Debug)]
-struct LeaseTimings {
-    lease_duration: std::time::Duration,
-    heartbeat_interval: std::time::Duration,
-    self_fence_duration: std::time::Duration,
-    deferred_delete_delay: std::time::Duration,
-    poll_interval: std::time::Duration,
+pub(crate) struct LeaseTimings {
+    pub(crate) lease_duration: std::time::Duration,
+    pub(crate) heartbeat_interval: std::time::Duration,
+    pub(crate) self_fence_duration: std::time::Duration,
+    pub(crate) deferred_delete_delay: std::time::Duration,
+    pub(crate) poll_interval: std::time::Duration,
+    pub(crate) shared_lock_timeout: std::time::Duration,
+    pub(crate) handler_exclusive_lock_timeout: std::time::Duration,
+    pub(crate) deferred_exclusive_lock_timeout: std::time::Duration,
 }
 
 impl Default for LeaseTimings {
@@ -811,6 +814,9 @@ impl Default for LeaseTimings {
             self_fence_duration: DOWNLOAD_SELF_FENCE_DURATION,
             deferred_delete_delay: DOWNLOAD_LEASE_DURATION,
             poll_interval: DOWNLOAD_POLL_INTERVAL,
+            shared_lock_timeout: MODEL_SHARED_LOCK_TIMEOUT,
+            handler_exclusive_lock_timeout: MODEL_HANDLER_EXCLUSIVE_LOCK_TIMEOUT,
+            deferred_exclusive_lock_timeout: MODEL_DEFERRED_EXCLUSIVE_LOCK_TIMEOUT,
         }
     }
 }
@@ -838,6 +844,11 @@ pub(crate) const DOWNLOAD_LEASE_DURATION: std::time::Duration = std::time::Durat
 const DOWNLOAD_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const DOWNLOAD_SELF_FENCE_DURATION: std::time::Duration = std::time::Duration::from_secs(25);
 const DOWNLOAD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const MODEL_SHARED_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MODEL_HANDLER_EXCLUSIVE_LOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(20);
+const MODEL_DEFERRED_EXCLUSIVE_LOCK_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(35);
 
 impl ModelDownloadTracker {
     pub fn new(
@@ -859,7 +870,7 @@ impl ModelDownloadTracker {
     }
 
     #[cfg(test)]
-    fn with_lease_timings(mut self, lease_timings: LeaseTimings) -> Self {
+    pub(crate) fn with_lease_timings(mut self, lease_timings: LeaseTimings) -> Self {
         self.lease_timings = lease_timings;
         self
     }
@@ -969,25 +980,22 @@ impl ModelDownloadTracker {
                 let tracker = self.clone();
                 let deferred_model = model_name.to_string();
                 let delay = self.lease_timings.deferred_delete_delay;
+                let lock_timeout = self.lease_timings.deferred_exclusive_lock_timeout;
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let live_records = match tracker.registry.get_models_by_last_used(None).await {
-                        Ok(records) => records,
-                        Err(err) => {
-                            error!(
-                                "Deferred cleanup for '{deferred_model}' failed to list live \
-                                 registry records after lease window: {err}. Run 'model clear' \
-                                 to reclaim leftover files."
-                            );
-                            return;
-                        }
-                    };
-                    let plan = plan_cleanup_for_model(provider, &deferred_model, &live_records);
-                    if let Err(err) = execute_cleanup_plan(&plan, &tracker.cache_directory).await {
+                    let outcome = tracker
+                        .cleanup_model_files_locked(
+                            provider,
+                            &deferred_model,
+                            removed,
+                            lock_timeout,
+                        )
+                        .await;
+                    if !outcome.success {
                         error!(
-                            "Deferred cleanup for '{deferred_model}' failed to remove cached \
-                             files after lease window: {err}. Run 'model clear' to reclaim \
-                             leftover files."
+                            "Deferred cleanup for '{deferred_model}' failed after lease window: \
+                             {}. Run 'model clear' to reclaim leftover files.",
+                            outcome.message
                         );
                     }
                 });
@@ -1003,6 +1011,115 @@ impl ModelDownloadTracker {
             };
         }
 
+        self.cleanup_model_files_locked(
+            provider,
+            model_name,
+            removed,
+            self.lease_timings.handler_exclusive_lock_timeout,
+        )
+        .await
+    }
+
+    /// Reclaim cached files for `(provider, model_name)` under the per-model exclusive
+    /// advisory file lock.
+    ///
+    /// Fast-paths a non-blocking exclusive try-lock when uncontended; when the lock is
+    /// busy, lists surviving registry records first so any protecting live record returns
+    /// immediate `Keep` without waiting, and otherwise waits up to `lock_timeout`
+    /// (20 s in the `DeleteModel` handler path so default 30 s clients receive a
+    /// retryable `success: false`, or 35 s in deferred cleanup) before failing closed
+    /// without touching disk.
+    async fn cleanup_model_files_locked(
+        &self,
+        provider: ModelProvider,
+        model_name: &str,
+        removed: usize,
+        lock_timeout: std::time::Duration,
+    ) -> DeleteModelOutcome {
+        let Ok(canonical_name) = download::canonical_model_name(model_name, provider) else {
+            return DeleteModelOutcome {
+                success: true,
+                message: format!(
+                    "Model '{model_name}' removed from registry ({removed} record(s)) and cache"
+                ),
+                rpc_outcome: RpcOutcome::Ok,
+            };
+        };
+
+        let lock_path =
+            match LockFile::model_lock_path(&self.cache_directory, provider, &canonical_name) {
+                Ok(path) => path,
+                Err(err) => {
+                    error!(
+                        "Deleted {removed} registry record(s) for '{model_name}', but failed to \
+                         derive model lock path: {err}"
+                    );
+                    return DeleteModelOutcome::cleanup_error(format!(
+                        "Removed {removed} registry record(s) for '{model_name}', but failed to \
+                         derive model lock path: {err}"
+                    ));
+                }
+            };
+
+        let exclusive_lock = match LockFile::try_acquire_exclusive(&lock_path).await {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                // Lock is currently held. Check surviving registry records before waiting
+                // so a live record returns immediate `Keep` without waiting on the lock.
+                let pre_records = match self.registry.get_models_by_last_used(None).await {
+                    Ok(records) => records,
+                    Err(err) => {
+                        error!(
+                            "Deleted {removed} registry record(s) for '{model_name}', but failed \
+                             to list surviving records before file cleanup: {err}"
+                        );
+                        return DeleteModelOutcome::backend_error(format!(
+                            "Failed to list surviving registry records for '{model_name}' after \
+                             deleting {removed} record(s): {err}"
+                        ));
+                    }
+                };
+                if matches!(
+                    plan_cleanup_for_model(provider, &canonical_name, &pre_records),
+                    CleanupPlan::Keep { .. } | CleanupPlan::InvalidTarget { .. }
+                ) {
+                    return DeleteModelOutcome {
+                        success: true,
+                        message: format!(
+                            "Model '{model_name}' removed from registry ({removed} record(s)); \
+                             cached files kept because live registry entries still reference them"
+                        ),
+                        rpc_outcome: RpcOutcome::Ok,
+                    };
+                }
+
+                match LockFile::acquire_exclusive_timeout(&lock_path, lock_timeout).await {
+                    Ok(lock) => lock,
+                    Err(err) => {
+                        error!(
+                            "Deleted {removed} registry record(s) for '{model_name}', but could \
+                             not acquire exclusive model lock before file cleanup: {err}"
+                        );
+                        return DeleteModelOutcome::cleanup_error(format!(
+                            "Removed {removed} registry record(s) for '{model_name}', but could \
+                             not acquire model file lock ({err}); retry 'model clear' to reclaim \
+                             cached files"
+                        ));
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    "Deleted {removed} registry record(s) for '{model_name}', but model file lock \
+                     failed: {err}"
+                );
+                return DeleteModelOutcome::cleanup_error(format!(
+                    "Removed {removed} registry record(s) for '{model_name}', but model file lock \
+                     failed: {err}"
+                ));
+            }
+        };
+
         let remaining_records = match self.registry.get_models_by_last_used(None).await {
             Ok(records) => records,
             Err(err) => {
@@ -1017,8 +1134,8 @@ impl ModelDownloadTracker {
             }
         };
 
-        let plan = plan_cleanup_for_model(provider, model_name, &remaining_records);
-        if let Err(err) = execute_cleanup_plan(&plan, &self.cache_directory).await {
+        let plan = plan_cleanup_for_model(provider, &canonical_name, &remaining_records);
+        if let Err(err) = execute_cleanup_plan(&plan, &self.cache_directory, exclusive_lock).await {
             error!(
                 "Deleted {removed} registry record(s) for '{model_name}', but failed to remove \
                  cached files: {err}"
@@ -1150,9 +1267,11 @@ impl ModelDownloadTracker {
         }
     }
 
-    /// Spawn a background task that downloads the model and finishes its registry claim
-    /// on success or failure. Waiters observe the terminal status via registry polling;
-    /// the background task does not push terminal notifications directly to streams.
+    /// Spawn a background task that acquires the shared per-model file lock inside
+    /// the lease-fence future, verifies claim ownership under that lock before any
+    /// provider write, runs the download, and finishes its registry claim on success
+    /// or failure. Waiters observe the terminal status via registry polling; the
+    /// background task does not push terminal notifications directly to streams.
     fn spawn_download_task(
         &self,
         target: DownloadTarget,
@@ -1171,24 +1290,90 @@ impl ModelDownloadTracker {
                 ignore_weights,
             } = target;
             let cache_dir = tracker.cache_directory.clone();
+            let tracker_for_download = tracker.clone();
+            let entry_key_for_download = entry_key.clone();
+            let claim_id_for_download = claim_id.clone();
+            let timings = tracker.lease_timings;
             #[cfg(test)]
             let download_override = tracker.download_override.clone();
             let download = async {
-                #[cfg(test)]
-                if let Some(override_fn) = download_override {
-                    return override_fn(&cache_dir);
-                }
-                download::download_model_revision(
-                    &model_name,
-                    provider,
-                    Some(cache_dir),
-                    ignore_weights,
-                    revision.as_deref(),
+                let canonical_name = download::canonical_model_name(&model_name, provider)
+                    .map_err(|err| anyhow::anyhow!("Invalid model name '{model_name}': {err}"))?;
+                let lock_path = LockFile::model_lock_path(&cache_dir, provider, &canonical_name)
+                    .map_err(|err| anyhow::anyhow!("Failed to derive model lock path: {err}"))?;
+                let model_lock =
+                    LockFile::acquire_shared_timeout(&lock_path, timings.shared_lock_timeout)
+                        .await
+                        .map_err(|err| {
+                            anyhow::anyhow!("Failed to acquire model cache lock: {err}")
+                        })?;
+
+                // Mandatory post-lock claim verification before any provider write.
+                // Runs inside the outer lease-fence future so a held reply cannot pin
+                // the shared lock past the self-fence deadline; the per-call timeout
+                // also bounds a single stalled reply if heartbeats keep renewing.
+                match tokio::time::timeout(
+                    timings.self_fence_duration,
+                    tracker_for_download.registry.refresh_download_claim(
+                        &entry_key_for_download,
+                        provider,
+                        &claim_id_for_download,
+                        timings.lease_duration,
+                    ),
                 )
                 .await
-                .map(|_| ())
+                {
+                    Ok(Ok(true)) => {}
+                    Ok(Ok(false)) => {
+                        warn!(
+                            "Stopping download for {model_name}: lease ownership was lost \
+                             before write"
+                        );
+                        drop(model_lock);
+                        return Ok(None);
+                    }
+                    Ok(Err(err)) => {
+                        drop(model_lock);
+                        return Err(anyhow::anyhow!(
+                            "Failed to verify download claim under model lock: {err}"
+                        ));
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Stopping download for {model_name}: pre-write claim check timed out"
+                        );
+                        drop(model_lock);
+                        return Err(anyhow::anyhow!(
+                            "Timed out verifying download claim under model lock"
+                        ));
+                    }
+                }
+
+                let outcome = async {
+                    #[cfg(test)]
+                    if let Some(override_fn) = download_override {
+                        return override_fn(&cache_dir);
+                    }
+                    download::download_model_revision(
+                        &model_name,
+                        provider,
+                        Some(cache_dir),
+                        ignore_weights,
+                        revision.as_deref(),
+                    )
+                    .await
+                    .map(|_| ())
+                }
+                .await;
+
+                // The outer download future has finished; release the shared file lock
+                // before publishing registry status so a stalled completion reply cannot
+                // pin the lock. Detached subtasks (such as `hf-hub` chunk tasks) and
+                // already-dispatched blocking filesystem calls remain a documented limit.
+                drop(model_lock);
+                outcome.map(Some)
             };
-            let Some((result, lease_expiry)) = tracker
+            let fenced_outcome = tracker
                 .run_download_with_lease_fence(
                     &entry_key,
                     &model_name,
@@ -1197,9 +1382,16 @@ impl ModelDownloadTracker {
                     claim_started_at,
                     download,
                 )
-                .await
-            else {
+                .await;
+
+            let Some((result, lease_expiry)) = fenced_outcome else {
                 return;
+            };
+
+            let result = match result {
+                Ok(Some(())) => Ok(()),
+                Ok(None) => return,
+                Err(err) => Err(err),
             };
 
             let (status, message) = match result {
@@ -1427,8 +1619,7 @@ impl ModelDownloadTracker {
             let _waiting_guard = WaitingModelGuard::acquire(&self.waiting_models, entry_key);
 
             // Spawn the download only on the replica that won the claim (fresh
-            // download) or won the ERROR-retry CAS. Every request observes
-            // completion via the registry poll loop below.
+            // download) or won the ERROR-retry CAS.
             if let Some(claim_started_at) = initial_claim_started_at.or(retry_claim_started_at) {
                 let retry = status == ModelStatus::ERROR;
                 self.spawn_download_task(target.clone(), retry, claim_id, claim_started_at);
@@ -4068,12 +4259,22 @@ mod tests {
 
         async fn try_reclaim_downloaded(
             &self,
-            _model_name: &str,
-            _provider: ModelProvider,
-            _claim_id: &str,
+            model_name: &str,
+            provider: ModelProvider,
+            claim_id: &str,
             _lease_duration: std::time::Duration,
         ) -> crate::registry::backend::RegistryResult<bool> {
-            Ok(false)
+            let mut records = self.records.lock().expect("records lock");
+            let Some(existing) = records.iter_mut().find(|r| r.model_name == model_name) else {
+                return Ok(false);
+            };
+            if existing.status != ModelStatus::DOWNLOADED {
+                return Ok(false);
+            }
+            existing.provider = provider;
+            existing.status = ModelStatus::DOWNLOADING;
+            *self.active_claim_id.lock().expect("claim lock") = Some(claim_id.to_string());
+            Ok(true)
         }
 
         async fn refresh_download_claim(
@@ -4279,6 +4480,7 @@ mod tests {
             self_fence_duration: std::time::Duration::from_millis(300),
             deferred_delete_delay: std::time::Duration::from_millis(400),
             poll_interval: std::time::Duration::from_millis(50),
+            ..LeaseTimings::default()
         })
         .with_download_override(Arc::new(move |cache_dir| {
             if let Ok(mut slot) = download_started_tx.lock()
@@ -4504,5 +4706,1095 @@ mod tests {
                 .expect("read B config"),
             "{\"gen\":\"B\"}"
         );
+    }
+
+    /// Case 8d (Option A lock, ^141 claim -> lock -> verify -> write): the deleter
+    /// deletes the record, acquires the exclusive lock, reads an empty survivor list,
+    /// and pauses with that reply held before deleting files. A concurrent request
+    /// claims DOWNLOADING without taking a file lock, spawns its download task, and
+    /// blocks on the shared lock with zero provider writes until deletion finishes;
+    /// once deletion releases the exclusive lock, the writer acquires the shared lock,
+    /// confirms its claim via `refresh_download_claim`, and writes a complete snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_model_lock_serializes_concurrent_claim_vs_delete_case_8d() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_s3_model_files(temp_dir.path(), "bucket/lock-8d", b"{\"v\":\"old\"}")
+            .expect("seed old files");
+
+        let (list_entered_tx, list_entered_rx) = tokio::sync::oneshot::channel();
+        let (list_release_tx, list_release_rx) = tokio::sync::oneshot::channel();
+
+        struct HoldSecondListBackend {
+            inner: RelayTestBackend,
+            list_calls: std::sync::atomic::AtomicUsize,
+            list_entered_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            list_release_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::registry::backend::RegistryBackend for HoldSecondListBackend {
+            async fn connect(&self) -> crate::registry::backend::RegistryResult<()> {
+                Ok(())
+            }
+            async fn get_status(
+                &self,
+                model_name: &str,
+            ) -> crate::registry::backend::RegistryResult<Option<ModelStatus>> {
+                self.inner.get_status(model_name).await
+            }
+            async fn get_model_record(
+                &self,
+                model_name: &str,
+            ) -> crate::registry::backend::RegistryResult<
+                Option<crate::registry::backend::ModelRecord>,
+            > {
+                self.inner.get_model_record(model_name).await
+            }
+            async fn set_status(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                status: ModelStatus,
+                message: Option<String>,
+            ) -> crate::registry::backend::RegistryResult<()> {
+                self.inner
+                    .set_status(model_name, provider, status, message)
+                    .await
+            }
+            async fn touch_model(
+                &self,
+                model_name: &str,
+            ) -> crate::registry::backend::RegistryResult<()> {
+                self.inner.touch_model(model_name).await
+            }
+            async fn delete_model(
+                &self,
+                model_name: &str,
+            ) -> crate::registry::backend::RegistryResult<()> {
+                self.inner.delete_model(model_name).await
+            }
+            async fn get_models_by_last_used(
+                &self,
+                limit: Option<u32>,
+            ) -> crate::registry::backend::RegistryResult<Vec<crate::registry::backend::ModelRecord>>
+            {
+                let call = self
+                    .list_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let records = self.inner.get_models_by_last_used(limit).await?;
+                if call == 1 {
+                    if let Some(tx) = self.list_entered_tx.lock().expect("tx").take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = self.list_release_rx.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                }
+                Ok(records)
+            }
+            async fn get_status_counts(
+                &self,
+            ) -> crate::registry::backend::RegistryResult<(u32, u32, u32)> {
+                self.inner.get_status_counts().await
+            }
+            async fn try_claim_for_download(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                lease_duration: std::time::Duration,
+            ) -> crate::registry::backend::RegistryResult<ClaimOutcome> {
+                self.inner
+                    .try_claim_for_download(model_name, provider, claim_id, lease_duration)
+                    .await
+            }
+            async fn try_reset_error_for_retry(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                lease_duration: std::time::Duration,
+            ) -> crate::registry::backend::RegistryResult<bool> {
+                self.inner
+                    .try_reset_error_for_retry(model_name, provider, claim_id, lease_duration)
+                    .await
+            }
+            async fn try_reclaim_downloaded(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                lease_duration: std::time::Duration,
+            ) -> crate::registry::backend::RegistryResult<bool> {
+                self.inner
+                    .try_reclaim_downloaded(model_name, provider, claim_id, lease_duration)
+                    .await
+            }
+            async fn refresh_download_claim(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                lease_duration: std::time::Duration,
+            ) -> crate::registry::backend::RegistryResult<bool> {
+                self.inner
+                    .refresh_download_claim(model_name, provider, claim_id, lease_duration)
+                    .await
+            }
+            async fn finish_download_claim(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                status: ModelStatus,
+                message: Option<String>,
+            ) -> crate::registry::backend::RegistryResult<bool> {
+                self.inner
+                    .finish_download_claim(model_name, provider, claim_id, status, message)
+                    .await
+            }
+        }
+
+        let inner = RelayTestBackend::default();
+        inner
+            .records
+            .lock()
+            .expect("records")
+            .push(record_with_provider(
+                "s3://bucket/lock-8d",
+                ModelProvider::S3,
+                ModelStatus::DOWNLOADED,
+            ));
+        let claim_calls = Arc::clone(&inner.claim_calls);
+        let backend = Arc::new(HoldSecondListBackend {
+            inner,
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+            list_entered_tx: Mutex::new(Some(list_entered_tx)),
+            list_release_rx: tokio::sync::Mutex::new(Some(list_release_rx)),
+        });
+
+        let registry = Arc::new(RegistryManager::with_backend(backend));
+        let mut reg = crate::metrics::new_registry();
+        let provider_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_writes_c = Arc::clone(&provider_writes);
+        let tracker = ModelDownloadTracker::new(
+            registry,
+            temp_dir.path().to_path_buf(),
+            DownloadMetrics::register(&mut reg),
+            RegistryMetrics::register(&mut reg),
+        )
+        .with_lease_timings(LeaseTimings {
+            poll_interval: std::time::Duration::from_millis(50),
+            ..LeaseTimings::default()
+        })
+        .with_download_override(Arc::new(move |cache_dir| {
+            provider_writes_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_s3_model_files(cache_dir, "bucket/lock-8d", b"{\"v\":\"new\"}")
+        }));
+
+        // Start delete; it deletes the DOWNLOADED record, acquires the exclusive lock,
+        // reads an empty survivor list, and pauses before removing files.
+        let del_tracker = tracker.clone();
+        let del_handle = tokio::spawn(async move {
+            del_tracker
+                .delete_model_entries(ModelProvider::S3, "s3://bucket/lock-8d")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), list_entered_rx)
+            .await
+            .expect("delete should reach under-lock survivor list")
+            .expect("entered");
+
+        // Concurrently start a new download claim for the same model.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let dl_tracker = tracker.clone();
+        let target = DownloadTarget {
+            model_name: "s3://bucket/lock-8d".to_string(),
+            provider: ModelProvider::S3,
+            revision: None,
+            ignore_weights: true,
+        };
+        let dl_handle =
+            tokio::spawn(async move { dl_tracker.ensure_model_downloaded(&target, &tx).await });
+
+        // Under ^141 order, the request claims without taking the file lock and emits
+        // DOWNLOADING, while the spawned download task blocks on the shared lock with
+        // zero provider writes until deletion finishes.
+        let initial_update = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("initial update timeout")
+            .expect("stream open")
+            .expect("ok update");
+        assert_eq!(
+            initial_update.status,
+            modelexpress_common::grpc::model::ModelStatus::Downloading as i32
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        assert!(
+            claim_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "request should claim without waiting on the file lock"
+        );
+        assert_eq!(
+            provider_writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "download task must perform zero provider writes while delete holds exclusive lock"
+        );
+
+        // Release delete: it removes the old files and releases the exclusive lock;
+        // the download task then acquires the shared lock, verifies its claim, and
+        // writes its fresh snapshot.
+        let _ = list_release_tx.send(());
+        let del_outcome = tokio::time::timeout(std::time::Duration::from_secs(2), del_handle)
+            .await
+            .expect("delete timeout")
+            .expect("delete join");
+        assert!(del_outcome.success, "{}", del_outcome.message);
+
+        let dl_status = tokio::time::timeout(std::time::Duration::from_secs(2), dl_handle)
+            .await
+            .expect("download timeout")
+            .expect("download join");
+        assert_eq!(dl_status, ModelStatus::DOWNLOADED);
+        assert_eq!(provider_writes.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.path().join("s3/bucket/lock-8d/config.json"))
+                .expect("read new config"),
+            "{\"v\":\"new\"}"
+        );
+    }
+
+    /// Option A lock (^52 items 2 & 10, ^139 item 1): handler exclusive lock wait is
+    /// strictly shorter than the 30 s default client timeout (<= 20 s), busy `DeleteModel`
+    /// returns immediate `Keep` when a live survivor stays, and otherwise fails closed
+    /// with a retryable `success: false` without deleting files.
+    #[tokio::test]
+    async fn test_delete_model_immediate_keep_when_lock_busy_and_bounded_timeout_when_empty() {
+        assert!(
+            LeaseTimings::default().handler_exclusive_lock_timeout
+                <= std::time::Duration::from_secs(20),
+            "DeleteModel handler lock wait must stay <= 20 s (under 30 s default client timeout)"
+        );
+
+        // 1. Live protecting S3 ancestor stays while lock is busy -> immediate Keep
+        //    without waiting for the handler exclusive lock timeout.
+        {
+            let temp_dir = TempDir::new().expect("temp dir");
+            write_s3_model_files(temp_dir.path(), "bucket/parent/child", b"{}")
+                .expect("seed child");
+
+            let mut mock = crate::registry::backend::MockRegistryBackend::new();
+            let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let list_calls_c = Arc::clone(&list_calls);
+            mock.expect_get_models_by_last_used()
+                .times(2)
+                .returning(move |_| {
+                    if list_calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Ok(vec![
+                            record_with_provider(
+                                "s3://bucket/parent",
+                                ModelProvider::S3,
+                                ModelStatus::DOWNLOADED,
+                            ),
+                            record_with_provider(
+                                "s3://bucket/parent/child",
+                                ModelProvider::S3,
+                                ModelStatus::DOWNLOADED,
+                            ),
+                        ])
+                    } else {
+                        Ok(vec![record_with_provider(
+                            "s3://bucket/parent",
+                            ModelProvider::S3,
+                            ModelStatus::DOWNLOADED,
+                        )])
+                    }
+                });
+            mock.expect_delete_model()
+                .with(mockall::predicate::eq("s3://bucket/parent/child"))
+                .once()
+                .returning(|_| Ok(()));
+
+            let tracker = tracker_with_mock_and_cache_dir(mock, temp_dir.path().to_path_buf())
+                .with_lease_timings(LeaseTimings {
+                    handler_exclusive_lock_timeout: std::time::Duration::from_secs(20),
+                    ..LeaseTimings::default()
+                });
+
+            let lock_path = LockFile::model_lock_path(
+                temp_dir.path(),
+                ModelProvider::S3,
+                "s3://bucket/parent/child",
+            )
+            .expect("lock path");
+            let _held_shared =
+                LockFile::acquire_shared_timeout(&lock_path, std::time::Duration::from_secs(1))
+                    .await
+                    .expect("hold shared lock");
+
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tracker.delete_model_entries(ModelProvider::S3, "s3://bucket/parent/child"),
+            )
+            .await
+            .expect("Keep must return immediately without waiting on busy lock");
+            assert!(outcome.success, "{}", outcome.message);
+            assert!(
+                temp_dir
+                    .path()
+                    .join("s3/bucket/parent/child/config.json")
+                    .is_file()
+            );
+        }
+
+        // 2. Zero live survivors while lock is busy -> waits bounded timeout, returns
+        //    retryable success: false without removing files; retry after unlock removes files.
+        {
+            let temp_dir = TempDir::new().expect("temp dir");
+            write_s3_model_files(temp_dir.path(), "bucket/busy-empty", b"{}").expect("seed model");
+
+            let backend = Arc::new(RelayTestBackend::default());
+            backend
+                .records
+                .lock()
+                .expect("records")
+                .push(record_with_provider(
+                    "s3://bucket/busy-empty",
+                    ModelProvider::S3,
+                    ModelStatus::DOWNLOADED,
+                ));
+            let registry = Arc::new(RegistryManager::with_backend(backend));
+            let mut reg = crate::metrics::new_registry();
+            let tracker = ModelDownloadTracker::new(
+                registry,
+                temp_dir.path().to_path_buf(),
+                DownloadMetrics::register(&mut reg),
+                RegistryMetrics::register(&mut reg),
+            )
+            .with_lease_timings(LeaseTimings {
+                handler_exclusive_lock_timeout: std::time::Duration::from_millis(120),
+                ..LeaseTimings::default()
+            });
+
+            let lock_path = LockFile::model_lock_path(
+                temp_dir.path(),
+                ModelProvider::S3,
+                "s3://bucket/busy-empty",
+            )
+            .expect("lock path");
+            let held_shared =
+                LockFile::acquire_shared_timeout(&lock_path, std::time::Duration::from_secs(1))
+                    .await
+                    .expect("hold shared lock");
+
+            let busy_outcome = tracker
+                .delete_model_entries(ModelProvider::S3, "s3://bucket/busy-empty")
+                .await;
+            assert!(!busy_outcome.success);
+            assert_eq!(busy_outcome.rpc_outcome, RpcOutcome::Error);
+            assert!(
+                busy_outcome.message.contains("retry"),
+                "busy delete outcome should instruct caller to retry: {}",
+                busy_outcome.message
+            );
+            assert!(
+                temp_dir
+                    .path()
+                    .join("s3/bucket/busy-empty/config.json")
+                    .is_file(),
+                "files must stay intact when exclusive lock times out"
+            );
+
+            drop(held_shared);
+
+            let retry_outcome = tracker
+                .delete_model_entries(ModelProvider::S3, "s3://bucket/busy-empty")
+                .await;
+            assert!(retry_outcome.success, "{}", retry_outcome.message);
+            assert!(!temp_dir.path().join("s3/bucket/busy-empty").exists());
+        }
+    }
+
+    /// Ruling ^140 / ^141 item 8: eviction reads an eligible DOWNLOADED record under its
+    /// exclusive lock; a concurrent request reclaims that stale record to DOWNLOADING
+    /// (without taking the file lock) and its download task waits for the shared lock;
+    /// eviction's unconditional `delete_model` removes the new claim and releases the
+    /// exclusive lock. The writer then acquires the shared lock, runs the mandatory
+    /// post-lock `refresh_download_claim` -> `Ok(false)`, releases the lock, and performs
+    /// ZERO provider writes (leaving no files and no registry record).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_eviction_removes_claim_while_writer_waits_for_lock_zero_provider_writes() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (locked_get_tx, locked_get_rx) = tokio::sync::oneshot::channel();
+        let (allow_delete_tx, allow_delete_rx) = tokio::sync::oneshot::channel();
+        let (refresh_false_tx, refresh_false_rx) = tokio::sync::oneshot::channel();
+
+        struct EvictionRaceBackend {
+            inner: RelayTestBackend,
+            get_record_calls: std::sync::atomic::AtomicUsize,
+            reclaim_calls: std::sync::atomic::AtomicUsize,
+            locked_get_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+            allow_delete_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+            refresh_false_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::registry::backend::RegistryBackend for EvictionRaceBackend {
+            async fn connect(&self) -> crate::registry::backend::RegistryResult<()> {
+                Ok(())
+            }
+            async fn get_status(
+                &self,
+                model_name: &str,
+            ) -> crate::registry::backend::RegistryResult<Option<ModelStatus>> {
+                self.inner.get_status(model_name).await
+            }
+            async fn get_model_record(
+                &self,
+                model_name: &str,
+            ) -> crate::registry::backend::RegistryResult<
+                Option<crate::registry::backend::ModelRecord>,
+            > {
+                let call = self
+                    .get_record_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let rec = self.inner.get_model_record(model_name).await?;
+                if call == 1 {
+                    // Eviction's under-lock status check saw DOWNLOADED; hold before
+                    // returning so the concurrent request reclaims the stale entry and
+                    // queues on the shared lock while eviction still holds the exclusive lock.
+                    if let Some(tx) = self.locked_get_tx.lock().expect("tx").take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = self.allow_delete_rx.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                }
+                Ok(rec)
+            }
+            async fn set_status(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                status: ModelStatus,
+                message: Option<String>,
+            ) -> crate::registry::backend::RegistryResult<()> {
+                self.inner
+                    .set_status(model_name, provider, status, message)
+                    .await
+            }
+            async fn touch_model(
+                &self,
+                model_name: &str,
+            ) -> crate::registry::backend::RegistryResult<()> {
+                self.inner.touch_model(model_name).await
+            }
+            async fn delete_model(
+                &self,
+                model_name: &str,
+            ) -> crate::registry::backend::RegistryResult<()> {
+                self.inner.delete_model(model_name).await
+            }
+            async fn get_models_by_last_used(
+                &self,
+                limit: Option<u32>,
+            ) -> crate::registry::backend::RegistryResult<Vec<crate::registry::backend::ModelRecord>>
+            {
+                self.inner.get_models_by_last_used(limit).await
+            }
+            async fn get_status_counts(
+                &self,
+            ) -> crate::registry::backend::RegistryResult<(u32, u32, u32)> {
+                self.inner.get_status_counts().await
+            }
+            async fn try_claim_for_download(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                lease_duration: std::time::Duration,
+            ) -> crate::registry::backend::RegistryResult<ClaimOutcome> {
+                self.inner
+                    .try_claim_for_download(model_name, provider, claim_id, lease_duration)
+                    .await
+            }
+            async fn try_reset_error_for_retry(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                lease_duration: std::time::Duration,
+            ) -> crate::registry::backend::RegistryResult<bool> {
+                self.inner
+                    .try_reset_error_for_retry(model_name, provider, claim_id, lease_duration)
+                    .await
+            }
+            async fn try_reclaim_downloaded(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                lease_duration: std::time::Duration,
+            ) -> crate::registry::backend::RegistryResult<bool> {
+                let won = self
+                    .inner
+                    .try_reclaim_downloaded(model_name, provider, claim_id, lease_duration)
+                    .await?;
+                if won {
+                    self.reclaim_calls
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                Ok(won)
+            }
+            async fn refresh_download_claim(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                lease_duration: std::time::Duration,
+            ) -> crate::registry::backend::RegistryResult<bool> {
+                let ok = self
+                    .inner
+                    .refresh_download_claim(model_name, provider, claim_id, lease_duration)
+                    .await?;
+                if !ok && let Some(tx) = self.refresh_false_tx.lock().expect("tx").take() {
+                    let _ = tx.send(());
+                }
+                Ok(ok)
+            }
+            async fn finish_download_claim(
+                &self,
+                model_name: &str,
+                provider: ModelProvider,
+                claim_id: &str,
+                status: ModelStatus,
+                message: Option<String>,
+            ) -> crate::registry::backend::RegistryResult<bool> {
+                self.inner
+                    .finish_download_claim(model_name, provider, claim_id, status, message)
+                    .await
+            }
+        }
+
+        let target = DownloadTarget {
+            model_name: "s3://bucket/evict-race".to_string(),
+            provider: ModelProvider::S3,
+            revision: None,
+            ignore_weights: true,
+        };
+        let entry_key = target.entry_key();
+
+        let inner = RelayTestBackend::default();
+        inner
+            .records
+            .lock()
+            .expect("records")
+            .push(record_with_provider(
+                &entry_key,
+                ModelProvider::S3,
+                ModelStatus::DOWNLOADED,
+            ));
+        let records_handle = Arc::clone(&inner.records);
+        let backend = Arc::new(EvictionRaceBackend {
+            inner,
+            get_record_calls: std::sync::atomic::AtomicUsize::new(0),
+            reclaim_calls: std::sync::atomic::AtomicUsize::new(0),
+            locked_get_tx: Mutex::new(Some(locked_get_tx)),
+            allow_delete_rx: tokio::sync::Mutex::new(Some(allow_delete_rx)),
+            refresh_false_tx: Mutex::new(Some(refresh_false_tx)),
+        });
+        let backend_handle = Arc::clone(&backend);
+        let registry = Arc::new(RegistryManager::with_backend(backend));
+        let mut reg = crate::metrics::new_registry();
+        let eviction_service = crate::cache::CacheEvictionService::new(
+            Arc::clone(&registry),
+            crate::cache::CacheEvictionConfig::default(),
+            temp_dir.path().to_path_buf(),
+            crate::metrics::cache::CacheMetrics::register(&mut reg),
+        );
+        let provider_writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider_writes_c = Arc::clone(&provider_writes);
+        let tracker = ModelDownloadTracker::new(
+            Arc::clone(&registry),
+            temp_dir.path().to_path_buf(),
+            DownloadMetrics::register(&mut reg),
+            RegistryMetrics::register(&mut reg),
+        )
+        .with_lease_timings(LeaseTimings {
+            poll_interval: std::time::Duration::from_secs(60),
+            ..LeaseTimings::default()
+        })
+        .with_download_override(Arc::new(move |cache_dir| {
+            provider_writes_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_s3_model_files(cache_dir, "bucket/evict-race", b"{\"bad\":true}")
+        }));
+
+        // 1. Start eviction; wait until it holds the exclusive lock right after its
+        //    under-lock get_model_record observed DOWNLOADED.
+        let evict_entry_key = entry_key.clone();
+        let evict_handle =
+            tokio::spawn(async move { eviction_service.evict_model(&evict_entry_key).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), locked_get_rx)
+            .await
+            .expect("eviction should reach under-lock get_model_record")
+            .expect("entered");
+
+        // 2. Concurrent request sees stale DOWNLOADED (no files on disk), reclaims it
+        //    to DOWNLOADING, and spawns a download task that blocks on the shared lock.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let dl_tracker = tracker.clone();
+        let dl_handle =
+            tokio::spawn(async move { dl_tracker.ensure_model_downloaded(&target, &tx).await });
+
+        let initial_update = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("request should reclaim without waiting on lock")
+            .expect("stream open")
+            .expect("ok update");
+        assert_eq!(
+            initial_update.status,
+            modelexpress_common::grpc::model::ModelStatus::Downloading as i32
+        );
+        assert_eq!(
+            backend_handle
+                .reclaim_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        // Disconnect the client waiter so only the spawned download task continues.
+        drop(rx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), dl_handle)
+            .await
+            .expect("disconnected waiter exits cleanly")
+            .expect("waiter join");
+        assert_eq!(
+            provider_writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "writer must not write while eviction holds exclusive lock"
+        );
+
+        // 3. Release eviction: it deletes the newly reclaimed DOWNLOADING record and
+        //    releases the exclusive lock.
+        let _ = allow_delete_tx.send(());
+        let evicted = tokio::time::timeout(std::time::Duration::from_secs(2), evict_handle)
+            .await
+            .expect("eviction timeout")
+            .expect("eviction join")
+            .expect("eviction ok");
+        assert!(evicted);
+
+        // 4. Writer acquires shared lock, runs mandatory refresh_download_claim -> false,
+        //    releases the lock, and performs zero provider writes.
+        tokio::time::timeout(std::time::Duration::from_secs(2), refresh_false_rx)
+            .await
+            .expect("writer should run post-lock refresh_download_claim and observe false")
+            .expect("refresh false observed");
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        assert_eq!(
+            provider_writes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "writer whose claim was evicted while waiting for lock must perform zero provider writes"
+        );
+        assert!(
+            !temp_dir.path().join("s3/bucket/evict-race").exists(),
+            "no unowned files may be written to disk"
+        );
+        assert!(
+            records_handle.lock().expect("records").is_empty(),
+            "evicted writer must not publish DOWNLOADED or ERROR after losing ownership"
+        );
+        let lock_path =
+            LockFile::model_lock_path(temp_dir.path(), ModelProvider::S3, "s3://bucket/evict-race")
+                .expect("lock path");
+        assert!(
+            LockFile::try_acquire_exclusive(&lock_path)
+                .await
+                .expect("try_acquire_exclusive")
+                .is_some(),
+            "writer must release shared lock immediately after refresh_download_claim returns false"
+        );
+    }
+
+    /// Ruling ^131 / ^139 item 4: cancelling `cleanup_model_files_locked` while its
+    /// blocking cleanup job is held before its first file operation keeps the exclusive
+    /// lock held until the blocking job completes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cancelled_delete_keeps_exclusive_lock_until_blocking_cleanup_ends() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        write_s3_model_files(temp_dir.path(), "bucket/cancel-del", b"{}").expect("seed model");
+
+        let backend = Arc::new(RelayTestBackend::default());
+        let registry = Arc::new(RegistryManager::with_backend(backend));
+        let mut reg = crate::metrics::new_registry();
+        let tracker = ModelDownloadTracker::new(
+            registry,
+            temp_dir.path().to_path_buf(),
+            DownloadMetrics::register(&mut reg),
+            RegistryMetrics::register(&mut reg),
+        );
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        crate::registry::cache_cleanup::register_before_cleanup_hook(temp_dir.path(), move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+
+        let cancelled = {
+            let cleanup_fut = tracker.cleanup_model_files_locked(
+                ModelProvider::S3,
+                "s3://bucket/cancel-del",
+                1,
+                std::time::Duration::from_secs(5),
+            );
+            tokio::pin!(cleanup_fut);
+            tokio::select! {
+                _ = &mut cleanup_fut => false,
+                res = entered_rx => {
+                    res.expect("blocking cleanup should start before first file op");
+                    true
+                }
+            }
+        };
+        assert!(
+            cancelled,
+            "cleanup_model_files_locked future must be dropped while cleanup is held"
+        );
+        assert!(
+            temp_dir
+                .path()
+                .join("s3/bucket/cancel-del/config.json")
+                .is_file(),
+            "files must still exist while blocking cleanup is paused"
+        );
+
+        let lock_path =
+            LockFile::model_lock_path(temp_dir.path(), ModelProvider::S3, "s3://bucket/cancel-del")
+                .expect("lock path");
+        let busy =
+            LockFile::acquire_shared_timeout(&lock_path, std::time::Duration::from_millis(120))
+                .await;
+        assert!(
+            matches!(
+                busy,
+                Err(modelexpress_common::providers::lock_file::LockFileError::Busy { .. })
+            ),
+            "shared lock must remain busy while cancelled delete's blocking job runs: {busy:?}"
+        );
+
+        release_tx.send(()).expect("release blocking cleanup");
+        let _shared =
+            LockFile::acquire_shared_timeout(&lock_path, std::time::Duration::from_secs(2))
+                .await
+                .expect("shared lock must succeed once blocking cleanup finishes");
+        assert!(
+            !temp_dir.path().join("s3/bucket/cancel-del").exists(),
+            "blocking cleanup should finish deleting files before dropping exclusive lock"
+        );
+    }
+
+    /// Ruling ^139 item 5 & ^140: download task's shared lock wait is bounded and ends
+    /// with ERROR (zero writes) on timeout or lock I/O error; a held pre-write
+    /// `refresh_download_claim` reply is bounded by the outer lease fence and releases
+    /// the shared lock without releasing the held reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_download_task_bounded_shared_lock_timeout_io_error_and_held_prewrite_check() {
+        // 1. Busy exclusive lock past shared_lock_timeout -> ERROR, zero provider writes.
+        {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let lock_path = LockFile::model_lock_path(
+                temp_dir.path(),
+                ModelProvider::S3,
+                "s3://bucket/lock-timeout",
+            )
+            .expect("lock path");
+            let _held_exclusive = LockFile::try_acquire_exclusive(&lock_path)
+                .await
+                .expect("try_acquire_exclusive")
+                .expect("hold exclusive lock");
+
+            let backend = Arc::new(RelayTestBackend::default());
+            let registry = Arc::new(RegistryManager::with_backend(backend));
+            let mut reg = crate::metrics::new_registry();
+            let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let writes_c = Arc::clone(&writes);
+            let tracker = ModelDownloadTracker::new(
+                registry,
+                temp_dir.path().to_path_buf(),
+                DownloadMetrics::register(&mut reg),
+                RegistryMetrics::register(&mut reg),
+            )
+            .with_lease_timings(LeaseTimings {
+                poll_interval: std::time::Duration::from_millis(40),
+                shared_lock_timeout: std::time::Duration::from_millis(120),
+                ..LeaseTimings::default()
+            })
+            .with_download_override(Arc::new(move |cache_dir| {
+                writes_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                write_s3_model_files(cache_dir, "bucket/lock-timeout", b"{}")
+            }));
+
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let target = DownloadTarget {
+                model_name: "s3://bucket/lock-timeout".to_string(),
+                provider: ModelProvider::S3,
+                revision: None,
+                ignore_weights: true,
+            };
+            let status = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tracker.ensure_model_downloaded(&target, &tx),
+            )
+            .await
+            .expect("bounded lock timeout must finish promptly");
+            assert_eq!(status, ModelStatus::ERROR);
+            assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        // 2. Lock I/O error -> fail closed with ERROR, zero provider writes.
+        {
+            let temp_dir = TempDir::new().expect("temp dir");
+            std::fs::write(temp_dir.path().join(".mx"), b"blocker").expect("block lock dir");
+
+            let backend = Arc::new(RelayTestBackend::default());
+            let registry = Arc::new(RegistryManager::with_backend(backend));
+            let mut reg = crate::metrics::new_registry();
+            let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let writes_c = Arc::clone(&writes);
+            let tracker = ModelDownloadTracker::new(
+                registry,
+                temp_dir.path().to_path_buf(),
+                DownloadMetrics::register(&mut reg),
+                RegistryMetrics::register(&mut reg),
+            )
+            .with_lease_timings(LeaseTimings {
+                poll_interval: std::time::Duration::from_millis(40),
+                ..LeaseTimings::default()
+            })
+            .with_download_override(Arc::new(move |cache_dir| {
+                writes_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                write_s3_model_files(cache_dir, "bucket/lock-io", b"{}")
+            }));
+
+            let (tx, _rx) = tokio::sync::mpsc::channel(8);
+            let target = DownloadTarget {
+                model_name: "s3://bucket/lock-io".to_string(),
+                provider: ModelProvider::S3,
+                revision: None,
+                ignore_weights: true,
+            };
+            let status = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tracker.ensure_model_downloaded(&target, &tx),
+            )
+            .await
+            .expect("lock I/O error must finish promptly");
+            assert_eq!(status, ModelStatus::ERROR);
+            assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+
+        // 3. Held pre-write refresh_download_claim reply: outer lease fence drops the
+        //    future and releases the shared lock without releasing the held reply.
+        {
+            let temp_dir = TempDir::new().expect("temp dir");
+            let (refresh_entered_tx, refresh_entered_rx) = tokio::sync::oneshot::channel();
+            let (_hold_refresh_tx, hold_refresh_rx) = tokio::sync::oneshot::channel::<()>();
+
+            struct HoldPreWriteRefreshBackend {
+                inner: RelayTestBackend,
+                entered_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+                hold_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+            }
+
+            #[async_trait::async_trait]
+            impl crate::registry::backend::RegistryBackend for HoldPreWriteRefreshBackend {
+                async fn connect(&self) -> crate::registry::backend::RegistryResult<()> {
+                    Ok(())
+                }
+                async fn get_status(
+                    &self,
+                    model_name: &str,
+                ) -> crate::registry::backend::RegistryResult<Option<ModelStatus>> {
+                    self.inner.get_status(model_name).await
+                }
+                async fn get_model_record(
+                    &self,
+                    model_name: &str,
+                ) -> crate::registry::backend::RegistryResult<
+                    Option<crate::registry::backend::ModelRecord>,
+                > {
+                    self.inner.get_model_record(model_name).await
+                }
+                async fn set_status(
+                    &self,
+                    model_name: &str,
+                    provider: ModelProvider,
+                    status: ModelStatus,
+                    message: Option<String>,
+                ) -> crate::registry::backend::RegistryResult<()> {
+                    self.inner
+                        .set_status(model_name, provider, status, message)
+                        .await
+                }
+                async fn touch_model(
+                    &self,
+                    model_name: &str,
+                ) -> crate::registry::backend::RegistryResult<()> {
+                    self.inner.touch_model(model_name).await
+                }
+                async fn delete_model(
+                    &self,
+                    model_name: &str,
+                ) -> crate::registry::backend::RegistryResult<()> {
+                    self.inner.delete_model(model_name).await
+                }
+                async fn get_models_by_last_used(
+                    &self,
+                    limit: Option<u32>,
+                ) -> crate::registry::backend::RegistryResult<
+                    Vec<crate::registry::backend::ModelRecord>,
+                > {
+                    self.inner.get_models_by_last_used(limit).await
+                }
+                async fn get_status_counts(
+                    &self,
+                ) -> crate::registry::backend::RegistryResult<(u32, u32, u32)> {
+                    self.inner.get_status_counts().await
+                }
+                async fn try_claim_for_download(
+                    &self,
+                    model_name: &str,
+                    provider: ModelProvider,
+                    claim_id: &str,
+                    lease_duration: std::time::Duration,
+                ) -> crate::registry::backend::RegistryResult<ClaimOutcome> {
+                    self.inner
+                        .try_claim_for_download(model_name, provider, claim_id, lease_duration)
+                        .await
+                }
+                async fn try_reset_error_for_retry(
+                    &self,
+                    model_name: &str,
+                    provider: ModelProvider,
+                    claim_id: &str,
+                    lease_duration: std::time::Duration,
+                ) -> crate::registry::backend::RegistryResult<bool> {
+                    self.inner
+                        .try_reset_error_for_retry(model_name, provider, claim_id, lease_duration)
+                        .await
+                }
+                async fn try_reclaim_downloaded(
+                    &self,
+                    model_name: &str,
+                    provider: ModelProvider,
+                    claim_id: &str,
+                    lease_duration: std::time::Duration,
+                ) -> crate::registry::backend::RegistryResult<bool> {
+                    self.inner
+                        .try_reclaim_downloaded(model_name, provider, claim_id, lease_duration)
+                        .await
+                }
+                async fn refresh_download_claim(
+                    &self,
+                    _model_name: &str,
+                    _provider: ModelProvider,
+                    _claim_id: &str,
+                    _lease_duration: std::time::Duration,
+                ) -> crate::registry::backend::RegistryResult<bool> {
+                    if let Some(tx) = self.entered_tx.lock().expect("tx").take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = self.hold_rx.lock().await.take() {
+                        let _ = rx.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(true)
+                }
+                async fn finish_download_claim(
+                    &self,
+                    model_name: &str,
+                    provider: ModelProvider,
+                    claim_id: &str,
+                    status: ModelStatus,
+                    message: Option<String>,
+                ) -> crate::registry::backend::RegistryResult<bool> {
+                    self.inner
+                        .finish_download_claim(model_name, provider, claim_id, status, message)
+                        .await
+                }
+            }
+
+            let backend = Arc::new(HoldPreWriteRefreshBackend {
+                inner: RelayTestBackend::default(),
+                entered_tx: Mutex::new(Some(refresh_entered_tx)),
+                hold_rx: tokio::sync::Mutex::new(Some(hold_refresh_rx)),
+            });
+            let registry = Arc::new(RegistryManager::with_backend(backend));
+            let mut reg = crate::metrics::new_registry();
+            let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let writes_c = Arc::clone(&writes);
+            let tracker = ModelDownloadTracker::new(
+                registry,
+                temp_dir.path().to_path_buf(),
+                DownloadMetrics::register(&mut reg),
+                RegistryMetrics::register(&mut reg),
+            )
+            .with_lease_timings(LeaseTimings {
+                lease_duration: std::time::Duration::from_millis(250),
+                heartbeat_interval: std::time::Duration::from_millis(80),
+                self_fence_duration: std::time::Duration::from_millis(160),
+                poll_interval: std::time::Duration::from_secs(60),
+                ..LeaseTimings::default()
+            })
+            .with_download_override(Arc::new(move |cache_dir| {
+                writes_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                write_s3_model_files(cache_dir, "bucket/held-refresh", b"{}")
+            }));
+
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let target = DownloadTarget {
+                model_name: "s3://bucket/held-refresh".to_string(),
+                provider: ModelProvider::S3,
+                revision: None,
+                ignore_weights: true,
+            };
+            let dl_tracker = tracker.clone();
+            let dl_handle =
+                tokio::spawn(async move { dl_tracker.ensure_model_downloaded(&target, &tx).await });
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .expect("initial update");
+            drop(rx);
+            let _ = dl_handle.await;
+
+            tokio::time::timeout(std::time::Duration::from_secs(2), refresh_entered_rx)
+                .await
+                .expect("writer should reach post-lock refresh_download_claim")
+                .expect("entered");
+
+            let lock_path = LockFile::model_lock_path(
+                temp_dir.path(),
+                ModelProvider::S3,
+                "s3://bucket/held-refresh",
+            )
+            .expect("lock path");
+            // While refresh_download_claim is held inside the fence window, shared lock is held.
+            assert!(
+                LockFile::try_acquire_exclusive(&lock_path)
+                    .await
+                    .expect("try_acquire_exclusive")
+                    .is_none(),
+                "shared lock must be held during pre-write refresh_download_claim"
+            );
+
+            // Once self_fence_duration elapses, the fence drops the future and releases
+            // the shared lock WITHOUT releasing `_hold_refresh_tx`.
+            let _exclusive =
+                LockFile::acquire_exclusive_timeout(&lock_path, std::time::Duration::from_secs(2))
+                    .await
+                    .expect("fence must release shared lock even while refresh reply stays held");
+            assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 }

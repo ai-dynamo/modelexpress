@@ -250,16 +250,59 @@ Roles/ClusterRoles include `watch` on `modelcacheentries` before upgrading.
     not preempt an in-flight `tokio::fs` / `spawn_blocking` write; there is no
     time bound on when it finishes, so the lease wait does not prove that all
     writes have stopped.
-  - **Concurrent claim during file deletion (no per-model file lock)**: A new
-    download claimed in the window between the survivor listing and filesystem
-    deletion can race with the delete. For Hugging Face and NGC, this can leave
-    the model marked `DOWNLOADED` with a partial snapshot on disk (`hf-hub`
-    recreates deleted directories with `create_dir_all` and writes remaining
-    files, and HF/NGC presence checks accept a single readable file) and the
-    server serves that partial snapshot as ready until the model is deleted
-    (`modelexpress-cli model clear` or `kubectl delete mxcache`). S3 and GCS
-    detect incomplete snapshots via their completion marker (`.mx-model`) or
-    manifest.
+  - **Per-model advisory file lock requirements and limits**: Active download
+    tasks, `DeleteModel`, LRU eviction, and the Kubernetes finalizer coordinate
+    on one `flock` file per `(provider, canonical_model_name)` under
+    `<cache>/.mx/locks/` (lock files are never deleted), closing concurrent
+    claim-vs-delete partial snapshots when the cache volume supports cross-node
+    `flock`. Requests, wait-loop polls, cache hits, `ListModelFiles`, and
+    `StreamModelFiles` do not acquire the file lock; the download task acquires
+    the shared lock after winning its claim, verifies claim ownership with
+    `refresh_download_claim` before any provider write, holds the lock across
+    provider I/O, and releases it before publishing completion. Remaining
+    limits:
+    - **Sibling revision deletes wait for same-model downloads**: Because the
+      lock is scoped per model rather than per revision, deleting or evicting
+      one Hugging Face revision waits until in-flight downloads of other
+      revisions of that model finish. `DeleteModel` waits up to 20 s and then
+      returns a retryable `success: false`; eviction skips the busy model until
+      a later cycle; on Kubernetes the `ModelCacheEntry` stays in `Terminating`
+      (retrying every 1 s) and requests for that revision wait until sibling
+      downloads finish.
+    - **Fail-closed on filesystems that refuse locks (including S3)**: If
+      opening or locking `<cache>/.mx/locks/` fails with `ENOLCK`,
+      `EOPNOTSUPP`, `ENOSYS`, or another I/O error, downloads fail with `ERROR`
+      without writing files, and deletion, eviction, and finalizer cleanup fail
+      closed rather than proceeding unlocked across all four providers
+      (including S3). On such a filesystem, `DeleteModel` (including for S3
+      models) removes the registry record(s) and returns `success: false` while
+      leaving cached files on disk — retrying `DeleteModel` cannot remove those
+      files until locking works, so an operator must remove them manually from
+      the cache directory. On Kubernetes, the finalizer controller fails closed
+      and retries every 5 s, keeping each deleted `ModelCacheEntry` in
+      `Terminating`; recover by fixing `flock` support on the cache volume or,
+      to force removal, run the finalizer-strip `kubectl patch` loop above and
+      remove the cached files manually.
+    - **Host-local lock mounts**: Shared mounts configured with host-local
+      locking (such as NFS `nolock` or `local_lock=all`) only serialize callers
+      on the same node; cross-node concurrent claim-vs-delete operations can
+      still race on those mounts.
+    - **`flock` writer starvation and busy timeouts**: `flock` has no writer
+      priority, so continuous overlapping active downloads of the same model
+      can starve an exclusive delete. `DeleteModel` checks live records first
+      (returning immediate `Keep` if any protecting record stays) and otherwise
+      waits up to 20 s in the handler path (shorter than the 30 s default
+      client timeout) or 35 s in deferred post-lease cleanup before returning a
+      retryable `success: false` without deleting files; download tasks wait up
+      to 30 s before ending in `ERROR`; eviction skips busy models; the
+      Kubernetes finalizer requeues after 1 s.
+    - **Non-atomic eviction status read and record delete**: Eviction verifies
+      that an entry is `DOWNLOADED` under the exclusive lock and then issues an
+      unconditional record delete. A concurrent stale-`DOWNLOADED` reclaim can
+      still race between those two registry calls, causing eviction to remove
+      the new claim; the writer's post-lock `refresh_download_claim` check then
+      detects the missing claim and performs zero provider writes (leaving no
+      unowned files).
   - **Rolling upgrades**: Older replicas lack the 25-second writer self-fence
     and can continue writing after the lease wait elapses during a rolling
     upgrade.

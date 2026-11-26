@@ -15,6 +15,7 @@ use std::path::Path;
 use modelexpress_common::download::{canonical_model_name, get_provider};
 use modelexpress_common::models::{ModelProvider, ModelStatus};
 use modelexpress_common::providers::HuggingFaceProvider;
+use modelexpress_common::providers::lock_file::ExclusiveLockGuard;
 use tracing::{debug, warn};
 
 use crate::registry::backend::ModelRecord;
@@ -328,21 +329,60 @@ pub fn plan_cleanup_for_model(
     }
 }
 
-/// Execute a [`CleanupPlan`] against `cache_dir`.
+#[cfg(test)]
+type BeforeCleanupHook = Box<dyn FnOnce() + Send>;
+
+#[cfg(test)]
+fn before_cleanup_hooks()
+-> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, BeforeCleanupHook>> {
+    static HOOKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, BeforeCleanupHook>>,
+    > = std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn register_before_cleanup_hook(cache_dir: &Path, hook: impl FnOnce() + Send + 'static) {
+    let mut map = before_cleanup_hooks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    map.insert(cache_dir.to_path_buf(), Box::new(hook));
+}
+
+#[cfg(test)]
+fn run_before_cleanup_hook(cache_dir: &Path) {
+    let hook = {
+        let mut map = before_cleanup_hooks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.remove(cache_dir)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Execute a [`CleanupPlan`] against `cache_dir` while owning `exclusive_lock` inside
+/// the blocking filesystem cleanup task.
 ///
-/// Runs synchronous filesystem removals on Tokio's blocking thread pool so
-/// deleting large model directories does not stall async worker threads.
-/// Returns `Ok(true)` if disk cleanup was executed, or `Ok(false)` if files were kept
-/// (`Keep`) or refused (`InvalidTarget`).
-pub async fn execute_cleanup_plan(plan: &CleanupPlan, cache_dir: &Path) -> anyhow::Result<bool> {
+/// Moving `exclusive_lock` into `spawn_blocking` ensures cancelling or dropping the
+/// async caller cannot release the advisory lock while queued or running filesystem
+/// removals are still in flight. Returns `(deleted, exclusive_lock)` on completion so
+/// callers (such as the Kubernetes finalizer controller) can keep holding the lock
+/// across subsequent steps such as finalizer removal.
+pub async fn execute_cleanup_plan(
+    plan: &CleanupPlan,
+    cache_dir: &Path,
+    exclusive_lock: ExclusiveLockGuard,
+) -> anyhow::Result<(bool, ExclusiveLockGuard)> {
     match plan {
         CleanupPlan::InvalidTarget { reason } => {
             warn!("Refusing cache file cleanup for invalid registry entry: {reason}");
-            Ok(false)
+            Ok((false, exclusive_lock))
         }
         CleanupPlan::Keep { reason } => {
             debug!("Keeping cached files: {reason}");
-            Ok(false)
+            Ok((false, exclusive_lock))
         }
         CleanupPlan::DeleteWholeModel { .. }
         | CleanupPlan::DeleteHfRevisionReclaimBlobs { .. }
@@ -350,34 +390,42 @@ pub async fn execute_cleanup_plan(plan: &CleanupPlan, cache_dir: &Path) -> anyho
             let plan = plan.clone();
             let cache_dir = cache_dir.to_path_buf();
             let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || match plan {
-                CleanupPlan::DeleteWholeModel {
-                    provider,
-                    model_name,
-                } => handle.block_on(get_provider(provider).delete_model(&model_name, cache_dir)),
-                CleanupPlan::DeleteHfRevisionReclaimBlobs {
-                    model_name,
-                    revision,
-                } => handle.block_on(
-                    get_provider(ModelProvider::HuggingFace).delete_model_revision(
-                        &model_name,
-                        cache_dir,
-                        Some(&revision),
+            let returned_lock = tokio::task::spawn_blocking(move || {
+                #[cfg(test)]
+                run_before_cleanup_hook(&cache_dir);
+
+                let result = match plan {
+                    CleanupPlan::DeleteWholeModel {
+                        provider,
+                        model_name,
+                    } => {
+                        handle.block_on(get_provider(provider).delete_model(&model_name, cache_dir))
+                    }
+                    CleanupPlan::DeleteHfRevisionReclaimBlobs {
+                        model_name,
+                        revision,
+                    } => handle.block_on(
+                        get_provider(ModelProvider::HuggingFace).delete_model_revision(
+                            &model_name,
+                            cache_dir,
+                            Some(&revision),
+                        ),
                     ),
-                ),
-                CleanupPlan::DeleteHfRevisionKeepBlobs {
-                    model_name,
-                    revision,
-                } => HuggingFaceProvider::delete_snapshot_keeping_blobs(
-                    &model_name,
-                    &cache_dir,
-                    &revision,
-                ),
-                CleanupPlan::InvalidTarget { .. } | CleanupPlan::Keep { .. } => Ok(()),
+                    CleanupPlan::DeleteHfRevisionKeepBlobs {
+                        model_name,
+                        revision,
+                    } => HuggingFaceProvider::delete_snapshot_keeping_blobs(
+                        &model_name,
+                        &cache_dir,
+                        &revision,
+                    ),
+                    CleanupPlan::InvalidTarget { .. } | CleanupPlan::Keep { .. } => Ok(()),
+                };
+                result.map(|()| exclusive_lock)
             })
             .await
             .map_err(|err| anyhow::anyhow!("cache cleanup task failed: {err}"))??;
-            Ok(true)
+            Ok((true, returned_lock))
         }
     }
 }
@@ -800,16 +848,26 @@ mod tests {
         std::fs::write(repo_root.join("refs/main"), "rev1").expect("write ref");
 
         // Invalid target does nothing and returns Ok(false).
+        let lock_path = modelexpress_common::providers::lock_file::LockFile::model_lock_path(
+            &cache_dir,
+            ModelProvider::HuggingFace,
+            "org/model",
+        )
+        .expect("lock path");
+        let lock =
+            modelexpress_common::providers::lock_file::LockFile::try_acquire_exclusive(&lock_path)
+                .await
+                .expect("try_acquire_exclusive")
+                .expect("exclusive lock");
         let invalid_plan = plan_cleanup_for_entry(
             ModelProvider::HuggingFace,
             &EntryKey::new("org/model", Some("../../../outside".to_string()), false).to_string(),
             &[],
         );
-        assert!(
-            !execute_cleanup_plan(&invalid_plan, &cache_dir)
-                .await
-                .expect("invalid plan should not error")
-        );
+        let (invalid_deleted, lock) = execute_cleanup_plan(&invalid_plan, &cache_dir, lock)
+            .await
+            .expect("invalid plan should not error");
+        assert!(!invalid_deleted);
         assert!(outside.join("keep.txt").exists());
         assert!(repo_root.join("snapshots/rev1/config.json").exists());
 
@@ -825,11 +883,10 @@ mod tests {
                 ModelStatus::DOWNLOADING,
             )],
         );
-        assert!(
-            execute_cleanup_plan(&plan, &cache_dir)
-                .await
-                .expect("variant 1 cleanup should succeed")
-        );
+        let (deleted, _lock) = execute_cleanup_plan(&plan, &cache_dir, lock)
+            .await
+            .expect("variant 1 cleanup should succeed");
+        assert!(deleted);
         assert!(!repo_root.join("snapshots/rev1").exists());
         assert!(!repo_root.join("refs/main").exists());
         assert!(repo_root.join("blobs/in-flight.sync.part").exists());
