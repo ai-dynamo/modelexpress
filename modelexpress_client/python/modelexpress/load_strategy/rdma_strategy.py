@@ -643,20 +643,23 @@ class RdmaStrategy(LoadStrategy):
         from ..metadata.worker_server import fetch_tensor_manifest
 
         manifest_start = time.perf_counter()
-        tensor_protos, manifest_bytes = fetch_tensor_manifest(
+        manifest = fetch_tensor_manifest(
             endpoint=source_worker.worker_grpc_endpoint,
             mx_source_id=mx_source_id,
             worker_id=worker_id,
         )
+        for field in ("agent_name", "metadata_endpoint"):
+            if getattr(manifest, field) != getattr(source_worker, field):
+                raise RuntimeError(f"Tensor manifest {field} mismatch")
         # Store the validated descriptors on the metadata object so the
         # transfer can reuse them without a second manifest RPC.
         source_worker.tensor_source.ClearField("tensors")
-        source_worker.tensor_source.tensors.extend(tensor_protos)
+        source_worker.tensor_source.tensors.extend(manifest.tensors)
         manifest_time = time.perf_counter() - manifest_start
         logger.info(
             f"[Worker {ctx.global_rank}] [TIMING] P2P tensor manifest: "
-            f"{manifest_time:.3f}s ({len(tensor_protos)} tensors, "
-            f"{manifest_bytes} bytes)"
+            f"{manifest_time:.3f}s ({len(manifest.tensors)} tensors, "
+            f"{manifest.ByteSize()} bytes)"
         )
 
     @staticmethod

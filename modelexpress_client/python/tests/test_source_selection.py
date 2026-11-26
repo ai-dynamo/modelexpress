@@ -766,7 +766,8 @@ def test_load_metadata_miss_tries_next_candidate():
     assert cands[1].worker_id in args
 
 
-def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
+@pytest.mark.parametrize("mismatch", ["worker_id", "agent_name", "metadata_endpoint"])
+def test_load_generation_mismatch_tries_next_candidate(monkeypatch, mismatch):
     strat = RdmaStrategy()
     cands = _sources(2)
     strat._find_source_instances = MagicMock(return_value=cands)
@@ -780,11 +781,19 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
         ),
     ]
     strat._load_as_target = MagicMock(return_value="loaded")
-    manifest = [p2p_pb2.TensorDescriptor(name="weight")]
+    manifest = p2p_pb2.GetTensorManifestResponse(
+        tensors=[p2p_pb2.TensorDescriptor(name="weight")],
+    )
+    rejected_manifest = RuntimeError("worker_id mismatch")
+    if mismatch != "worker_id":
+        rejected_manifest = p2p_pb2.GetTensorManifestResponse(
+            worker_id=cands[0].worker_id,
+            **{mismatch: "replacement"},
+        )
     fetch_manifest = MagicMock(
         side_effect=[
-            RuntimeError("worker_id mismatch"),
-            (manifest, 10),
+            rejected_manifest,
+            manifest,
         ],
     )
     monkeypatch.setattr(
@@ -831,7 +840,7 @@ def test_fetch_worker_metadata_fetches_missing_manifest(monkeypatch):
         found=True,
         worker=worker,
     )
-    fetch_manifest = MagicMock(return_value=([], 0))
+    fetch_manifest = MagicMock(return_value=p2p_pb2.GetTensorManifestResponse())
     monkeypatch.setattr(
         "modelexpress.metadata.worker_server.fetch_tensor_manifest",
         fetch_manifest,
