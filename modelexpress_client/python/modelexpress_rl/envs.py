@@ -287,7 +287,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Run the generator client's staging step in a child process. Applies only
     # when object storage is the client's only source. Only the child stages
     # then: the client replaces a child as soon as it exits and never stages
-    # itself.
+    # itself, except a version whose install reads the weights from their
+    # source (a streamed full checkpoint), which has nothing to stage ahead.
     "MX_REFIT_STAGE_PROCESS": lambda: parse_bool(
         os.environ.get("MX_REFIT_STAGE_PROCESS", "false"),
         "MX_REFIT_STAGE_PROCESS",

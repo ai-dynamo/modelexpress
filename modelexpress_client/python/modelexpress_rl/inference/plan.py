@@ -177,6 +177,14 @@ class PreparedArtifact(ABC):
     def metrics(self) -> dict[str, float]:
         """Return metrics recorded while preparing or applying this artifact."""
 
+    @property
+    def is_streamed(self) -> bool:
+        """Whether installing this artifact still reads the weights from their source.
+
+        False when preparation left a complete copy to install from.
+        """
+        return False
+
 
 @dataclass(frozen=True)
 class PreparedEngineTensors(PreparedArtifact):
@@ -210,6 +218,10 @@ class PreparedStreamingTensors(PreparedArtifact):
     @property
     def metrics(self) -> dict[str, float]:
         return dict(self.transfer_metrics)
+
+    @property
+    def is_streamed(self) -> bool:
+        return True
 
     @property
     def release_blocked(self) -> bool:
@@ -315,6 +327,10 @@ class PreparedCheckpointArtifact(PreparedArtifact):
     @property
     def metrics(self) -> dict[str, float]:
         return dict(self.checkpoint.metrics)
+
+    @property
+    def is_streamed(self) -> bool:
+        return self.checkpoint.streaming is not None
 
 
 class SourceResolver(ABC):

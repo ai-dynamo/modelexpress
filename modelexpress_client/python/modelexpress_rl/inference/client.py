@@ -218,6 +218,11 @@ class StagedWeightHandle:
             return False
         return self._update.installation_started and not self._update.applied
 
+    @property
+    def is_streamed(self) -> bool:
+        """Whether the install still reads the weights from their source."""
+        return self._update is not None and self._update.is_streamed
+
 
 class _WorkerLease:
     """The version leases the stage process holds for one staged update."""
@@ -395,7 +400,10 @@ class ModelExpressGeneratorClient:
         been transferred. Streaming transfers start during ``apply_weight``.
         With a stage process, the whole staging step runs there, including its
         MX server calls, and never in this process: a version the stage process
-        cannot stage raises StageProcessError.
+        cannot stage raises StageProcessError. The exception is a version whose
+        install reads the weights from their source, such as a streamed full
+        checkpoint: there is nothing to stage ahead, so this client stages it
+        and holds its lease, as it does without a stage process.
         """
         if not isinstance(version, WeightVersionRef):
             raise TypeError("version must be a WeightVersionRef")
@@ -410,14 +418,16 @@ class ModelExpressGeneratorClient:
                 raise RuntimeError("another generator update is still active")
             if self._stage_process is None:
                 return self._stage_weight(version)
-            versions, metrics = self._stage_process.stage(
+            staged = self._stage_process.stage(
                 version.version_id,
                 serving_version_id=self._serving_version_id,
                 engine_state=self._engine_state.value,
             )
-            worker_staged = _WorkerStaged(
-                versions, metrics, _WorkerLease(self._stage_process)
-            )
+            if staged is None:
+                # The install of this version reads the weights from their
+                # source, in this process, so this client holds the lease.
+                return self._stage_weight(version)
+            worker_staged = _WorkerStaged(*staged, _WorkerLease(self._stage_process))
             try:
                 return self._stage_weight(version, worker_staged)
             except BaseException:

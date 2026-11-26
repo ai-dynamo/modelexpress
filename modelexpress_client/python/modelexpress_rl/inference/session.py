@@ -46,6 +46,10 @@ class SessionUpdate:
     def metrics(self) -> dict[str, float]:
         return self.plan.method.prepared_metrics(self.prepared)
 
+    @property
+    def is_streamed(self) -> bool:
+        return self.prepared.is_streamed
+
 
 class _LeaseGroup:
     """Close all revision leases held by one replay operation."""

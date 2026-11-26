@@ -21,7 +21,8 @@ The two processes exchange Python objects over one socket pair:
                        {"event": "fatal", "error"}
     client -> worker   {"op": "stage", "version_id", "serving_version_id",
                         "engine_state"}
-    worker -> client   {"ok": True, "versions", "metrics", "seconds"}
+    worker -> client   {"ok": True, "staged": True, "versions", "metrics", "seconds"}
+                       {"ok": True, "staged": False}    the install reads the source
                        {"ok": False, "error"}
     client -> worker   {"op": "release"}    drop what the last stage holds
     client -> worker   {"op": "shutdown"}   or end of file
@@ -129,12 +130,15 @@ class StageProcess:
 
     def stage(
         self, version_id: str, *, serving_version_id: str | None, engine_state: str
-    ) -> tuple[dict[str, Any], dict[str, float]]:
+    ) -> tuple[dict[str, Any], dict[str, float]] | None:
         """Have a worker run the staging step for ``version_id``.
 
         Return the version records the worker read from the MX server, by id,
         and what its staging step measured. The worker holds the staged
-        version's leases until ``release``.
+        version's leases until ``release``. Return None when there is nothing
+        to stage ahead because installing the version reads the weights from
+        their source: the worker then holds nothing, and the caller stages the
+        version itself.
 
         ``serving_version_id`` is the version the caller's engine serves, and
         ``engine_state`` whether it is known to hold it: the worker's staging
@@ -185,6 +189,8 @@ class StageProcess:
                 f"stage process failed to stage version {version_id!r}: "
                 f"{reply.get('error')}"
             )
+        if not reply["staged"]:
+            return None
         metrics = {**reply["metrics"], "perf/mx_stage_process_time": reply["seconds"]}
         if started:
             # Workers this request had to start before one replied.
@@ -222,8 +228,12 @@ class StageProcess:
             except (OSError, ValueError):
                 pass
             conn.close()
+            grace = self._close_grace_seconds
+            if deadline is not None:
+                # This wait does not extend the request's time limit either.
+                grace = min(grace, max(deadline - time.monotonic(), 0.0))
             try:
-                proc.wait(timeout=self._close_grace_seconds)
+                proc.wait(timeout=grace)
             except subprocess.TimeoutExpired:
                 # Killing it during a staging step would leave that step's
                 # state half written. It exits once the step ends, and the

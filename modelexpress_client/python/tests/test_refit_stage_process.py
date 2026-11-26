@@ -48,7 +48,11 @@ from modelexpress_rl.inference.checkpoint_store import (
 from modelexpress_rl.inference.engines.sglang import SglangGeneratorContext
 from modelexpress_rl.inference.engines.sglang.installer import _SglangInstaller
 from modelexpress_rl.inference.engines.stage_only import StageOnlyGeneratorContext
-from modelexpress_rl.inference.plan import SourceResolver
+from modelexpress_rl.inference.plan import (
+    EngineCapabilities,
+    PreparedCheckpointArtifact,
+    SourceResolver,
+)
 from modelexpress_rl.inference.stage_process import StageProcessError
 from tests.helpers import refit_stage_process as fakes
 
@@ -445,6 +449,46 @@ def test_recovery_after_a_failed_install_is_staged_in_the_worker(harness, monkey
     _wait_until(lambda: not harness.service.leases, "leases to be released")
 
 
+# Streaming applies to a full checkpoint published without checksums, which
+# only its index tells: the MX server's record is the same for both.
+@pytest.mark.parametrize("checksums", [False, True])
+def test_version_read_at_install_is_staged_by_the_client(
+    harness, monkeypatch, checksums
+):
+    monkeypatch.setenv("MX_REFIT_FULL_STREAMING", "true")
+    capabilities = EngineCapabilities(
+        artifact_types=frozenset({PreparedCheckpointArtifact}),
+        streamed_checkpoints=True,
+    )
+    monkeypatch.setattr(
+        _SglangInstaller, "capabilities", property(lambda self: capabilities)
+    )
+    uri = f"s3://bucket/v5/{fakes.INDEX_NAME}"
+    fakes.write_checkpoint(
+        fakes.object_path(harness.root, uri).parent,
+        harness.tensors["v4"],
+        fakes.layout(),
+        checksums=checksums,
+    )
+    harness._register("v5", uri)
+    client, _ = harness.client()
+    worker_pid = client._stage_process.pid
+
+    handle = client.stage_weight(version=WeightVersionRef("v5"))
+
+    streamed = not checksums
+    assert handle.is_streamed is streamed
+    # A streamed version is read during its install, in this process. Nothing
+    # is staged ahead, so the worker reads no weights and this client holds
+    # the lease. Any other full checkpoint is staged by the worker.
+    assert bool(harness.shard_reads(worker_pid)) is not streamed
+    assert harness.shard_reads(os.getpid()) == []
+    holder = "generator-0" if streamed else "generator-0-stage"
+    assert list(harness.service.leases.values()) == [("v5", holder)]
+    handle.release()
+    _wait_until(lambda: not harness.service.leases, "leases to be released")
+
+
 def test_store_without_a_seed_is_built_by_the_worker(harness):
     # Without a seed, the first full checkpoint builds the checkpoint cache.
     client, runner = harness.client(seed=False)
@@ -637,8 +681,10 @@ def test_close_during_a_stage_fails_it_and_lets_the_worker_finish(harness, monke
     assert harness.head() == (CheckpointState.READY, "v1")
 
 
-def test_close_leaves_a_stage_its_time_limit_and_no_longer(harness, monkeypatch):
-    monkeypatch.setenv("MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS", "0.1")
+# A grace period shorter than the time the request has left, and a longer one.
+@pytest.mark.parametrize("grace", ["0.1", "30"])
+def test_close_leaves_a_stage_its_time_limit_and_no_longer(harness, monkeypatch, grace):
+    monkeypatch.setenv("MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS", grace)
     monkeypatch.setenv("MX_REFIT_STAGE_PROCESS_TIMEOUT_SECONDS", "3.0")
     client, _ = harness.client()
     worker = harness.procs[0]
@@ -647,6 +693,7 @@ def test_close_leaves_a_stage_its_time_limit_and_no_longer(harness, monkeypatch)
     with futures.ThreadPoolExecutor(1) as pool:
         staging = pool.submit(client.stage_weight, version=WeightVersionRef("v1"))
         harness.wait_holding()
+        closing = time.monotonic()
         client.close()
         with pytest.raises(StageProcessError, match="closed"):
             staging.result(WAIT_SECONDS)
@@ -654,6 +701,8 @@ def test_close_leaves_a_stage_its_time_limit_and_no_longer(harness, monkeypatch)
     # The read stays blocked. Nobody waits for the reply any more, and the
     # worker is still killed when the request's time is up, and reaped.
     _wait_until(lambda: worker.poll() == -signal.SIGKILL, "the worker to be killed")
+    # The grace period did not add to the request's time limit.
+    assert time.monotonic() - closing < 15
     store = LocalCheckpointStore(root=harness.refit, model_name=STORE_KEY)
     with store.preparation_locked(blocking=False) as free:
         # Other ranks on the node can prepare versions again.

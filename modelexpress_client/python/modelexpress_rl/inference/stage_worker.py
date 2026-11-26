@@ -104,14 +104,27 @@ def _serve(
                     handle = client._stage_weight(
                         WeightVersionRef(request["version_id"])
                     )
-                    reply = {
-                        "ok": True,
-                        # What the MX server said, so the engine's client
-                        # does not have to ask it again.
-                        "versions": dict(client._fetched_versions),
-                        "metrics": dict(handle.metrics),
-                        "seconds": time.perf_counter() - started,
-                    }
+                    if handle.is_streamed:
+                        # Nothing is staged for this version: its install
+                        # reads the weights from their source, in the engine's
+                        # process. That client stages it and holds the leases.
+                        logger.info(
+                            "version %s is streamed at install; handing it back",
+                            handle.version_id,
+                        )
+                        _release(handle)
+                        handle = None
+                        reply = {"ok": True, "staged": False}
+                    else:
+                        reply = {
+                            "ok": True,
+                            "staged": True,
+                            # What the MX server said, so the engine's client
+                            # does not have to ask it again.
+                            "versions": dict(client._fetched_versions),
+                            "metrics": dict(handle.metrics),
+                            "seconds": time.perf_counter() - started,
+                        }
                 except Exception as error:
                     logger.exception(
                         "failed to stage version %s", request.get("version_id")
