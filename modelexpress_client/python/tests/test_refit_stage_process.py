@@ -812,6 +812,60 @@ def test_start_is_tried_again_until_a_worker_is_ready(harness, monkeypatch):
     assert harness.parent_readers[0].reads == []
 
 
+def _pad_configuration(monkeypatch) -> None:
+    """Make the worker's configuration larger than a socket holds unread."""
+    real = stage_process_module.StageProcess
+
+    def padded(config, **kwargs):
+        object.__setattr__(config, "_padding", "x" * (1 << 20))
+        return real(config, **kwargs)
+
+    monkeypatch.setattr(client_module, "StageProcess", padded)
+
+
+def test_start_does_not_wait_on_a_configuration_larger_than_the_socket(
+    harness, monkeypatch
+):
+    _pad_configuration(monkeypatch)
+    started = threading.Event()
+    made = []
+
+    def start():
+        made.append(harness.client())
+        started.set()
+
+    # In a thread, so that a write that blocks fails this test instead of
+    # hanging it.
+    threading.Thread(target=start, daemon=True).start()
+    assert started.wait(WAIT_SECONDS), "the configuration write blocked"
+    client, runner = made[0]
+    _stage_apply(harness, client, runner, "v1")
+
+
+def test_worker_that_never_reads_its_configuration_is_killed(harness, monkeypatch):
+    # The test worker sleeps before it reads anything.
+    monkeypatch.setenv(fakes.STALL_ENV, "1")
+    monkeypatch.setenv("MX_REFIT_STAGE_PROCESS_START_TIMEOUT_SECONDS", "1")
+    _pad_configuration(monkeypatch)
+    finished = threading.Event()
+    errors = []
+
+    def start():
+        try:
+            harness.client()
+        except StageProcessError as error:
+            errors.append(str(error))
+        finished.set()
+
+    # In a thread, so that a write that blocks fails this test instead of
+    # hanging it.
+    threading.Thread(target=start, daemon=True).start()
+    assert finished.wait(WAIT_SECONDS), "the configuration write blocked"
+    assert errors and "it was not ready within 1 s" in errors[0]
+    killed = [-signal.SIGKILL] * stage_process_module._ATTEMPTS
+    assert [proc.poll() for proc in harness.procs] == killed
+
+
 def test_stage_process_is_off_unless_asked_for(harness, monkeypatch):
     client, _ = harness.client(stage_process=None)
     assert client._stage_process is None and harness.procs == []

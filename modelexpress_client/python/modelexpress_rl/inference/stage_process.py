@@ -35,6 +35,9 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import os
+import pickle
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -62,6 +65,18 @@ _REAP_SECONDS = 5.0
 # worker if there is none and, for a stage request, sends the request. Also how
 # many workers in a row are replaced on exit with no reply to a request between.
 _ATTEMPTS = 3
+
+
+def _limit_writes(conn: Any, seconds: float) -> None:
+    """Make a write to ``conn`` give up after waiting ``seconds`` for its reader.
+
+    Zero removes the limit.
+    """
+    whole = int(seconds)
+    timeval = struct.pack("ll", whole, int((seconds - whole) * 1_000_000))
+    # The option belongs to the socket, which this second descriptor shares.
+    with socket.socket(fileno=os.dup(conn.fileno())) as shared:
+        shared.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, timeval)
 
 
 class StageProcessError(RuntimeError):
@@ -304,8 +319,6 @@ class StageProcess:
         # One socket pair, private to the two processes.
         conn, worker_end = multiprocessing.Pipe()
         try:
-            # The configuration waits in the socket until the worker reads it.
-            conn.send({"op": "init", "config": self._config})
             proc = subprocess.Popen(
                 [sys.executable, "-m", _WORKER_MODULE, str(worker_end.fileno())],
                 pass_fds=[worker_end.fileno()],
@@ -319,8 +332,33 @@ class StageProcess:
         finally:
             worker_end.close()
         self._proc, self._conn = proc, conn
+        deadline = time.monotonic() + self._start_timeout_seconds
         try:
-            message = self._receive(time.monotonic() + self._start_timeout_seconds)
+            # Written once there is a worker to read it: a configuration
+            # larger than the socket holds would otherwise wait for a reader
+            # that does not exist yet. The start time limit covers the write:
+            # one that does not fit waits for the reader twice at most.
+            _limit_writes(conn, self._start_timeout_seconds / 2)
+            # As bytes: a write that is given up leaves no buffer half sent.
+            conn.send_bytes(pickle.dumps({"op": "init", "config": self._config}))
+            _limit_writes(conn, 0)
+        except BlockingIOError:
+            # The worker is alive and does not read.
+            self._drop(kill=True)
+            raise _WorkerGone(
+                f"it was not ready within {self._start_timeout_seconds:g} s"
+            ) from None
+        except OSError:
+            # The worker is already gone.
+            code = self._drop(kill=False)
+            raise _WorkerGone(
+                f"it exited with code {code} before it was ready"
+            ) from None
+        except Exception as error:
+            self._drop(kill=True)
+            raise _WorkerGone(f"it could not be started: {error}") from error
+        try:
+            message = self._receive(deadline)
         except _WorkerGone:
             code = self._drop(kill=False)
             raise _WorkerGone(
