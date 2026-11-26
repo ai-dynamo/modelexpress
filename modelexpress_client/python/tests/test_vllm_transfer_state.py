@@ -249,3 +249,52 @@ def test_kimi_vision_rope_cache_stays_local(
                 for tensor in catalog.values():
                     tensor.fill_(9)
             assert torch.equal(cache, before)
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+@pytest.mark.parametrize("engine_module", [
+    "vllm.v1.attention.ops.cp_common", "application.collective",
+])
+def test_dcp_peer_mappings_stay_local(
+    subclass: bool, engine_module: str,
+    mock_accelerator_backend_cls: type,
+) -> None:
+    """Exclude DCP peer mappings, pointers and synchronization state.
+
+    Args:
+        subclass: Whether the workspace subclasses the engine base class.
+        engine_module: Module identifying the real or unrelated workspace.
+        mock_accelerator_backend_cls: CPU accelerator fixture.
+    """
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    cls = type("DirectCPWorkspace", (), {"__module__": engine_module})
+    if subclass:
+        cls = type("DirectDCPA2AWorkspace", (cls,), {
+            "__module__": "vllm.v1.attention.ops.dcp",
+        })
+    workspace = cls()
+    storage = torch.arange(32, dtype=torch.int32)
+    peer_mapping = torch.zeros(32, dtype=torch.int32)
+    pointers = torch.tensor([storage.data_ptr(), peer_mapping.data_ptr()])
+    workspace._allocations = [(storage, object(), [storage, peer_mapping])]
+    workspace.peer_signal_ptrs = pointers
+    workspace.epoch = torch.zeros(1, dtype=torch.int64)
+    workspace.cutedsl_counters = torch.zeros(9, dtype=torch.int32)
+    model, _ = _model()
+    model.impl.dcp_manager = SimpleNamespace(direct_a2a=workspace)
+    for _ in range(2):
+        catalog = _discover(model, backend)
+        if engine_module == "application.collective":
+            assert any(t.data_ptr() == peer_mapping.data_ptr()
+                       for t in catalog.values())
+        else:
+            assert len(catalog) == 2
+            assert "weight" in catalog
+            assert any("scale_recip" in name for name in catalog)
+            assert all("dcp_manager" not in name for name, _ in model.named_buffers())
+            with torch.no_grad():
+                for tensor in catalog.values():
+                    tensor.fill_(9)
+            assert torch.equal(storage, torch.arange(32, dtype=torch.int32))
+            assert torch.count_nonzero(peer_mapping) == 0
+            assert pointers.tolist() == [storage.data_ptr(), peer_mapping.data_ptr()]

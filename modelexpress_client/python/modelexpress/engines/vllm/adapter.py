@@ -511,10 +511,13 @@ class VllmAdapter(EngineAdapter):
     @staticmethod
     def _exclude_hidden_tensor_object(obj: object) -> bool:
         """Keep K3 peer pointers, barriers, and collective workspaces local."""
-        cls = type(obj)
-        return (
-            cls.__module__ == "vllm.models.kimi_k3.nvidia.ops.latent_moe_tail"
-            and cls.__name__ == "KimiK3LatentMoETailOp"
+        return any(
+            (cls.__module__, cls.__name__) in {
+                ("vllm.models.kimi_k3.nvidia.ops.latent_moe_tail",
+                 "KimiK3LatentMoETailOp"),
+                ("vllm.v1.attention.ops.cp_common", "DirectCPWorkspace"),
+            }
+            for cls in type(obj).__mro__
         )
 
     def discovers_host_parameters(self) -> bool:
