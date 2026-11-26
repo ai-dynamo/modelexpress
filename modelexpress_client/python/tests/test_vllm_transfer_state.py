@@ -207,3 +207,45 @@ def test_unrelated_zero_residual_is_transferred(
     model = torch.nn.Module()
     model.register_buffer("_zero_residual", torch.ones(8))
     assert "_zero_residual" in _discover(model, backend)
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+@pytest.mark.parametrize("engine_module", [
+    "vllm.model_executor.models.kimi_k25_vit", "application.vision",
+])
+def test_kimi_vision_rope_cache_stays_local(
+    subclass: bool, engine_module: str,
+    mock_accelerator_backend_cls: type,
+) -> None:
+    """Preserve the deterministic vision cache only for its engine class.
+
+    Args:
+        subclass: Whether the encoder is an application subclass.
+        engine_module: Module identifying the real or unrelated encoder.
+        mock_accelerator_backend_cls: CPU accelerator fixture.
+    """
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    cls = type("Rope2DPosEmbRepeated", (torch.nn.Module,), {
+        "__module__": engine_module,
+    })
+    if subclass:
+        cls = type("ApplicationRope", (cls,), {"__module__": "application"})
+    source, target = cls(), cls()
+    for model in (source, target):
+        model.weight = torch.nn.Parameter(torch.ones(8))
+        model.register_buffer("scale_recip", torch.tensor([0.5]))
+    cache = torch.arange(32, dtype=torch.float32).to(torch.complex64)
+    target.register_buffer("freqs_cis", cache, persistent=False)
+    target.register_buffer("cache_alias", cache[4:8], persistent=False)
+    before = cache.clone()
+    for _ in range(2):
+        catalog = _discover(target, backend)
+        if engine_module == "application.vision":
+            assert "freqs_cis" in catalog
+        else:
+            assert catalog.keys() == _discover(source, backend).keys()
+            assert set(catalog) == {"weight", "scale_recip"}
+            with torch.no_grad():
+                for tensor in catalog.values():
+                    tensor.fill_(9)
+            assert torch.equal(cache, before)

@@ -83,14 +83,18 @@ def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
     """Identify local attention and collective state by engine type."""
     tensors = []
     for module in model.modules():
-        if any(
-            cls.__module__ == "vllm.models.kimi_k3.nvidia.latent_moe_runner"
-            and cls.__name__ == "LatentMoERunner"
-            for cls in type(module).__mro__
-        ):
-            residual = getattr(module, "_zero_residual", None)
-            if isinstance(residual, torch.Tensor):
-                tensors.append(residual)
+        local_fields = {
+            ("vllm.models.kimi_k3.nvidia.latent_moe_runner",
+             "LatentMoERunner"): "_zero_residual",
+            ("vllm.model_executor.models.kimi_k25_vit",
+             "Rope2DPosEmbRepeated"): "freqs_cis",
+        }
+        for cls in type(module).__mro__:
+            name = local_fields.get((cls.__module__, cls.__name__))
+            if name is not None:
+                tensor = getattr(module, name, None)
+                if isinstance(tensor, torch.Tensor):
+                    tensors.append(tensor)
         backend = getattr(module, "attn_backend", None)
         get_name = getattr(backend, "get_name", None)
         if not callable(get_name) or get_name() != "FLASHINFER_MLA":
