@@ -38,17 +38,20 @@ class _ServedOn:
         return 2
 
 
-def test_capture_publishes_full_copies_and_skips_non_float():
+def test_capture_publishes_full_copies_of_every_dtype():
     state_dict = {
         "w": torch.arange(8, dtype=torch.float32).reshape(2, 4),
         "b": torch.ones(4, dtype=torch.bfloat16),
-        "step": torch.arange(4, dtype=torch.long),  # non-float: skipped
+        # An integer lookup table (e.g. a hash-routing map) is an engine
+        # parameter too: a full refit must be able to write it.
+        "table": torch.arange(4, dtype=torch.long),
     }
 
     shards = capture_local_shards(state_dict)
 
     by_name = {s.name: s for s in shards}
-    assert set(by_name) == {"w", "b"}
+    assert set(by_name) == {"w", "b", "table"}
+    assert by_name["table"].source_tensor.dtype == torch.long
     for shard in shards:
         # Plain (non-DTensor) tensors are held in full by every rank.
         assert shard.shard_offset == (0,) * len(shard.global_shape)

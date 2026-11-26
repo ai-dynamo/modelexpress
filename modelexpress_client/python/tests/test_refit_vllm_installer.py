@@ -3240,3 +3240,25 @@ def test_trainer_installation_requires_capture_before_reload(monkeypatch, stream
         else:
             installer.install_tensors(batch)
     torch.testing.assert_close(model.weight, original)
+
+
+def test_reload_keeps_a_plain_attribute_that_holds_another_modules_parameter(
+    monkeypatch,
+):
+    # vLLM's routed experts keep the gate's hash-routing table as a plain
+    # attribute, outside their own parameters.
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    model = nn.Module()
+    model.gate = nn.Module()
+    model.gate.table = nn.Parameter(torch.tensor([3, 1]), requires_grad=False)
+    model.experts = nn.Module()
+    object.__setattr__(model.experts, "hash_indices_table", model.gate.table)
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    installer._reload(lambda _aliases: None)
+    assert model.experts.hash_indices_table is model.gate.table
+    assert dict(model.experts.named_parameters()) == {}

@@ -116,6 +116,24 @@ def test_multiple_dtype_overrides_include_fp16_and_scalar(dist_ready, monkeypatc
     assert staged.metadata.total_bytes == 6 * 2 + 4 + 4 * 2
 
 
+def test_copy_serves_integer_tensors_in_their_own_dtype(dist_ready, monkeypatch):
+    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
+    manager = _Manager()
+    table = torch.tensor([[3, 1], [0, 2]], dtype=torch.long)
+    staged = _stage(
+        _adapter(manager),
+        {"weights": torch.ones(4), "table": table},
+        TrainerStagingMode.COPY_TO_DEVICE,
+    )
+    served = {
+        key.split("__", 3)[-1]: value for key, value in manager.registered[0].items()
+    }
+    assert served["weights"].dtype == torch.bfloat16
+    assert served["table"].dtype == torch.long
+    assert torch.equal(served["table"], table)
+    assert staged.metadata.total_bytes == 4 * 2 + 4 * 8
+
+
 def test_copy_rejects_source_dtype_change_before_writing(dist_ready, monkeypatch):
     monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
     manager = _Manager()

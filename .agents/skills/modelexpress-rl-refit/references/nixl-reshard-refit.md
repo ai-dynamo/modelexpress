@@ -89,7 +89,8 @@ Engine contexts:
 
 What the FSDP publisher puts on the wire:
 
-- Only floating-point `state_dict` tensors are published.
+- Every `state_dict` tensor is published. Floating-point tensors travel in the
+  wire dtype; other dtypes, such as integer lookup tables, travel unchanged.
 - An unsharded or replicated tensor is published in full by every rank; the
   duplicate boxes are deduped before planning.
 - A sharded `DTensor` publishes this rank's local box: FSDP along dim 0, tensor
