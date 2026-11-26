@@ -366,7 +366,9 @@ cleanup path in those cases.
 
 The name is `mx-cache-` followed by `sanitize("{provider}/{model_name}")`, so each `/` becomes `--` and the sha256 suffix binds the pair `(provider, name)`. For provider `HuggingFace` and model `deepseek-ai/DeepSeek-V3` the CR is named `mx-cache-huggingface--deepseek-ai--deepseek-v3-{hash}`. Pre-0.5.0 deployments carry name-only CRs (`mx-cache-{sanitized-model-name}-{hash}`), which the server still looks up so those records migrate.
 
-`ModelCacheEntry.spec.modelName` preserves the original model name while `status.phase`, `status.createdAt`, `status.lastUsedAt`, and `status.message` track the same lifecycle fields as the Redis `mx:model:*` hash.
+`ModelCacheEntry.spec.modelName` preserves the original model name while `status.phase`, `status.createdAt`, `status.lastUsedAt`, `status.message`, `status.claimId`, and `status.leaseExpiresAt` track the same lifecycle and download-lease fields as the Redis `mx:model:*` hash.
+
+Every `ModelCacheEntry` CR carries the `modelexpress.nvidia.com/cache-files` finalizer (set at creation and backfilled onto pre-upgrade CRs by the server's finalizer controller during its startup initial pass, which logs an `info` summary line). Deleting a CR (`kubectl delete mxcache <name>`) sets `metadata.deletionTimestamp`, which excludes the CR from reads, listings, counts, touch, claims, retries, heartbeats, and completion writes. The finalizer controller revokes active `claimId` leases on terminating `DOWNLOADING` (or uninitialized) CRs, waits the lease window (tracked per CR UID), runs survivor-aware file cleanup, and removes only `modelexpress.nvidia.com/cache-files` using UID, `resourceVersion`, and exact-index JSON Patch preconditions so recreated CRs and foreign finalizers are preserved. If cleanup permanently refuses a symlinked ancestor below the cache root, the CR stays in `Terminating` (retrying every 5 seconds) until the symlink is fixed or removed. See [`docs/DEPLOYMENT.md`](DEPLOYMENT.md#cache-deletion-uninstall-and-recovery-operations) for pre-upgrade verification, rollback, keep-files uninstall, and recovery commands.
 
 #### Example P2P CRD
 

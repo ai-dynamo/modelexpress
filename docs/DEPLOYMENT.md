@@ -141,6 +141,142 @@ key is absent from `values.yaml`, it defaults to `true`. Set
 `serviceAccount.automount: true` explicitly when using the Kubernetes
 backend.
 
+With the Kubernetes backend, every `ModelCacheEntry` CR carries the
+`modelexpress.nvidia.com/cache-files` finalizer so deleting a CR (for example
+`kubectl delete mxcache <name> -n <namespace>`) reclaims its cached files from
+the server's cache directory before the CR disappears. At startup, the server
+verifies `list`, `watch`, and `patch` on `modelcacheentries` plus `patch` on
+`modelcacheentries/status` via `SelfSubjectAccessReview`; make sure custom
+Roles/ClusterRoles include `watch` on `modelcacheentries` before upgrading.
+
+#### Cache deletion, uninstall, and recovery operations
+
+- **Upgrading to a release with the finalizer controller**: Pre-upgrade
+  `ModelCacheEntry` CRs are not protected from manual API deletion until an
+  upgraded server attaches `modelexpress.nvidia.com/cache-files`. At startup,
+  the finalizer controller runs an initial backfill pass over existing CRs and
+  logs an `info` line (`Kubernetes ModelCacheEntry finalizer controller
+  completed initial pass in namespace '<namespace>': reconciled <N>/<total>
+  existing entries`). Wait until all old replicas have stopped (so no old
+  replica can create new unprotected CRs), then verify that no CR is still
+  missing the finalizer before deleting entries through the Kubernetes API:
+
+  ```bash
+  kubectl get mxcache -n <namespace> \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.finalizers[*]}{"\n"}{end}' \
+    | awk '{for (i=2; i<=NF; i++) if ($i=="modelexpress.nvidia.com/cache-files") next; print $1}'
+  ```
+
+  Do not run `kubectl delete mxcache` while that command prints any names; only
+  trust an empty result once all pre-upgrade replicas are gone.
+
+- **Uninstalling or deleting a namespace on Kubernetes**:
+  - **Delete CRs and cached files**: Delete `ModelCacheEntry` CRs while the
+    ModelExpress server is still running so its finalizer controller reclaims
+    files and clears finalizers cleanly. **Warning:** this removes **all**
+    cached model files from the server's cache volume.
+
+    ```bash
+    kubectl delete modelcacheentries --all -n <namespace> --ignore-not-found=true
+    helm uninstall <release> -n <namespace>
+    ```
+
+  - **Uninstall while keeping cached files on the volume**: Stop or uninstall
+    the ModelExpress server pods first (`helm uninstall <release> -n <namespace>`
+    or scale the deployment to `0`), then strip only
+    `modelexpress.nvidia.com/cache-files` from each `ModelCacheEntry` before
+    deleting the CRs or namespace so the cached files on disk stay intact.
+  - **Stripping `modelexpress.nvidia.com/cache-files` (forced uninstall, keep-files
+    variant, or stuck `Terminating` CRs)**: Use the following loop to remove
+    only `modelexpress.nvidia.com/cache-files` while preserving any foreign
+    finalizers:
+
+    ```bash
+    for cr in $(kubectl get modelcacheentries -n <namespace> -o name); do
+      idx=0
+      for fin in $(kubectl get "$cr" -n <namespace> -o jsonpath='{.metadata.finalizers[*]}'); do
+        if [ "$fin" = "modelexpress.nvidia.com/cache-files" ]; then
+          kubectl patch "$cr" -n <namespace> --type=json \
+            -p="[{\"op\":\"test\",\"path\":\"/metadata/finalizers/${idx}\",\"value\":\"modelexpress.nvidia.com/cache-files\"},{\"op\":\"remove\",\"path\":\"/metadata/finalizers/${idx}\"}]"
+          break
+        fi
+        idx=$((idx + 1))
+      done
+    done
+    ```
+
+- **Rolling back to a release without the finalizer controller**: Existing
+  `ModelCacheEntry` CRs keep `modelexpress.nvidia.com/cache-files` after a
+  rollback. Without the controller running, `kubectl delete mxcache` waits
+  because nothing removes that finalizer; on the older server,
+  `modelexpress-cli model clear` returns success while the CR stays in
+  `Terminating` and the older server continues answering "downloaded" for it.
+  After rolling back the server deployment and confirming no pod of the new
+  version is still running (a pod of the new version re-attaches the
+  finalizer), run the finalizer-strip patch loop above across the namespace so
+  CR deletion works again.
+
+- **Cleaning up invalid or malformed registry records**: Deleting a malformed
+  `ModelCacheEntry` (`kubectl delete mxcache <name> -n <namespace>`) or Redis
+  key (`DEL`) removes the record without touching disk; on Kubernetes the
+  finalizer controller strips its finalizer cleanly after rejecting the invalid
+  target.
+- **Symlinked ancestor below the cache root**: All four providers permanently
+  refuse deletion if any directory component below the cache root along the
+  target path is a symlink. On Kubernetes, the CR stays in `Terminating` and
+  the controller logs an error and retries every 5 seconds. To recover, fix or
+  remove the symlink inside the cache directory; the next retry completes
+  cleanup and strips `modelexpress.nvidia.com/cache-files`.
+- **Recovering leftover files after failed eviction, Redis restart, or S3/GCS overlap**:
+  - If eviction removes a registry record and subsequent file removal fails,
+    the server logs an `error` and skips counting the eviction; run
+    `modelexpress-cli model clear <model>` to reclaim leftover files.
+  - On Redis, deleting a model with an active `DOWNLOADING` entry schedules a
+    post-lease cleanup task inside the handling replica only. If that replica
+    restarts before the lease window finishes, run `modelexpress-cli model clear
+    <model>` again to reclaim leftover files.
+  - When an S3 or GCS parent entry is deleted while a descendant prefix is
+    `DOWNLOADING`, cleanup keeps the parent files on disk so the active
+    descendant download is not disrupted, leaving those parent files with no
+    registry record. After the descendant download finishes, run
+    `modelexpress-cli model clear <parent>` again to reclaim them.
+  - Deleting an S3 child prefix (for example `s3://bucket/a/b`) while a live
+    ancestor (`s3://bucket/a`) exists keeps the child's files and
+    `a/b/.mx-model` marker on disk until the ancestor is deleted.
+- **Operational limits during active downloads and upgrades**:
+  - **>25 s registry outages**: Active download tasks self-fence and abort if
+    25 seconds pass without a confirmed lease renewal.
+  - **Late blocking filesystem operations**: Cancelling a download task does
+    not preempt an in-flight `tokio::fs` / `spawn_blocking` write; there is no
+    time bound on when it finishes, so the lease wait does not prove that all
+    writes have stopped.
+  - **Concurrent claim during file deletion (no per-model file lock)**: A new
+    download claimed in the window between the survivor listing and filesystem
+    deletion can race with the delete. For Hugging Face and NGC, this can leave
+    the model marked `DOWNLOADED` with a partial snapshot on disk (`hf-hub`
+    recreates deleted directories with `create_dir_all` and writes remaining
+    files, and HF/NGC presence checks accept a single readable file) and the
+    server serves that partial snapshot as ready until the model is deleted
+    (`modelexpress-cli model clear` or `kubectl delete mxcache`). S3 and GCS
+    detect incomplete snapshots via their completion marker (`.mx-model`) or
+    manifest.
+  - **Rolling upgrades**: Older replicas lack the 25-second writer self-fence
+    and can continue writing after the lease wait elapses during a rolling
+    upgrade.
+  - **Download completion polling (500 ms) and delete-before-observed**: Every
+    waiting `EnsureModelDownloaded` request observes completion by polling the
+    registry every 500 ms, so a caller can observe completion up to one poll
+    interval (500 ms) after the download finishes. Deleting a model before a
+    waiting request observes `DOWNLOADED` counts as a delete during the
+    download; a connected caller can legitimately re-claim and re-download the
+    model on its next poll.
+  - **Shared vs. independent per-replica caches**: Registry-driven cleanup
+    operates on the cache directory configured on the replica handling the
+    cleanup; independent per-replica caches are out of scope.
+  - **GCS on-disk overlap**: If a seeded or overlapping GCS model directory
+    prevents removal, the server logs a warning naming both the target and the
+    overlapping model and leaves the files on disk.
+
 For automatic cleanup of P2P metadata, expose the client Pod identity through
 the Kubernetes Downward API. The checked-in vLLM, SGLang, and Dynamo manifests
 already include these fields:
@@ -178,7 +314,7 @@ behaves as above.
 
 #### Storage access modes
 
-MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY`, default `./cache`). Its access-mode requirement depends on deployment topology, not on MX itself:
+MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS_CACHE_DIRECTORY` / `--cache-directory` / `cache.directory`, auto-resolved when unset). Its access-mode requirement depends on deployment topology, not on MX itself:
 
 | Mode | Cache volume | Notes |
 |------|-------------|-------|
@@ -190,15 +326,21 @@ MX has one configurable filesystem path, the model weights cache (`MODEL_EXPRESS
 | P2P RDMA receivers, weights only | none on receiver | Weights land in GPU HBM; the source may have bootstrapped through server cache, InstantTensor, ModelStreamer, GDS, or the native loader |
 | P2P RDMA receivers, weights and artifacts | Writable local staging and runtime cache paths | Weights land in GPU HBM. File-backed artifacts are staged locally, verified, and installed into the target engine's filesystem caches. |
 
-For new multi-replica deployments, prefer the no-shared-storage row: each MX replica can use its own RWO or ephemeral cache while Redis or Kubernetes coordinates lifecycle state. The RWX row is mainly for existing shared-cache topologies, and the single-replica row is a local/dev simplification.
+For new multi-replica deployments, prefer the no-shared-storage row: each MX replica can use its own RWO or ephemeral cache while Redis or Kubernetes coordinates lifecycle state. Note that with per-replica caches, a registry-driven cache delete (`DeleteModel`, eviction, or `kubectl delete mxcache`) removes files only on the single replica that performs the cleanup; other replicas retain their local copies until cleared or evicted on those replicas. The RWX row is mainly for existing shared-cache topologies, and the single-replica row is a local/dev simplification.
 
 #### Cache Settings
 
 | Option | CLI Flag | Env Var | Default | Description |
 |--------|----------|---------|---------|-------------|
-| directory | `--cache-directory` | `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Model cache directory |
+| directory | `--cache-directory` | `MODEL_EXPRESS_CACHE_DIRECTORY` | unset (auto-resolved) | Model cache directory |
 | max_size_bytes | - | - | null (unlimited) | Max cache size in bytes |
 | eviction.enabled | `--cache-eviction-enabled` | `MODEL_EXPRESS_CACHE_EVICTION_ENABLED` | `true` | Enable LRU eviction |
+
+Server cache directory resolution precedence (shared across downloads, file streaming, deletion, and LRU eviction, and logged with its source at startup):
+1. Explicit server setting: `--cache-directory` CLI flag > `MODEL_EXPRESS_CACHE_DIRECTORY` environment variable > non-null `cache.directory` in the server configuration file
+2. Otherwise, `CacheConfig::discover()` (matching shared-storage clients): `MODEL_EXPRESS_CACHE_DIRECTORY` > `~/.model-express/config.yaml` > auto-detected existing cache directory > default (`~/.cache/model-express`)
+
+> **Upgrade note:** Earlier versions defaulted `cache.directory` to `./cache` in generated `model-express.yaml` files while downloads ignored that field and used `CacheConfig::discover()`. The server now uses one unified cache directory for all operations. If an existing `model-express.yaml` still sets `cache.directory: "./cache"` without `MODEL_EXPRESS_CACHE_DIRECTORY` or `--cache-directory`, remove or set `cache.directory: null` to keep `CacheConfig::discover()`, or set it explicitly to your active cache path.
 
 Eviction policy settings (in config file only):
 - `eviction.policy.unused_threshold` - Evict models unused for this duration (default: 7 days)

@@ -230,6 +230,64 @@ async fn concurrent_error_retries_yield_single_winner() {
 
 #[tokio::test]
 #[ignore = "requires a live Redis at REDIS_URL"]
+async fn concurrent_downloaded_reclaims_yield_single_winner() {
+    let backend = Arc::new(fresh_backend().await);
+    let name = unique_name("reclaim-downloaded");
+
+    backend
+        .set_status(
+            &name,
+            ModelProvider::HuggingFace,
+            ModelStatus::DOWNLOADED,
+            Some("seeded".to_string()),
+        )
+        .await
+        .expect("seed DOWNLOADED record");
+
+    let mut handles = Vec::new();
+    for owner in 0..8 {
+        let b = backend.clone();
+        let n = name.clone();
+        let claim_id = format!("reclaim-owner-{owner}");
+        handles.push(tokio::spawn(async move {
+            b.try_reclaim_downloaded(
+                &n,
+                ModelProvider::HuggingFace,
+                &claim_id,
+                TEST_LEASE_DURATION,
+            )
+            .await
+        }));
+    }
+
+    let mut winners = 0;
+    let mut losers = 0;
+    for h in handles {
+        if h.await.expect("spawn join").expect("reclaim CAS result") {
+            winners += 1;
+        } else {
+            losers += 1;
+        }
+    }
+    assert_eq!(winners, 1, "exactly one replica must win reclaim CAS");
+    assert_eq!(losers, 7, "the other seven must lose reclaim CAS");
+
+    let rec = backend
+        .get_model_record(&name)
+        .await
+        .expect("get")
+        .expect("present");
+    assert_eq!(rec.status, ModelStatus::DOWNLOADING);
+    assert_eq!(
+        rec.message.as_deref(),
+        Some("Re-downloading missing cached files...")
+    );
+
+    backend.delete_model(&name).await.expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires a live Redis at REDIS_URL"]
 async fn touch_updates_last_used_at() {
     let backend = fresh_backend().await;
     let name = unique_name("touch");

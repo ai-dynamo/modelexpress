@@ -109,11 +109,14 @@ ModelExpress/
 │       │   ├── state.rs                # RegistryManager wrapper
 │       │   ├── stats_refresh.rs        # Background gauge refresh (own interval)
 │       │   ├── backend.rs              # RegistryBackend trait + ModelRecord
+│       │   ├── cache_cleanup.rs        # Survivor-aware cache cleanup planner & executor
 │       │   ├── entry_key.rs            # EntryKey: model + revision + weight mode
 │       │   ├── k8s_types.rs            # ModelCacheEntry CRD type
 │       │   └── backend/
 │       │       ├── redis.rs            # Redis registry backend
 │       │       ├── kubernetes.rs       # K8s ModelCacheEntry registry backend
+│       │       ├── kubernetes/
+│       │       │   └── finalizer.rs    # ModelCacheEntry cache-files finalizer controller
 │       │       └── instrumented.rs     # Metrics decorator over RegistryBackend
 │       └── bin/
 │           └── config_gen.rs           # Config file generator/migrator
@@ -333,11 +336,34 @@ Six proto files define the server's gRPC services, all compiled via `tonic-build
 | `EnsureModelDownloaded` | `ModelDownloadRequest` | stream `ModelStatusUpdate` | Trigger download, stream progress |
 | `StreamModelFiles` | `ModelFilesRequest` | stream `FileChunk` | Stream model file contents (1MB chunks) |
 | `ListModelFiles` | `ModelFilesRequest` | `ModelFileList` | List files with sizes |
-| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model's records from the registry (used by `model clear`) |
+| `DeleteModel` | `DeleteModelRequest` | `DeleteModelResponse` | Remove a model's registry records and reclaim its cached files on disk (used by `model clear`) |
 
-Key message types: `ModelProvider` (HuggingFace, NGC, GCS), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
+Key message types: `ModelProvider` (HuggingFace, NGC, GCS, S3), `ModelStatus` (Downloading, Downloaded, Error), `ModelStatusUpdate`, `FileChunk`.
 
-`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit. If the files are missing (for example after a `model clear` that only removed local storage), the stale record is deleted and the download is re-claimed so the model is actually re-fetched rather than returning a false success.
+`EnsureModelDownloaded` verifies that a `DOWNLOADED` registry record still has its files on disk before honoring it as a cache hit (`has_cached_files` is weight-aware for GCS and metadata-only for S3, which returns `false` when `ignore_weights=false`; Hugging Face checks local snapshot presence without separating weight and metadata-only files; NGC checks for non-empty model files excluding `.tmp`). If the files are missing, the stale `DOWNLOADED` record is reclaimed in place via CAS (bounded retries returning `ERROR` rather than a false `DOWNLOADED`) so the model is re-fetched cleanly.
+
+#### Cache deletion, active downloads, and known limits
+
+Registry deletion and cache file reclamation share one survivor-aware planner (`modelexpress_server/src/registry/cache_cleanup.rs`) across `DeleteModel`, `CacheEvictionService`, and the Kubernetes `ModelCacheEntry` finalizer controller:
+
+- **Record-first order and canonical matching**: All three paths delete or mark terminating the registry record before removing files on disk. Matching canonicalizes provider names (for example, NGC raw, `ngc://`, colon-version, and explicit-type spellings map to one canonical model name). Invalid or traversal model names and revisions produce `InvalidTarget` and never fall back to whole-model deletion; zero files are touched.
+- **Symlink containment**: All four providers enforce ancestor-symlink containment inside the resolved cache root before deleting any path. A symlinked directory component below the cache root is refused permanently; on Kubernetes, the CR stays in `Terminating` (retrying every 5 seconds) until an operator fixes or removes the symlink so cleanup can complete and strip the finalizer.
+- **Survivor-aware cleanup**:
+  - Unpinned entries cover the entire model directory and keep files while any survivor exists for that model.
+  - Hugging Face pinned revisions keep files while another live entry references the same commit or the unpinned model. When a pinned revision is deleted while a sibling entry of the same model is `DOWNLOADING`, the snapshot and stale refs are removed while blob reclamation and repo-root removal are deferred (`DeleteHfRevisionKeepBlobs`) until a later cleanup finds no sibling downloading.
+  - S3 and GCS overlapping prefixes keep a child while a live ancestor exists, and keep a parent while a descendant is `DOWNLOADING`. For S3, deleting a child (`a/b`) below a live ancestor (`a`) keeps `a/b/.mx-model` and its files until the ancestor is deleted. When an S3 or GCS parent is deleted while a descendant is `DOWNLOADING`, the planner chooses `Keep` and the parent's files remain on disk without a registry record; re-run `model clear` on the parent after the descendant finishes to reclaim them. For GCS, a seeded or on-disk overlap that prevents deletion logs a warning naming both the target and the overlapping model and leaves files untouched.
+- **Client-disconnect safety and fail-closed errors in `DeleteModel`**: `ModelServiceImpl::delete_model` validates inputs and spawns a detached task before the first destructive registry call, so a client disconnect mid-RPC does not stop disk cleanup after registry removal. If listing or deleting registry records fails, `DeleteModel` fails closed (`BackendError`) and deletes no files. If disk cleanup fails after registry records are removed, `DeleteModel` returns `success: false` (`Error`).
+- **25 s writer self-fence and in-flight downloads**: Active download tasks self-fence if 25 seconds pass without a confirmed lease renewal (inside the 30-second lease window). The deadline is anchored before the claim RPC is sent so a delayed reply cannot extend the window. A registry outage lasting longer than 25 seconds aborts in-flight downloads. When `DeleteModel` removes a `DOWNLOADING` entry, it does not delete files during the RPC: on Kubernetes the finalizer controller revokes `claimId` and waits the lease window (keyed by CR UID); on Redis/in-memory backends a detached cleanup task waits the lease window and then runs survivor-aware cleanup.
+
+Known operational limits:
+
+- **Late blocking filesystem operations**: Cancelling an in-flight download task cannot preempt a `tokio::fs` / `spawn_blocking` call that is already executing. There is no time bound on when that operation finishes, so the lease wait does not prove that all writes have stopped.
+- **Concurrent claim during file deletion (no per-model file lock)**: A new download claimed between the survivor listing and filesystem deletion can race with the delete. For Hugging Face and NGC, this can leave an entry marked `DOWNLOADED` with a partial snapshot on disk (`hf-hub` recreates deleted directories with `create_dir_all` and writes remaining files, and HF/NGC presence checks accept a single readable file) that the server serves as ready until the model is deleted (`model clear` or `kubectl delete mxcache`). S3 and GCS detect incomplete snapshots via their completion marker (`.mx-model`) or manifest.
+- **Rolling upgrades and pre-upgrade CRs**: Older replicas do not implement the 25-second writer self-fence and can keep writing to disk after the lease wait elapses during a rolling upgrade. Pre-upgrade `ModelCacheEntry` CRs are only protected after all old replicas have stopped and the upgraded server's finalizer controller has attached `modelexpress.nvidia.com/cache-files` (see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md#cache-deletion-uninstall-and-recovery-operations)).
+- **Redis deferred cleanup durability**: On Redis, the delayed post-lease cleanup task lives only in the replica that handled `DeleteModel` and is lost if that replica restarts before the wait ends. Recovery: run `model clear` again to reclaim leftover files.
+- **Registry polling and delete-before-observed**: Every waiting `EnsureModelDownloaded` request (both the claim owner and co-waiters) observes completion by polling the registry every 500 ms, so a caller can observe download completion up to one poll interval (500 ms) after the download finishes. Deleting a model before a waiting request observes `DOWNLOADED` counts as a delete during the download: a client that remains connected can legitimately re-claim and re-download the model on its next poll.
+- **Overlapping object-storage claims during delete**: An overlapping S3 or GCS download claimed concurrently while a delete is in progress can still race with the delete.
+- **Independent per-replica caches**: Shared-registry cleanup applies only to the cache directory mounted on the replica performing cleanup; independent per-replica caches are out of scope.
 
 #### Pinned revisions
 
@@ -423,7 +449,7 @@ The optional Redis-backed RefitService, immutable WeightVersion model, shard pub
    aborting startup.
 5. Connect to the model registry backend (`MX_METADATA_BACKEND` — same selector as P2P). Fails fast on connect error.
 6. Initialize the process-wide `ModelDownloadTracker` with the registry, seed the `MODEL_TRACKER` OnceLock
-7. Start `CacheEvictionService` background task (reads the same registry)
+7. Start `CacheEvictionService` background task (reads the same registry) and, when `MX_METADATA_BACKEND=kubernetes`, start the `ModelCacheEntry` finalizer controller
 8. Connect to the P2P metadata backend (`MX_METADATA_BACKEND`, Redis or Kubernetes CRD)
 9. Start reaper background task for stale source detection and GC
 10. Start the registry-statistics refresh task (`MX_REGISTRY_STATS_INTERVAL_SECS`,
@@ -433,8 +459,9 @@ The optional Redis-backed RefitService, immutable WeightVersion model, shard pub
 11. Register the configured gRPC services with tonic (max message size: 100MB),
     wrapped in the per-RPC metrics layer
 12. Listen on configured address (default `0.0.0.0:8001`)
-13. Graceful shutdown on CTRL+C: signals the cache eviction service, the reaper
-    and the statistics refresh, then joins them. The `/metrics` listener stops
+13. Graceful shutdown on CTRL+C: signals the cache eviction service, the
+    Kubernetes finalizer controller (when enabled), the reaper, and the
+    statistics refresh, then joins them. The `/metrics` listener stops
     **last**, after the gRPC server has drained, so the drain window stays
     scrapeable.
 
@@ -445,7 +472,7 @@ server:
   host: "0.0.0.0"        # MODEL_EXPRESS_SERVER_HOST
   port: 8001              # MODEL_EXPRESS_SERVER_PORT
 cache:
-  directory: "./cache"    # MODEL_EXPRESS_CACHE_DIRECTORY
+  directory: null         # MODEL_EXPRESS_CACHE_DIRECTORY (unset = auto-resolved)
   max_size_bytes: null
   eviction:
     enabled: true         # MODEL_EXPRESS_CACHE_EVICTION_ENABLED
@@ -468,7 +495,9 @@ Distributed backend selection lives outside the YAML, in env vars: `MX_METADATA_
 
 **Redis backend**: single Redis Hash per cached model at `mx:model:{provider}:{name}` with fields `provider`, `status`, `created_at` (RFC3339), `last_used_at` (RFC3339), and optional `message`. No secondary indexes — LRU ordering and status counts are computed on demand by `SCAN` + pipelined `HGETALL`/`HGET`. Claim, retry, and `set_status` updates use Lua scripts so concurrent readers see either the pre-update record or the complete post-update record, never a partially-written hash.
 
-**Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names are `mx-cache-` followed by `sanitize_registry_name("{provider}/{model_name}")`, which lowercases, maps `/` to `--`, and appends a sha256 suffix over the original name. The P2P `ModelMetadata` CRs use their own `sanitize_model_name`; the two are separate implementations, not a shared helper.
+**Kubernetes CRD backend**: one `ModelCacheEntry` CR per cached model in the server's namespace. `spec.modelName` + `spec.provider` are immutable; `status.{phase,createdAt,lastUsedAt,message,claimId,leaseExpiresAt}` are patched via the status subresource. Atomicity on the claim path comes from etcd's name-uniqueness on `create` (409 Conflict on the loser). CR names are `mx-cache-` followed by `sanitize_registry_name("{provider}/{model_name}")`, which lowercases, maps `/` to `--`, and appends a sha256 suffix over the original name. The P2P `ModelMetadata` CRs use their own `sanitize_model_name`; the two are separate implementations, not a shared helper.
+
+Every `ModelCacheEntry` CR carries the `modelexpress.nvidia.com/cache-files` finalizer (attached at creation and backfilled onto pre-upgrade CRs by the finalizer controller). Startup verifies `list`, `watch`, and `patch` on `modelcacheentries` plus `patch` on `modelcacheentries/status` via `SelfSubjectAccessReview`. Terminating CRs (`metadata.deletionTimestamp` set) are excluded from reads, listings, status counts, touch, claims, retries, heartbeats, and completion writes. The finalizer controller revokes active `claimId` leases on terminating `DOWNLOADING` (or uninitialized) CRs, enforces a UID-keyed writer wait before touching disk, executes survivor-aware cleanup, and strips only `modelexpress.nvidia.com/cache-files` via RFC 6902 JSON Patch testing `/metadata/uid`, `/metadata/resourceVersion`, and the exact finalizer index so recreated CRs and foreign finalizers are never clobbered. On disk cleanup failure, the finalizer stays attached for backoff retry.
 
 Key operations on the async `RegistryBackend` trait:
 
@@ -491,6 +520,12 @@ Runs in a background tokio task on a configurable interval (default 1 hour). LRU
 1. Time-based: evict models with `last_used_at` older than `unused_threshold` (default 7 days)
 2. Count-based: if total > `max_models`, evict oldest excess
 3. Only DOWNLOADED models are eligible for eviction
+
+Eviction deletes the registry record before deleting cached files via `cache_cleanup`:
+
+- Invalid stored targets remove only the invalid registry record and touch zero files on disk.
+- If deleting the registry record fails, cached files are left intact and the eviction is not counted.
+- If deleting cached files fails after the registry record was removed, the server logs an error advising `model clear` recovery and does not increment `evicted_count` or `mx_cache_evictions_total`.
 
 ### P2P Metadata Backends
 

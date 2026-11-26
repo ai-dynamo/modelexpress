@@ -460,6 +460,32 @@ impl RegistryBackend for RedisRegistryBackend {
         Ok(won == 1)
     }
 
+    async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let mut conn = self.get_conn().await?;
+        // Reclaim only runs after a claim observed AlreadyExists(DOWNLOADED) (which
+        // already migrated any legacy record), so the CAS targets the provider-scoped key.
+        let key = model_key(provider, model_name);
+        let now = Utc::now().to_rfc3339();
+        let won: i32 = redis::Script::new(RETRY_CAS_LUA)
+            .key(&key)
+            .arg(status_str(ModelStatus::DOWNLOADED))
+            .arg(status_str(ModelStatus::DOWNLOADING))
+            .arg(provider_str(provider))
+            .arg(&now)
+            .arg("Re-downloading missing cached files...")
+            .arg(claim_id)
+            .arg(lease_duration_millis(lease_duration))
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(won == 1)
+    }
+
     async fn refresh_download_claim(
         &self,
         model_name: &str,

@@ -13,7 +13,8 @@ use hf_hub::api::tokio::{ApiBuilder, ApiError};
 use hf_hub::{Cache, Repo, RepoType};
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, info, warn};
@@ -78,38 +79,167 @@ pub struct HuggingFaceProvider;
 
 pub(crate) struct HuggingFaceProviderCache;
 
+fn validate_single_segment(segment: &str, label: &str) -> Result<()> {
+    if segment.is_empty() || segment.trim() != segment {
+        anyhow::bail!("Invalid {label}: must be non-empty without surrounding whitespace");
+    }
+    if segment.contains('\0') || segment.contains('/') || segment == "." || segment == ".." {
+        anyhow::bail!("Invalid {label} '{segment}': unsafe path segment");
+    }
+    let mut components = Path::new(segment).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => anyhow::bail!("Invalid {label} '{segment}': must be a single normal path segment"),
+    }
+}
+
+fn validate_model_name(model_name: &str) -> Result<()> {
+    if model_name.is_empty() || model_name.trim() != model_name || model_name.contains('\0') {
+        anyhow::bail!("Invalid Hugging Face model name '{model_name}'");
+    }
+    let parts: Vec<&str> = model_name.split('/').collect();
+    if parts.is_empty() || parts.len() > 2 {
+        anyhow::bail!(
+            "Invalid Hugging Face model name '{model_name}': expected '<model>' or '<org>/<model>'"
+        );
+    }
+    for segment in &parts {
+        validate_single_segment(segment, "Hugging Face model name segment")?;
+        if segment.contains("--") || segment.starts_with('-') || segment.ends_with('-') {
+            anyhow::bail!(
+                "Invalid Hugging Face model name '{model_name}': segments must not contain '--' or start or end with '-'"
+            );
+        }
+    }
+    let folder = format!("models--{}", parts.join("--"));
+    validate_single_segment(&folder, "Hugging Face cache directory name")
+}
+
+fn validate_snapshot_revision(revision: &str) -> Result<()> {
+    validate_single_segment(revision, "Hugging Face snapshot revision")
+}
+
+fn validate_ref_name(revision: &str) -> Result<()> {
+    if revision.is_empty() || revision.trim() != revision || revision.contains('\0') {
+        anyhow::bail!("Invalid Hugging Face revision '{revision}'");
+    }
+    for segment in revision.split('/') {
+        validate_single_segment(segment, "Hugging Face revision segment")?;
+    }
+    Ok(())
+}
+
+fn remove_dir_all_if_exists(cache_root: &Path, path: &Path) -> Result<bool> {
+    if !crate::providers::ensure_delete_target_within_cache_root(cache_root, path)? {
+        return Ok(false);
+    }
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to inspect {}", path.display()));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
+        }
+    } else {
+        match fs::remove_dir_all(path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err).with_context(|| format!("Failed to remove {}", path.display())),
+        }
+    }
+}
+
+fn snapshot_has_readable_file(snapshot_dir: &Path) -> bool {
+    let mut stack = vec![snapshot_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_file() {
+                return true;
+            }
+            if file_type.is_symlink() {
+                if fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
+                    return true;
+                }
+            } else if file_type.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    false
+}
+
+fn remove_refs_for_commit(cache_root: &Path, refs_dir: &Path, commit: &str) {
+    if !crate::providers::ensure_delete_target_within_cache_root(cache_root, refs_dir)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if !fs::symlink_metadata(refs_dir).is_ok_and(|meta| meta.file_type().is_dir()) {
+        return;
+    }
+    let mut stack = vec![refs_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && fs::read_to_string(&path).is_ok_and(|target| target.trim() == commit)
+            {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => warn!("Failed to remove stale ref {}: {err}", path.display()),
+                }
+            }
+        }
+    }
+}
+
 impl HuggingFaceProviderCache {
-    fn repo_root(cache_root: &Path, model_name: &str) -> PathBuf {
-        cache_root.join(format!("models--{}", model_name.replace('/', "--")))
+    fn repo_root(cache_root: &Path, model_name: &str) -> Result<PathBuf> {
+        validate_model_name(model_name)?;
+        Ok(cache_root.join(format!("models--{}", model_name.replace('/', "--"))))
     }
 
-    fn snapshots_dir(cache_root: &Path, model_name: &str) -> PathBuf {
-        Self::repo_root(cache_root, model_name).join("snapshots")
+    fn snapshots_dir(cache_root: &Path, model_name: &str) -> Result<PathBuf> {
+        Ok(Self::repo_root(cache_root, model_name)?.join("snapshots"))
     }
 
-    fn refs_dir(cache_root: &Path, model_name: &str) -> PathBuf {
-        Self::repo_root(cache_root, model_name).join("refs")
+    fn refs_dir(cache_root: &Path, model_name: &str) -> Result<PathBuf> {
+        Ok(Self::repo_root(cache_root, model_name)?.join("refs"))
     }
 
     /// Read the commit a cached `refs/<revision>` entry points at.
     ///
-    /// Returns `None` when the ref does not exist, so callers can fall back to
-    /// treating the requested revision as a commit SHA.
+    /// Returns `None` when the ref does not exist or its target is not a safe
+    /// snapshot segment, so callers can fall back or reject safely.
     fn read_ref(cache_root: &Path, model_name: &str, revision: &str) -> Option<String> {
-        let ref_path = Self::refs_dir(cache_root, model_name).join(revision);
+        validate_ref_name(revision).ok()?;
+        let ref_path = Self::refs_dir(cache_root, model_name).ok()?.join(revision);
         let commit = fs::read_to_string(ref_path).ok()?;
         let commit = commit.trim();
-        if commit.is_empty() {
-            None
-        } else {
-            Some(commit.to_string())
-        }
-    }
-
-    /// Map a requested revision to the commit that identifies its snapshot directory,
-    /// using only local cache state.
-    fn local_commit_for_revision(cache_root: &Path, model_name: &str, revision: &str) -> String {
-        Self::read_ref(cache_root, model_name, revision).unwrap_or_else(|| revision.to_string())
+        validate_snapshot_revision(commit).ok()?;
+        Some(commit.to_string())
     }
 
     fn folder_name_to_model_id(folder_name: &str) -> String {
@@ -121,13 +251,16 @@ impl HuggingFaceProviderCache {
     }
 
     fn latest_local_snapshot_path(cache_root: &Path, model_name: &str) -> Result<PathBuf> {
-        let path = Self::snapshots_dir(cache_root, model_name);
+        let path = Self::snapshots_dir(cache_root, model_name)?;
 
-        if !path.exists() {
+        if !path.is_dir() {
             anyhow::bail!("Model snapshots for '{model_name}' not found in cache");
         }
 
-        let mut files: Vec<fs::DirEntry> = fs::read_dir(path)?.filter_map(Result::ok).collect();
+        let mut files: Vec<fs::DirEntry> = fs::read_dir(path)?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_dir()))
+            .collect();
         if files.is_empty() {
             anyhow::bail!("Model snapshots for '{model_name}' is empty");
         }
@@ -146,11 +279,9 @@ impl HuggingFaceProviderCache {
 
 impl ProviderCache for HuggingFaceProviderCache {
     fn clear_model(&self, cache_root: &Path, model_name: &str) -> Result<()> {
-        let model_path = Self::repo_root(cache_root, model_name);
+        let model_path = Self::repo_root(cache_root, model_name)?;
 
-        if model_path.exists() {
-            fs::remove_dir_all(&model_path)
-                .with_context(|| format!("Failed to remove model: {model_path:?}"))?;
+        if remove_dir_all_if_exists(cache_root, &model_path)? {
             info!(
                 "Cleared model: {} ({:?})",
                 model_name,
@@ -174,7 +305,10 @@ impl ProviderCache for HuggingFaceProviderCache {
         revision: Option<&str>,
     ) -> Result<PathBuf> {
         match revision {
-            Some(revision) => Ok(Self::snapshots_dir(cache_root, model_name).join(revision)),
+            Some(revision) => {
+                validate_snapshot_revision(revision)?;
+                Ok(Self::snapshots_dir(cache_root, model_name)?.join(revision))
+            }
             None => Self::latest_local_snapshot_path(cache_root, model_name),
         }
     }
@@ -278,7 +412,9 @@ impl HuggingFaceProvider {
             anyhow::anyhow!("Full-body response for '{filename}' is missing content-length")
         })?;
 
-        let repo_root = HuggingFaceProviderCache::repo_root(cache_dir, model_name);
+        let repo_root = HuggingFaceProviderCache::repo_root(cache_dir, model_name)?;
+        validate_snapshot_revision(commit_hash)?;
+        validate_single_segment(filename, "Hugging Face filename")?;
         let pointer_path = repo_root.join("snapshots").join(commit_hash).join(filename);
         let snapshot_dir = pointer_path
             .parent()
@@ -351,6 +487,9 @@ impl HuggingFaceProvider {
         revision: &str,
         commit_hash: &str,
     ) -> Result<()> {
+        validate_model_name(model_name)?;
+        validate_ref_name(revision)?;
+        validate_snapshot_revision(commit_hash)?;
         Cache::new(cache_dir.to_path_buf())
             .repo(Repo::with_revision(
                 model_name.to_string(),
@@ -372,30 +511,66 @@ impl HuggingFaceProvider {
     /// Best effort: a blob we cannot classify is kept. Leaking disk is recoverable,
     /// deleting a blob another snapshot still points at is not.
     fn reclaim_unreferenced_blobs(cache_dir: &Path, model_name: &str) {
-        let blobs_dir = HuggingFaceProviderCache::repo_root(cache_dir, model_name).join("blobs");
+        let Ok(repo_root) = HuggingFaceProviderCache::repo_root(cache_dir, model_name) else {
+            return;
+        };
+        let blobs_dir = repo_root.join("blobs");
+        if !crate::providers::ensure_delete_target_within_cache_root(cache_dir, &blobs_dir)
+            .unwrap_or(false)
+            || !fs::symlink_metadata(&blobs_dir).is_ok_and(|meta| meta.file_type().is_dir())
+        {
+            return;
+        }
         let Ok(blobs) = fs::read_dir(&blobs_dir) else {
             return;
         };
 
         let mut referenced = HashSet::new();
-        let snapshots_dir = HuggingFaceProviderCache::snapshots_dir(cache_dir, model_name);
+        let snapshots_dir = repo_root.join("snapshots");
+        if !fs::symlink_metadata(&snapshots_dir).is_ok_and(|meta| meta.file_type().is_dir()) {
+            return;
+        }
         let Ok(snapshots) = fs::read_dir(&snapshots_dir) else {
             // No snapshot directory to walk means we cannot prove a blob is unused.
             return;
         };
-        for snapshot in snapshots.filter_map(Result::ok) {
-            let Ok(entries) = fs::read_dir(snapshot.path()) else {
+        let mut dirs_to_scan = Vec::new();
+        for snapshot in snapshots {
+            let Ok(snapshot) = snapshot else {
+                return;
+            };
+            let Ok(file_type) = snapshot.file_type() else {
+                return;
+            };
+            if file_type.is_dir() {
+                dirs_to_scan.push(snapshot.path());
+            }
+        }
+        while let Some(dir) = dirs_to_scan.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
                 // An unreadable snapshot may reference anything, so keep every blob.
                 return;
             };
-            for entry in entries.filter_map(Result::ok) {
-                if let Ok(target) = fs::canonicalize(entry.path()) {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return;
+                };
+                let Ok(file_type) = entry.file_type() else {
+                    return;
+                };
+                let path = entry.path();
+                if file_type.is_dir() {
+                    dirs_to_scan.push(path);
+                } else if let Ok(target) = fs::canonicalize(&path) {
                     referenced.insert(target);
                 }
             }
         }
 
         for blob in blobs.filter_map(Result::ok) {
+            if !blob.file_type().is_ok_and(|ft| ft.is_file()) {
+                continue;
+            }
             let path = blob.path();
             let is_unreferenced = fs::canonicalize(&path)
                 .map(|canonical| !referenced.contains(&canonical))
@@ -403,6 +578,7 @@ impl HuggingFaceProvider {
             if is_unreferenced {
                 match fs::remove_file(&path) {
                     Ok(()) => debug!("Reclaimed unreferenced blob {}", path.display()),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                     Err(e) => warn!("Failed to reclaim blob {}: {e}", path.display()),
                 }
             }
@@ -418,6 +594,8 @@ impl HuggingFaceProvider {
         revision: &str,
         cache_dir: Option<&Path>,
     ) -> Result<hf_hub::api::RepoInfo> {
+        validate_model_name(model_name)?;
+        validate_ref_name(revision)?;
         let mut builder = ApiBuilder::from_env().with_token(resolve_hf_token());
         if let Some(cache_dir) = cache_dir {
             builder = builder.with_cache_dir(cache_dir.to_path_buf());
@@ -447,20 +625,24 @@ impl HuggingFaceProvider {
         model_name: &str,
         revision: Option<&str>,
     ) -> Result<String> {
+        let snapshots_dir = HuggingFaceProviderCache::snapshots_dir(cache_dir, model_name)?;
         match revision {
             Some(revision) => {
-                let commit = HuggingFaceProviderCache::local_commit_for_revision(
-                    cache_dir, model_name, revision,
-                );
-                let snapshot =
-                    HuggingFaceProviderCache::snapshots_dir(cache_dir, model_name).join(&commit);
-                if snapshot.is_dir() {
-                    Ok(commit)
-                } else {
-                    anyhow::bail!(
-                        "Revision '{revision}' of model '{model_name}' is not present in the cache"
-                    )
+                validate_ref_name(revision)?;
+                if validate_snapshot_revision(revision).is_ok()
+                    && snapshots_dir.join(revision).is_dir()
+                {
+                    return Ok(revision.to_string());
                 }
+                if let Some(commit) =
+                    HuggingFaceProviderCache::read_ref(cache_dir, model_name, revision)
+                    && snapshots_dir.join(&commit).is_dir()
+                {
+                    return Ok(commit);
+                }
+                anyhow::bail!(
+                    "Revision '{revision}' of model '{model_name}' is not present in the cache"
+                )
             }
             None => {
                 let latest =
@@ -487,6 +669,10 @@ impl HuggingFaceProvider {
         ignore_weights: bool,
         revision: Option<&str>,
     ) -> Result<ModelDownloadOutcome> {
+        validate_model_name(model_name)?;
+        if let Some(revision) = revision {
+            validate_ref_name(revision)?;
+        }
         let cache_dir = get_cache_dir(cache_dir);
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             anyhow::anyhow!("Failed to create cache directory {:?}: {}", cache_dir, e)
@@ -496,7 +682,7 @@ impl HuggingFaceProvider {
             info!("HF_HUB_OFFLINE is set, using cached model for '{model_name}'");
             let resolved = Self::resolve_revision_offline(&cache_dir, model_name, revision)?;
             let path =
-                HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(&resolved);
+                HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name)?.join(&resolved);
             return Ok(ModelDownloadOutcome {
                 path,
                 resolved_revision: Some(resolved),
@@ -536,6 +722,7 @@ impl HuggingFaceProvider {
                 )
             })?;
         debug!("Got model info: {info:?}");
+        validate_snapshot_revision(&info.sha)?;
 
         if info.siblings.is_empty() {
             anyhow::bail!("Model '{model_name}' exists but contains no downloadable files.");
@@ -637,9 +824,68 @@ impl HuggingFaceProvider {
         );
 
         Ok(ModelDownloadOutcome {
-            path: HuggingFaceProviderCache::snapshots_dir(&cache_dir, &model_name).join(&info.sha),
+            path: HuggingFaceProviderCache::snapshots_dir(&cache_dir, &model_name)?.join(&info.sha),
             resolved_revision: Some(info.sha),
         })
+    }
+}
+
+impl HuggingFaceProvider {
+    /// Validate that `revision` is a plain single-component snapshot directory name.
+    pub fn validate_snapshot_revision(revision: &str) -> Result<()> {
+        validate_snapshot_revision(revision)
+    }
+
+    /// Delete a single cached Hugging Face snapshot and stale refs pointing to it,
+    /// leaving `blobs/` and the repository root untouched.
+    ///
+    /// Used when deleting a revision while a sibling revision of the same model is
+    /// actively `DOWNLOADING`, so in-flight `.sync.part`, `.lock`, or newly renamed
+    /// blobs belonging to the sibling are never disturbed.
+    pub fn delete_snapshot_keeping_blobs(
+        model_name: &str,
+        cache_dir: &Path,
+        revision: &str,
+    ) -> Result<()> {
+        Self::delete_snapshot_internal(model_name, cache_dir, revision, false)
+    }
+
+    fn delete_snapshot_internal(
+        model_name: &str,
+        cache_dir: &Path,
+        revision: &str,
+        reclaim_blobs: bool,
+    ) -> Result<()> {
+        validate_snapshot_revision(revision)?;
+        let snapshots_dir = HuggingFaceProviderCache::snapshots_dir(cache_dir, model_name)?;
+        let snapshot = snapshots_dir.join(revision);
+
+        if remove_dir_all_if_exists(cache_dir, &snapshot)? {
+            info!("Deleted snapshot {revision} for model '{model_name}'");
+        } else {
+            info!("Snapshot {revision} for model '{model_name}' is not cached");
+        }
+
+        let refs_dir = HuggingFaceProviderCache::refs_dir(cache_dir, model_name)?;
+        remove_refs_for_commit(cache_dir, &refs_dir, revision);
+
+        if !reclaim_blobs {
+            return Ok(());
+        }
+
+        let no_snapshots_left = fs::read_dir(&snapshots_dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false);
+        if no_snapshots_left {
+            let repo_root = HuggingFaceProviderCache::repo_root(cache_dir, model_name)?;
+            if remove_dir_all_if_exists(cache_dir, &repo_root)? {
+                info!("Removed empty repository directory for model '{model_name}'");
+            }
+        } else {
+            HuggingFaceProvider::reclaim_unreferenced_blobs(cache_dir, model_name);
+        }
+
+        Ok(())
     }
 }
 
@@ -679,6 +925,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
         cache_dir: Option<PathBuf>,
         revision: Option<&str>,
     ) -> Result<Option<String>> {
+        validate_model_name(model_name)?;
+        if let Some(revision) = revision {
+            validate_ref_name(revision)?;
+        }
         let cache_dir = get_cache_dir(cache_dir);
 
         if is_offline_mode() {
@@ -695,110 +945,20 @@ impl ModelProviderTrait for HuggingFaceProvider {
         Ok(Some(info.sha))
     }
 
-    /// Attempt to delete a model from Hugging Face cache
-    /// Returns Ok(()) if the model was successfully deleted or didn't exist
+    /// Delete a model's repository directory from the local Hugging Face cache.
+    ///
+    /// Never contacts the Hub; returns `Ok(())` when the model is already absent.
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
         info!("Deleting model from Hugging Face cache: {model_name}");
-        let token = resolve_hf_token();
-        let api = ApiBuilder::from_env()
-            .with_token(token)
-            .with_cache_dir(cache_dir.clone())
-            .build()
-            .context("Failed to create Hugging Face API client")?;
-        let model_name = model_name.to_string();
-
-        let repo = api.model(model_name.clone());
-        let cache_repo = Cache::new(cache_dir).model(model_name.clone());
-
-        let info = match repo.info().await {
-            Ok(info) => info,
-            Err(_) => {
-                // If we can't get model info, assume it doesn't exist or is already deleted
-                info!("Model '{model_name}' not found or already deleted");
-                return Ok(());
-            }
-        };
-
-        if info.siblings.is_empty() {
-            info!("Model '{model_name}' has no files to delete");
-            return Ok(());
-        }
-
-        let mut files_deleted: u32 = 0;
-        let mut deletion_errors = Vec::new();
-        let mut model_dirs: HashSet<PathBuf> = HashSet::new();
-
-        for sib in &info.siblings {
-            if HuggingFaceProvider::is_subdirectory_file(&sib.rfilename) {
-                continue;
-            }
-
-            if HuggingFaceProvider::is_ignored(&sib.rfilename)
-                || HuggingFaceProvider::is_image(Path::new(&sib.rfilename))
-            {
-                continue;
-            }
-
-            // Cache-only lookup: avoid network fetch during deletion.
-            if let Some(cached_path) = cache_repo.get(&sib.rfilename) {
-                // Delete the cached file
-                match std::fs::remove_file(&cached_path) {
-                    Ok(_) => {
-                        files_deleted = files_deleted.saturating_add(1);
-                        info!("Deleted cached file: {}", cached_path.display());
-                        if let Some(model_dir) = cached_path.parent() {
-                            model_dirs.insert(model_dir.to_path_buf());
-                        }
-                    }
-                    Err(e) => {
-                        let error_msg =
-                            format!("Failed to delete cached file '{}'", cached_path.display());
-                        deletion_errors.push(anyhow::anyhow!(e).context(error_msg));
-                    }
-                }
-            }
-        }
-
-        // Try to remove the empty model directory if all files were deleted
-        if files_deleted > 0 && deletion_errors.is_empty() {
-            for model_dir in model_dirs {
-                if let Ok(mut entries) = std::fs::read_dir(&model_dir)
-                    && entries.next().is_none()
-                {
-                    if let Err(e) = std::fs::remove_dir(&model_dir) {
-                        info!("Could not remove empty model directory: {e}");
-                    } else {
-                        info!("Removed empty model directory: {}", model_dir.display());
-                    }
-                }
-            }
-        }
-
-        if !deletion_errors.is_empty() {
-            let mut compound_error =
-                anyhow::anyhow!("Failed to delete some files for model '{model_name}'");
-
-            for (i, error) in deletion_errors.into_iter().enumerate() {
-                compound_error =
-                    compound_error.context(format!("Error {}: {:#}", i.saturating_add(1), error));
-            }
-
-            return Err(compound_error);
-        }
-
-        if files_deleted == 0 {
-            info!("No cached files found to delete for model '{model_name}'");
-        } else {
-            info!("Successfully deleted {files_deleted} cached files for model '{model_name}'");
-        }
-
-        Ok(())
+        HuggingFaceProviderCache.clear_model(&cache_dir, model_name)
     }
 
     /// Delete a single cached revision, leaving the model's other revisions intact.
     ///
-    /// Once the last snapshot is gone the whole repository directory is removed, which
-    /// also reclaims the blobs the snapshots pointed at.
+    /// Treats `revision` as the literal snapshot directory name without resolving
+    /// through `refs/`, so a branch name cannot redirect deletion onto another entry's
+    /// snapshot. Still removes any `refs/` entry that pointed to the deleted commit.
+    /// Once the last snapshot is gone the whole repository directory is removed.
     async fn delete_model_revision(
         &self,
         model_name: &str,
@@ -806,59 +966,10 @@ impl ModelProviderTrait for HuggingFaceProvider {
         revision: Option<&str>,
     ) -> Result<()> {
         let Some(revision) = revision else {
-            // Remove the repository directory outright rather than going through
-            // `delete_model`, which enumerates the repo's files from the Hub and so
-            // frees nothing when the Hub is unreachable. Cache eviction has to reclaim
-            // disk without depending on the network, and dropping the directory also
-            // takes the blobs and refs that a file-by-file delete leaves behind.
             return HuggingFaceProviderCache.clear_model(&cache_dir, model_name);
         };
 
-        let commit =
-            HuggingFaceProviderCache::local_commit_for_revision(&cache_dir, model_name, revision);
-        let snapshot =
-            HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(&commit);
-
-        if snapshot.exists() {
-            fs::remove_dir_all(&snapshot)
-                .with_context(|| format!("Failed to remove snapshot {}", snapshot.display()))?;
-            info!("Deleted snapshot {} for model '{model_name}'", commit);
-        } else {
-            info!("Snapshot {commit} for model '{model_name}' is not cached");
-        }
-
-        // Drop refs that named the removed snapshot so a later lookup cannot resolve a
-        // branch or tag to a directory that no longer exists.
-        let refs_dir = HuggingFaceProviderCache::refs_dir(&cache_dir, model_name);
-        if let Ok(entries) = fs::read_dir(&refs_dir) {
-            for entry in entries.filter_map(Result::ok) {
-                let path = entry.path();
-                if path.is_file()
-                    && fs::read_to_string(&path).is_ok_and(|target| target.trim() == commit)
-                    && let Err(e) = fs::remove_file(&path)
-                {
-                    warn!("Failed to remove stale ref {}: {e}", path.display());
-                }
-            }
-        }
-
-        let snapshots_dir = HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name);
-        let no_snapshots_left = fs::read_dir(&snapshots_dir)
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(false);
-        if no_snapshots_left {
-            let repo_root = HuggingFaceProviderCache::repo_root(&cache_dir, model_name);
-            fs::remove_dir_all(&repo_root).with_context(|| {
-                format!("Failed to remove empty repository {}", repo_root.display())
-            })?;
-            info!("Removed empty repository directory for model '{model_name}'");
-        } else {
-            // Snapshot entries are symlinks into `blobs/`, so removing a snapshot frees
-            // almost none of its bytes. Reclaim the blobs no surviving snapshot points at.
-            HuggingFaceProvider::reclaim_unreferenced_blobs(&cache_dir, model_name);
-        }
-
-        Ok(())
+        Self::delete_snapshot_internal(model_name, &cache_dir, revision, true)
     }
 
     /// Get the full path to the latest model snapshot if it exists.
@@ -910,7 +1021,31 @@ impl ModelProviderTrait for HuggingFaceProvider {
         };
 
         let commit = Self::resolve_revision_offline(&cache_dir, model_name, Some(revision))?;
-        Ok(HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name).join(commit))
+        Ok(HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name)?.join(commit))
+    }
+
+    async fn has_cached_files(
+        &self,
+        model_name: &str,
+        cache_dir: PathBuf,
+        revision: Option<&str>,
+        _ignore_weights: bool,
+    ) -> Result<bool> {
+        validate_model_name(model_name)?;
+        if let Some(revision) = revision {
+            validate_ref_name(revision)?;
+        }
+        let Ok(commit) = Self::resolve_revision_offline(&cache_dir, model_name, revision) else {
+            return Ok(false);
+        };
+        let snapshot_dir =
+            HuggingFaceProviderCache::snapshots_dir(&cache_dir, model_name)?.join(commit);
+        Ok(snapshot_has_readable_file(&snapshot_dir))
+    }
+
+    fn canonical_model_name(&self, model_name: &str) -> Result<String> {
+        validate_model_name(model_name)?;
+        Ok(model_name.to_string())
     }
 
     fn supports_revisions(&self) -> bool {
@@ -1202,37 +1337,10 @@ mod tests {
         let model_name = "modelexpress-tests/delete-no-download";
 
         Mock::given(method("GET"))
-            .and(path_regex(
-                r"^/api/models/modelexpress-tests/delete-no-download(?:/.*)?$",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": model_name,
-                "sha": "def5678",
-                "siblings": [
-                    {"rfilename": "config.json"}
-                ]
-            })))
-            .expect(1)
-            .named("delete_model should query repo info exactly once")
-            .mount(&server)
-            .await;
-
-        // Deleting uncached files must not trigger any remote resolve/download requests.
-        Mock::given(method("GET"))
-            .and(path_regex(
-                r"^/modelexpress-tests/delete-no-download/resolve/(main|[^/]+)/config\.json$",
-            ))
-            .respond_with(
-                ResponseTemplate::new(206)
-                    .insert_header("etag", "\"def5678\"")
-                    .insert_header("x-repo-commit", "def5678")
-                    .insert_header("accept-ranges", "bytes")
-                    .insert_header("content-length", "64")
-                    .insert_header("content-range", "bytes 0-63/64")
-                    .set_body_bytes(vec![0u8; 64]),
-            )
+            .and(path_regex(r"^/.*$"))
+            .respond_with(ResponseTemplate::new(500))
             .expect(0)
-            .named("delete_model should not call Hugging Face resolve endpoint")
+            .named("delete_model must be local-only and never contact Hugging Face")
             .mount(&server)
             .await;
 
@@ -1250,6 +1358,22 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "Delete should succeed when cache is empty");
+
+        let repo_root = temp_cache
+            .path()
+            .join("models--modelexpress-tests--delete-no-download");
+        std::fs::create_dir_all(repo_root.join("snapshots/abc1234"))
+            .expect("Failed to create snapshot");
+        std::fs::create_dir_all(repo_root.join("blobs")).expect("Failed to create blobs");
+        std::fs::write(repo_root.join("snapshots/abc1234/config.json"), b"{}")
+            .expect("Failed to write config");
+        std::fs::write(repo_root.join("blobs/blob1"), b"data").expect("Failed to write blob");
+
+        provider
+            .delete_model(model_name, temp_cache.path().to_path_buf())
+            .await
+            .expect("Local-only delete should remove cached repository");
+        assert!(!repo_root.exists());
     }
 
     #[tokio::test]
@@ -1661,17 +1785,21 @@ mod tests {
             )
             .expect("Failed to write config");
         }
-        std::fs::create_dir_all(repo_root.join("refs")).expect("Failed to create refs");
+        std::fs::create_dir_all(repo_root.join("refs/release")).expect("Failed to create refs");
         std::fs::write(repo_root.join("refs/main"), "abc1234").expect("Failed to write ref");
+        std::fs::write(repo_root.join("refs/release/v1"), "abc1234").expect("Failed to write ref");
+        std::fs::write(repo_root.join("refs/stable"), "def5678").expect("Failed to write ref");
 
         let provider = HuggingFaceProvider;
         provider
-            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), Some("main"))
+            .delete_model_revision("test/model", temp_dir.path().to_path_buf(), Some("abc1234"))
             .await
             .expect("Deleting one revision should succeed");
 
         assert!(!repo_root.join("snapshots/abc1234").exists());
         assert!(!repo_root.join("refs/main").exists());
+        assert!(!repo_root.join("refs/release/v1").exists());
+        assert!(repo_root.join("refs/stable").exists());
         assert!(repo_root.join("snapshots/def5678/config.json").exists());
 
         provider
@@ -1867,6 +1995,378 @@ mod tests {
                 .iter()
                 .all(|request| !request.headers.contains_key("authorization")),
             "A cached token must not be sent once HF_HUB_DISABLE_IMPLICIT_TOKEN is set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validation_rejects_ambiguous_and_traversal_names_and_revisions() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let victim = temp_dir.path().join("models--org--model/snapshots/abc1234");
+        fs::create_dir_all(&victim).expect("Failed to create victim snapshot");
+        fs::write(victim.join("config.json"), b"{}").expect("Failed to write victim file");
+
+        let provider = HuggingFaceProvider;
+        let bad_names = [
+            "",
+            " ",
+            " org/model",
+            "org/model ",
+            ".",
+            "..",
+            "../other",
+            "org/..",
+            "org/.",
+            "/org/model",
+            "org/model/",
+            "org//model",
+            "a/b/c",
+            "org--model",
+            "org/a--b",
+            "org/model\0",
+        ];
+
+        for bad in bad_names {
+            assert!(
+                provider.canonical_model_name(bad).is_err(),
+                "canonical_model_name should reject '{bad}'"
+            );
+            assert!(
+                provider
+                    .delete_model(bad, temp_dir.path().to_path_buf())
+                    .await
+                    .is_err(),
+                "delete_model should reject '{bad}'"
+            );
+            assert!(
+                HuggingFaceProviderCache
+                    .clear_model(temp_dir.path(), bad)
+                    .is_err(),
+                "clear_model should reject '{bad}'"
+            );
+            assert!(
+                provider
+                    .has_cached_files(bad, temp_dir.path().to_path_buf(), None, false)
+                    .await
+                    .is_err(),
+                "has_cached_files should reject '{bad}'"
+            );
+        }
+
+        let bad_revisions = [
+            "",
+            " ",
+            " abc",
+            "abc ",
+            ".",
+            "..",
+            "../abc1234",
+            "../../models--org--model",
+            "a/b",
+            "abc\0",
+        ];
+        for bad_rev in bad_revisions {
+            assert!(
+                provider
+                    .delete_model_revision(
+                        "org/model",
+                        temp_dir.path().to_path_buf(),
+                        Some(bad_rev)
+                    )
+                    .await
+                    .is_err(),
+                "delete_model_revision should reject revision '{bad_rev}'"
+            );
+        }
+
+        assert!(
+            victim.join("config.json").exists(),
+            "Invalid delete inputs must leave valid cached models untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_model_revision_does_not_resolve_through_refs() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_root = temp_dir.path().join("models--org--model");
+        let snapshot = repo_root.join("snapshots/abc1234");
+        fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+        fs::write(snapshot.join("config.json"), b"{}").expect("Failed to write config");
+        fs::create_dir_all(repo_root.join("refs")).expect("Failed to create refs");
+        fs::write(repo_root.join("refs/main"), "abc1234").expect("Failed to write ref");
+
+        HuggingFaceProvider
+            .delete_model_revision("org/model", temp_dir.path().to_path_buf(), Some("main"))
+            .await
+            .expect("Deleting an uncached literal snapshot name should be idempotent");
+
+        assert!(
+            snapshot.join("config.json").exists(),
+            "Deleting branch name 'main' must not dereference refs/main and delete snapshots/abc1234"
+        );
+        assert!(repo_root.join("refs/main").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_delete_does_not_follow_symlinks_outside_cache() {
+        let cache_dir = TempDir::new().expect("Failed to create cache dir");
+        let outside_dir = TempDir::new().expect("Failed to create outside dir");
+        let outside_file = outside_dir.path().join("keep.txt");
+        fs::write(&outside_file, b"important").expect("Failed to write outside file");
+
+        let linked_repo = cache_dir.path().join("models--org--linked");
+        symlink(outside_dir.path(), &linked_repo).expect("Failed to create repo symlink");
+
+        HuggingFaceProvider
+            .delete_model("org/linked", cache_dir.path().to_path_buf())
+            .await
+            .expect("Deleting a symlinked repo root should succeed");
+
+        assert!(linked_repo.symlink_metadata().is_err());
+        assert!(
+            outside_file.exists(),
+            "External target of a symlinked repo root must stay intact"
+        );
+
+        let nested_repo = cache_dir.path().join("models--org--nested");
+        let snapshot = nested_repo.join("snapshots/abc1234");
+        fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+        symlink(outside_dir.path(), snapshot.join("escape")).expect("Failed to create symlink");
+
+        HuggingFaceProvider
+            .delete_model_revision(
+                "org/nested",
+                cache_dir.path().to_path_buf(),
+                Some("abc1234"),
+            )
+            .await
+            .expect("Deleting snapshot containing symlink should succeed");
+
+        assert!(!nested_repo.exists());
+        assert!(
+            outside_file.exists(),
+            "External target of a symlink inside a snapshot must stay intact"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_has_cached_files_after_download_in_each_weight_mode_and_offline() {
+        let env_lock = acquire_env_mutex();
+        let mock_server = MockHFServer::new(&env_lock).await;
+        let provider = HuggingFaceProvider;
+
+        for ignore_weights in [false, true] {
+            let cache_dir = TempDir::new().expect("Failed to create cache dir");
+            assert!(
+                !provider
+                    .has_cached_files(
+                        "test/model",
+                        cache_dir.path().to_path_buf(),
+                        Some("def5678"),
+                        ignore_weights,
+                    )
+                    .await
+                    .expect("has_cached_files should succeed when empty"),
+                "Empty cache must report false for ignore_weights={ignore_weights}"
+            );
+
+            let outcome = provider
+                .download_model_revision(
+                    "test/model",
+                    Some(cache_dir.path().to_path_buf()),
+                    ignore_weights,
+                    None,
+                )
+                .await
+                .expect("Download should succeed");
+
+            assert!(
+                provider
+                    .has_cached_files(
+                        "test/model",
+                        cache_dir.path().to_path_buf(),
+                        outcome.resolved_revision.as_deref(),
+                        ignore_weights,
+                    )
+                    .await
+                    .expect("has_cached_files should succeed after download"),
+                "Downloaded model must report present for ignore_weights={ignore_weights}"
+            );
+            assert!(
+                provider
+                    .has_cached_files(
+                        "test/model",
+                        cache_dir.path().to_path_buf(),
+                        None,
+                        ignore_weights,
+                    )
+                    .await
+                    .expect("Unpinned has_cached_files should succeed after download"),
+                "Unpinned check must report present for ignore_weights={ignore_weights}"
+            );
+
+            // Deleting blobs leaves broken symlinks in snapshots/, which must report absent.
+            let blobs_dir = cache_dir.path().join("models--test--model/blobs");
+            if blobs_dir.exists() {
+                fs::remove_dir_all(&blobs_dir).expect("Failed to remove blobs");
+                assert!(
+                    !provider
+                        .has_cached_files(
+                            "test/model",
+                            cache_dir.path().to_path_buf(),
+                            outcome.resolved_revision.as_deref(),
+                            ignore_weights,
+                        )
+                        .await
+                        .expect("has_cached_files should handle broken symlinks"),
+                    "Broken blob symlinks must not report cached files present"
+                );
+            }
+        }
+
+        drop(mock_server);
+
+        // Verify has_cached_files never contacts the Hub even when unpinned.
+        let failing_hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/.*$"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .named("has_cached_files must never call the Hub")
+            .mount(&failing_hub)
+            .await;
+        let _hf_endpoint_guard =
+            EnvVarGuard::set(&env_lock, crate::envs::HF_ENDPOINT, &failing_hub.uri());
+        let _offline_guard = EnvVarGuard::remove(&env_lock, crate::envs::HF_HUB_OFFLINE);
+
+        let local_cache = TempDir::new().expect("Failed to create local cache");
+        let snapshot = local_cache
+            .path()
+            .join("models--test--model/snapshots/abc1234");
+        fs::create_dir_all(&snapshot).expect("Failed to create snapshot");
+        assert!(
+            !provider
+                .has_cached_files("test/model", local_cache.path().to_path_buf(), None, false)
+                .await
+                .expect("Empty snapshot dir should return Ok(false)")
+        );
+        fs::write(snapshot.join("config.json"), b"{}").expect("Failed to write config");
+        assert!(
+            provider
+                .has_cached_files("test/model", local_cache.path().to_path_buf(), None, false)
+                .await
+                .expect("Populated snapshot dir should return Ok(true)")
+        );
+    }
+
+    #[test]
+    fn test_hf_validate_model_name_rejects_leading_and_trailing_dashes() {
+        for invalid in ["a-/b", "a/-b", "-a/b", "a/b-", "-model", "model-"] {
+            assert!(
+                validate_model_name(invalid).is_err(),
+                "Expected leading/trailing dash model name '{invalid}' to be rejected"
+            );
+        }
+        for valid in ["org-name/model-name", "meta-llama/Llama-3.1-8B", "gpt2"] {
+            assert!(
+                validate_model_name(valid).is_ok(),
+                "Expected valid model name '{valid}' to succeed"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_hf_delete_model_revision_rejects_symlinked_snapshots_ancestor() {
+        let cache = TempDir::new().expect("create cache dir");
+        let outside = TempDir::new().expect("create outside dir");
+        let outside_rev = outside.path().join("rev1");
+        fs::create_dir_all(&outside_rev).expect("create outside rev dir");
+        fs::write(outside_rev.join("secret.txt"), b"keep").expect("write outside file");
+
+        let repo_root = cache.path().join("models--org--model");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        std::os::unix::fs::symlink(outside.path(), repo_root.join("snapshots"))
+            .expect("create snapshots symlink");
+
+        let err = HuggingFaceProvider
+            .delete_model_revision("org/model", cache.path().to_path_buf(), Some("rev1"))
+            .await
+            .expect_err("Expected symlinked snapshots ancestor to be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "Unexpected error: {err}"
+        );
+        assert!(
+            outside_rev.join("secret.txt").is_file(),
+            "Outside directory must not be deleted through symlinked snapshots ancestor"
+        );
+    }
+
+    #[test]
+    fn test_delete_snapshot_keeping_blobs_preserves_inflight_blobs_and_repo_root() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let repo_root = temp_dir.path().join("models--org--model");
+        let snapshot = repo_root.join("snapshots/rev1");
+        let blobs = repo_root.join("blobs");
+        let refs = repo_root.join("refs/release");
+        fs::create_dir_all(&snapshot).expect("create snapshot");
+        fs::create_dir_all(&blobs).expect("create blobs");
+        fs::create_dir_all(&refs).expect("create refs");
+
+        fs::write(snapshot.join("config.json"), b"{}").expect("write snapshot file");
+        fs::write(blobs.join("etag1"), b"blob-data").expect("write blob");
+        fs::write(blobs.join("etag2.sync.part"), b"partial").expect("write partial blob");
+        fs::write(blobs.join("etag2.lock"), b"").expect("write lock");
+        fs::write(repo_root.join("refs/main"), "rev1").expect("write main ref");
+        fs::write(refs.join("v1"), "rev1").expect("write nested ref");
+        fs::write(repo_root.join("refs/other"), "rev2").expect("write other ref");
+
+        HuggingFaceProvider::delete_snapshot_keeping_blobs("org/model", temp_dir.path(), "rev1")
+            .expect("delete_snapshot_keeping_blobs should succeed");
+
+        assert!(!snapshot.exists(), "deleted snapshot must be removed");
+        assert!(
+            !repo_root.join("refs/main").exists(),
+            "stale top-level ref must be removed"
+        );
+        assert!(
+            !refs.join("v1").exists(),
+            "stale nested ref must be removed"
+        );
+        assert!(
+            repo_root.join("refs/other").exists(),
+            "unrelated ref must remain"
+        );
+        assert!(
+            repo_root.exists(),
+            "repo root must remain even when snapshots/ becomes empty"
+        );
+        assert!(
+            blobs.join("etag1").exists()
+                && blobs.join("etag2.sync.part").exists()
+                && blobs.join("etag2.lock").exists(),
+            "all blobs and in-flight partial files must remain untouched"
+        );
+
+        assert!(
+            HuggingFaceProvider::delete_snapshot_keeping_blobs(
+                "org/model",
+                temp_dir.path(),
+                "../outside"
+            )
+            .is_err(),
+            "traversal revision must be rejected"
+        );
+        assert!(
+            HuggingFaceProvider::delete_snapshot_keeping_blobs(
+                "org--model",
+                temp_dir.path(),
+                "rev1"
+            )
+            .is_err(),
+            "double-dash model segment must be rejected"
         );
     }
 }

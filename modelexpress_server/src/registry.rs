@@ -10,6 +10,7 @@
 //! `CacheEvictionService`. `entry_key` defines the identity every backend keys on.
 
 pub mod backend;
+pub mod cache_cleanup;
 pub mod entry_key;
 pub mod k8s_types;
 pub mod state;

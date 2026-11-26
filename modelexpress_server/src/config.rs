@@ -258,14 +258,43 @@ fn default_metrics_port() -> u16 {
 }
 
 /// Cache configuration wrapper
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CacheConfig {
     /// Cache eviction settings
     pub eviction: CacheEvictionConfig,
-    /// Cache directory path
-    pub directory: PathBuf,
+    /// Explicit cache directory path. When unset (`None`), the server resolves
+    /// `MODEL_EXPRESS_CACHE_DIRECTORY`, then `HF_HUB_CACHE`, then client cache
+    /// discovery (`~/.model-express/config.yaml`, auto-detected paths, or
+    /// `~/.cache/model-express`).
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
     /// Maximum cache size in bytes
     pub max_size_bytes: Option<u64>,
+}
+
+/// Source that determined the server's active model cache directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheDirectorySource {
+    /// Explicit server setting (`--cache-directory`, `MODEL_EXPRESS_CACHE_DIRECTORY`, or `cache.directory` in config file).
+    ServerConfig,
+    /// Discovered via `CacheConfig::discover()` (`MODEL_EXPRESS_CACHE_DIRECTORY`, `~/.model-express/config.yaml`, auto-detected path, or default).
+    Discovered,
+}
+
+impl std::fmt::Display for CacheDirectorySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ServerConfig => f.write_str("server config"),
+            Self::Discovered => f.write_str("discovered"),
+        }
+    }
+}
+
+/// Resolved server cache directory and the source that selected it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCacheDirectory {
+    pub path: PathBuf,
+    pub source: CacheDirectorySource,
 }
 
 /// Logging configuration
@@ -289,16 +318,6 @@ impl Default for ServerSettings {
             host: "0.0.0.0".to_string(),
             port: modelexpress_common::constants::DEFAULT_GRPC_PORT,
             metrics_port: default_metrics_port(),
-        }
-    }
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            eviction: CacheEvictionConfig::default(),
-            directory: PathBuf::from("./cache"),
-            max_size_bytes: None,
         }
     }
 }
@@ -365,7 +384,7 @@ impl ServerConfig {
 
         // Apply cache overrides
         if let Some(cache_directory) = args.cache_directory {
-            config.cache.directory = cache_directory;
+            config.cache.directory = Some(cache_directory);
         }
 
         if let Some(cache_eviction_enabled) = args.cache_eviction_enabled {
@@ -392,10 +411,47 @@ impl ServerConfig {
         Ok(config)
     }
 
+    /// Resolve the single model cache directory used by downloads, file serving,
+    /// deletion, and LRU eviction, along with the source that selected it.
+    ///
+    /// Precedence:
+    /// 1. Explicit `cache.directory` (`--cache-directory` > `MODEL_EXPRESS_CACHE_DIRECTORY` > config file)
+    /// 2. `CacheConfig::discover()` (`MODEL_EXPRESS_CACHE_DIRECTORY` > `~/.model-express/config.yaml` > auto-detected > default)
+    #[must_use]
+    pub fn resolve_cache_directory(&self) -> ResolvedCacheDirectory {
+        if let Some(dir) = self
+            .cache
+            .directory
+            .as_ref()
+            .filter(|path| !path.as_os_str().is_empty())
+        {
+            return ResolvedCacheDirectory {
+                path: dir.clone(),
+                source: CacheDirectorySource::ServerConfig,
+            };
+        }
+
+        let path = modelexpress_common::cache::CacheConfig::discover()
+            .unwrap_or_default()
+            .local_path;
+        ResolvedCacheDirectory {
+            path,
+            source: CacheDirectorySource::Discovered,
+        }
+    }
+
+    /// Resolved model cache directory path.
+    #[must_use]
+    pub fn cache_directory(&self) -> PathBuf {
+        self.resolve_cache_directory().path
+    }
+
     /// Validate the configuration
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Validate cache directory
-        if let Some(parent) = self.cache.directory.parent()
+        // Validate explicit cache directory parent
+        if let Some(ref directory) = self.cache.directory
+            && let Some(parent) = directory.parent()
+            && !parent.as_os_str().is_empty()
             && !parent.exists()
         {
             return Err(ConfigError::Message(format!(
@@ -454,8 +510,13 @@ impl ServerConfig {
             None => info!("  Metrics Port: disabled"),
         }
 
+        let resolved_cache = self.resolve_cache_directory();
         info!("Cache Configuration:");
-        info!("  Directory: {}", self.cache.directory.display());
+        info!(
+            "  Directory: {} (source: {})",
+            resolved_cache.path.display(),
+            resolved_cache.source
+        );
         info!("  Max Size: {:?}", self.cache.max_size_bytes);
         info!("  Eviction Enabled: {}", self.cache.eviction.enabled);
         info!(
@@ -841,7 +902,17 @@ mod tests {
         assert_eq!(config.server.port.get(), 9000);
         assert_eq!(config.logging.level, LogLevel::Error);
         assert_eq!(config.logging.format, LogFormat::Json);
-        assert_eq!(config.cache.directory, PathBuf::from("/tmp/override_cache"));
+        assert_eq!(
+            config.cache.directory,
+            Some(PathBuf::from("/tmp/override_cache"))
+        );
+        assert_eq!(
+            config.resolve_cache_directory(),
+            ResolvedCacheDirectory {
+                path: PathBuf::from("/tmp/override_cache"),
+                source: CacheDirectorySource::ServerConfig,
+            }
+        );
         assert!(!config.cache.eviction.enabled);
     }
 
@@ -1029,5 +1100,101 @@ mod tests {
             Some(0),
             "0 is the documented disable value"
         );
+    }
+
+    #[test]
+    fn test_cache_directory_resolution_precedence_and_unset_yaml() {
+        use modelexpress_common::test_support::{EnvVarGuard, acquire_env_mutex};
+
+        let env_lock = acquire_env_mutex();
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let explicit_dir = temp_dir.path().join("explicit");
+        let env_mx_dir = temp_dir.path().join("env-mx");
+        let env_hf_dir = temp_dir.path().join("env-hf");
+
+        let _mx_unset = EnvVarGuard::remove(&env_lock, "MODEL_EXPRESS_CACHE_DIRECTORY");
+        let _hf_guard = EnvVarGuard::set(
+            &env_lock,
+            "HF_HUB_CACHE",
+            env_hf_dir.to_str().expect("utf8 path"),
+        );
+
+        let config_file = temp_dir.path().join("unset_cache_dir.yaml");
+        fs::write(
+            &config_file,
+            r#"
+server:
+  host: "127.0.0.1"
+  port: 8002
+cache:
+  eviction:
+    enabled: false
+    policy:
+      type: lru
+      unused_threshold: "3d"
+      max_models: 10
+      min_free_space_bytes: null
+    check_interval: "30m"
+  max_size_bytes: null
+logging:
+  level: Info
+  format: Pretty
+  file: null
+  structured: false
+"#,
+        )
+        .expect("Failed to write config file");
+
+        let args = ServerArgs {
+            config: Some(config_file),
+            port: None,
+            host: None,
+            metrics_port: None,
+            log_level: None,
+            log_format: None,
+            cache_directory: None,
+            cache_eviction_enabled: None,
+            security: SecurityArgs::default(),
+            validate_config: false,
+        };
+        let mut config = ServerConfig::load_and_validate_strict(args).expect("should load");
+        assert!(config.cache.directory.is_none());
+        let expected_discovered = modelexpress_common::cache::CacheConfig::discover()
+            .unwrap_or_default()
+            .local_path;
+        // HF_HUB_CACHE must not override CacheConfig::discover().
+        assert_ne!(expected_discovered, env_hf_dir);
+        assert_eq!(
+            config.resolve_cache_directory(),
+            ResolvedCacheDirectory {
+                path: expected_discovered,
+                source: CacheDirectorySource::Discovered,
+            }
+        );
+
+        let _mx_guard = EnvVarGuard::set(
+            &env_lock,
+            "MODEL_EXPRESS_CACHE_DIRECTORY",
+            env_mx_dir.to_str().expect("utf8 path"),
+        );
+        assert_eq!(
+            config.resolve_cache_directory(),
+            ResolvedCacheDirectory {
+                path: env_mx_dir,
+                source: CacheDirectorySource::Discovered,
+            }
+        );
+
+        config.cache.directory = Some(explicit_dir.clone());
+        assert_eq!(
+            config.resolve_cache_directory(),
+            ResolvedCacheDirectory {
+                path: explicit_dir,
+                source: CacheDirectorySource::ServerConfig,
+            }
+        );
+
+        config.cache.directory = Some(temp_dir.path().join("missing-parent/cache"));
+        assert!(config.validate().is_err());
     }
 }

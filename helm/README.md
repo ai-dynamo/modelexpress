@@ -98,6 +98,7 @@ The following table lists the configurable parameters of the ModelExpress chart 
 | `serviceAccount.create`                      | Create a service account                       | `true`   |
 | `serviceAccount.annotations`                 | Service account annotations                    | `{}`     |
 | `serviceAccount.name`                        | Service account name                           | `""`     |
+| `serviceAccount.automount`                   | Automount service account token into pods (must be `true` for the Kubernetes metadata backend) | `false` |
 | `serviceAccount.rbac.enabled`                | Create a ClusterRole and ClusterRoleBinding for the Kubernetes metadata backend | `false` |
 | `podAnnotations`                             | Pod annotations                                | `{}`     |
 | `podSecurityContext`                         | Pod security context                           | `{runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, fsGroup: 1000}` |
@@ -239,10 +240,14 @@ extraEnv:
 
 Enabling `serviceAccount.rbac.enabled` creates a `ClusterRole` and
 `ClusterRoleBinding`, allowing a ModelExpress server deployed in a dedicated
-namespace to access metadata resources in a workload namespace:
+namespace to access metadata resources in a workload namespace. The chart sets
+`serviceAccount.automount: false` by default, so also set
+`serviceAccount.automount: true` so pods receive the projected token needed to
+reach the Kubernetes API server:
 
 ```yaml
 serviceAccount:
+  automount: true
   rbac:
     enabled: true
 
@@ -259,11 +264,41 @@ kubectl apply -f helm/crds/modelexpress-crds.yaml
 helm upgrade my-modelexpress ./helm
 ```
 
+When using `MX_METADATA_BACKEND=kubernetes`, the server checks `list`, `watch`,
+and `patch` on `modelcacheentries` plus `patch` on `modelcacheentries/status`
+at startup; ensure custom RBAC manifests grant `watch` on `modelcacheentries`
+before upgrading. During a rolling upgrade from older releases, older replicas
+lack the 25-second download writer self-fence and can continue writing to disk
+after the lease wait elapses. Pre-upgrade `ModelCacheEntry` CRs are only
+protected once all old replicas have stopped and the upgraded controller has
+attached `modelexpress.nvidia.com/cache-files` (see
+[`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md#cache-deletion-uninstall-and-recovery-operations)
+for the verification command and rollback steps).
+
 ## Uninstalling
 
-```bash
-helm uninstall my-modelexpress
-```
+When using `MX_METADATA_BACKEND=kubernetes`, `ModelCacheEntry` CRs carry the
+`modelexpress.nvidia.com/cache-files` finalizer.
+
+- **Delete CRs and cached files**: Delete `ModelCacheEntry` CRs while the
+  server is still running so cached files and finalizers are cleaned up before
+  removing the release. **Warning:** this deletes **all** cached model files on
+  the server's cache volume.
+
+  ```bash
+  kubectl delete modelcacheentries --all -n <namespace> --ignore-not-found=true
+  helm uninstall my-modelexpress -n <namespace>
+  ```
+
+- **Keep cached files on the volume**: Uninstall or stop the server first
+  (`helm uninstall my-modelexpress -n <namespace>`), then strip only
+  `modelexpress.nvidia.com/cache-files` from each `ModelCacheEntry` before
+  deleting the CRs or namespace (see
+  [`docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md#cache-deletion-uninstall-and-recovery-operations)).
+  Use the same strip procedure once no pod of the new version is running (a pod
+  of the new version re-attaches the finalizer) if CRs remain stuck in
+  `Terminating` after a forced uninstall or rollback to a version without the
+  finalizer controller.
 
 ## Troubleshooting
 

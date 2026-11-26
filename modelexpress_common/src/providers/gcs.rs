@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::providers::{ModelProviderTrait, ensure_crypto_provider};
+use crate::providers::{ModelProviderTrait, ensure_crypto_provider, reject_unsupported_revision};
 use anyhow::{Context, Result};
 use google_cloud_storage::client::{Storage, StorageControl};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 mod cache_manifest;
 mod download_progress;
@@ -139,10 +139,17 @@ impl ModelProviderTrait for GcsProvider {
         let model_dir_state = ModelDir::new(&cache_dir, &model_dir);
 
         if !model_dir_state.is_removable()? {
-            info!(
-                "GCS model '{}' not found in cache, skipping delete",
-                model_name
-            );
+            if let Some((relation, overlap)) = model_dir_state.find_overlap()? {
+                warn!(
+                    "Skipping delete for GCS model '{}': overlaps cached {} model '{}'",
+                    model_name, relation, overlap
+                );
+            } else {
+                info!(
+                    "GCS model '{}' not found in cache, skipping delete",
+                    model_name
+                );
+            }
             return Ok(());
         }
 
@@ -164,6 +171,19 @@ impl ModelProviderTrait for GcsProvider {
         }
 
         Ok(model_dir)
+    }
+
+    async fn has_cached_files(
+        &self,
+        model_name: &str,
+        cache_dir: PathBuf,
+        revision: Option<&str>,
+        ignore_weights: bool,
+    ) -> Result<bool> {
+        reject_unsupported_revision(self.provider_name(), revision)?;
+        let model = ModelName::parse(model_name)?;
+        let model_dir = model.model_dir(&cache_dir);
+        ModelDir::new(&cache_dir, &model_dir).cache_satisfies_request(ignore_weights)
     }
 
     fn canonical_model_name(&self, model_name: &str) -> Result<String> {
@@ -682,5 +702,214 @@ mod tests {
         assert_eq!(list_requests.len(), 1);
         assert_eq!(list_requests[0].parent, "projects/_/buckets/test-bucket");
         assert_eq!(list_requests[0].prefix, format!("{object_prefix}/"));
+
+        assert!(
+            provider
+                .has_cached_files(model_name, temp_dir.path().to_path_buf(), None, false)
+                .await
+                .expect("has_cached_files(false) should succeed after full download")
+        );
+        assert!(
+            provider
+                .has_cached_files(model_name, temp_dir.path().to_path_buf(), None, true)
+                .await
+                .expect("has_cached_files(true) should succeed after full download")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_cached_files_after_metadata_only_download_and_delete() {
+        let provider = GcsProvider;
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let server = MockServer::start().await;
+        let model_name = "gs://test-bucket/org/model/meta-only";
+        let object_prefix = "org/model/meta-only";
+
+        mount_gcs_read_object(&server, &format!("{object_prefix}/config.json"), 31, b"{}").await;
+
+        let control_stub = TestStorageControlStub::new([ListObjectsResponse::new().set_objects([
+            gcs_object(&format!("{object_prefix}/config.json"), b"{}", 31),
+            gcs_object(
+                &format!("{object_prefix}/weights/model.safetensors"),
+                b"weights",
+                32,
+            ),
+        ])]);
+        let control = StorageControl::from_stub(control_stub);
+
+        provider
+            .download_with_clients(
+                model_name,
+                Some(temp_dir.path().to_path_buf()),
+                true,
+                || async {
+                    ensure_crypto_provider()?;
+                    let storage = Storage::builder()
+                        .with_endpoint(server.uri())
+                        .with_credentials(Anonymous::new().build())
+                        .build()
+                        .await
+                        .context("Failed to initialize WireMock GCS data client")?;
+                    Ok((storage, control))
+                },
+            )
+            .await
+            .expect("Expected metadata-only WireMock GCS download to succeed");
+
+        assert!(
+            provider
+                .has_cached_files(model_name, temp_dir.path().to_path_buf(), None, true)
+                .await
+                .expect("has_cached_files(true) should succeed")
+        );
+        assert!(
+            !provider
+                .has_cached_files(model_name, temp_dir.path().to_path_buf(), None, false)
+                .await
+                .expect("has_cached_files(false) should return false without weights")
+        );
+        assert!(
+            provider
+                .has_cached_files(model_name, temp_dir.path().to_path_buf(), Some("rev"), true)
+                .await
+                .is_err()
+        );
+        assert!(
+            provider
+                .has_cached_files(
+                    "gs://test-bucket/org/bad\0model",
+                    temp_dir.path().to_path_buf(),
+                    None,
+                    true,
+                )
+                .await
+                .is_err()
+        );
+
+        provider
+            .delete_model(model_name, temp_dir.path().to_path_buf())
+            .await
+            .expect("delete should succeed");
+        provider
+            .delete_model(model_name, temp_dir.path().to_path_buf())
+            .await
+            .expect("second delete should be idempotent");
+        assert!(
+            !provider
+                .has_cached_files(model_name, temp_dir.path().to_path_buf(), None, true)
+                .await
+                .expect("has_cached_files after delete")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_delete_gcs_does_not_follow_symlinks() {
+        let provider = GcsProvider;
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let outside = TempDir::new().expect("Failed to create outside dir");
+        fs::write(outside.path().join("keep.txt"), b"keep").expect("write outside");
+
+        let model_name = "gs://test-bucket/org/symlinked";
+        let model_dir = expected_model_dir(temp_dir.path(), model_name);
+        fs::create_dir_all(model_dir.parent().expect("parent")).expect("create parent");
+        std::os::unix::fs::symlink(outside.path(), &model_dir).expect("create symlink");
+
+        provider
+            .delete_model(model_name, temp_dir.path().to_path_buf())
+            .await
+            .expect("delete symlink should succeed");
+        assert!(fs::symlink_metadata(&model_dir).is_err());
+        assert!(outside.path().join("keep.txt").is_file());
+    }
+
+    #[test]
+    fn test_gcs_remove_is_idempotent_when_missing() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let model_dir = expected_model_dir(temp_dir.path(), "gs://test-bucket/org/missing");
+        ModelDir::new(temp_dir.path(), &model_dir)
+            .remove()
+            .expect("removing missing GCS model dir should be idempotent");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_delete_gcs_rejects_symlinked_ancestor() {
+        let provider = GcsProvider;
+        let cache = TempDir::new().expect("Failed to create cache dir");
+        let outside = TempDir::new().expect("Failed to create outside dir");
+        let outside_model = outside.path().join("m");
+        fs::create_dir_all(&outside_model).expect("create outside model");
+        fs::write(outside_model.join("keep.txt"), b"keep").expect("write outside file");
+
+        let bucket_dir = cache.path().join("gcs").join("test-bucket");
+        fs::create_dir_all(&bucket_dir).expect("create bucket dir");
+        std::os::unix::fs::symlink(outside.path(), bucket_dir.join("link"))
+            .expect("create ancestor symlink");
+
+        let err = provider
+            .delete_model("gs://test-bucket/link/m", cache.path().to_path_buf())
+            .await
+            .expect_err("Expected symlinked ancestor to be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "Unexpected error: {err}"
+        );
+        assert!(
+            outside_model.join("keep.txt").is_file(),
+            "Outside files must not be deleted through symlinked GCS ancestor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_gcs_skips_seeded_overlap_and_reports_overlap() {
+        use super::cache_manifest::{CacheManifest, ManifestEntry};
+        use super::model_dir::INTERNAL_METADATA_DIR_NAME;
+
+        let provider = GcsProvider;
+        let cache = TempDir::new().expect("Failed to create cache dir");
+
+        let parent_name = "gs://test-bucket/org/parent";
+        let child_name = "gs://test-bucket/org/parent/child";
+        let parent_dir = expected_model_dir(cache.path(), parent_name);
+        let child_dir = expected_model_dir(cache.path(), child_name);
+        fs::create_dir_all(&child_dir).expect("create child dir");
+        fs::write(parent_dir.join("config.json"), b"{}").expect("write parent config");
+        fs::write(child_dir.join("config.json"), b"{}").expect("write child config");
+
+        let parent_manifest = CacheManifest {
+            version: 1,
+            model: parent_name.to_string(),
+            files: vec![ManifestEntry {
+                path: "config.json".to_string(),
+                generation: Some(1),
+                size: 2,
+                crc32c: format!("{:08x}", crc32c::crc32c(b"{}")),
+            }],
+        };
+        let parent_meta_dir = parent_dir.join(INTERNAL_METADATA_DIR_NAME);
+        fs::create_dir_all(&parent_meta_dir).expect("create parent metadata dir");
+        fs::write(
+            parent_meta_dir.join("manifest.json"),
+            serde_json::to_vec(&parent_manifest).expect("serialize parent manifest"),
+        )
+        .expect("write parent manifest");
+
+        let child_state = ModelDir::new(cache.path(), &child_dir);
+        let overlap = child_state
+            .find_overlap()
+            .expect("overlap check should succeed")
+            .expect("expected ancestor overlap");
+        assert_eq!(overlap.0, "ancestor");
+        assert_eq!(overlap.1.to_string(), parent_name);
+
+        provider
+            .delete_model(child_name, cache.path().to_path_buf())
+            .await
+            .expect("delete_model skips overlapped GCS dir with warning");
+        assert!(
+            child_dir.join("config.json").is_file(),
+            "Overlapped child directory must remain intact"
+        );
     }
 }

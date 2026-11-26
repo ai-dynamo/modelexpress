@@ -89,7 +89,23 @@ cleanup() {
         log_info "Cleaning up Kubernetes resources..."
         kubectl delete job grpc-transfer-test-cli -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
         kubectl delete job grpc-transfer-test-env -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+        # Delete ModelCacheEntry CRs while the server's finalizer controller is still running.
+        kubectl delete modelcacheentries --all -n "$NAMESPACE" --ignore-not-found=true --timeout=60s 2>/dev/null || true
         helm uninstall "$RELEASE_NAME" -n "$NAMESPACE" 2>/dev/null || true
+        # Strip only cache-files finalizer from any CRs left behind (e.g. if the server pod crashed)
+        # so namespace deletion does not block in Terminating while preserving foreign finalizers.
+        for cr in $(kubectl get modelcacheentries -n "$NAMESPACE" -o name 2>/dev/null || true); do
+            idx=0
+            for fin in $(kubectl get "$cr" -n "$NAMESPACE" -o jsonpath='{.metadata.finalizers[*]}' 2>/dev/null || true); do
+                if [ "$fin" = "modelexpress.nvidia.com/cache-files" ]; then
+                    kubectl patch "$cr" -n "$NAMESPACE" --type=json \
+                        -p="[{\"op\":\"test\",\"path\":\"/metadata/finalizers/${idx}\",\"value\":\"modelexpress.nvidia.com/cache-files\"},{\"op\":\"remove\",\"path\":\"/metadata/finalizers/${idx}\"}]" \
+                        2>/dev/null || true
+                    break
+                fi
+                idx=$((idx + 1))
+            done
+        done
         kubectl delete namespace "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
         if [ "$CREATED_CLUSTER" = true ]; then
             log_info "Deleting kind cluster ${KIND_CLUSTER_NAME}..."
@@ -100,6 +116,7 @@ cleanup() {
         log_warning "Skipping cleanup (--no-cleanup specified)"
         log_info "To cleanup manually, run:"
         echo "  kubectl delete job grpc-transfer-test-cli grpc-transfer-test-env -n $NAMESPACE"
+        echo "  kubectl delete modelcacheentries --all -n $NAMESPACE --ignore-not-found=true"
         echo "  helm uninstall $RELEASE_NAME -n $NAMESPACE"
         echo "  kubectl delete namespace $NAMESPACE"
         if [ "$CREATED_CLUSTER" = true ]; then

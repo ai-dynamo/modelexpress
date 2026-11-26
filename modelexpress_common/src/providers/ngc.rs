@@ -5,12 +5,13 @@ use crate::{
     cache::{ModelInfo, ProviderCache, directory_size},
     envs,
     models::ModelProvider,
-    providers::{ModelProviderTrait, lock_file::LockFile},
+    providers::{ModelProviderTrait, lock_file::LockFile, reject_unsupported_revision},
 };
 use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use tracing::{debug, info, warn};
 
 const NGC_CLI_CONFIG_PATH: &str = ".ngc/config";
@@ -24,6 +25,37 @@ struct NgcArtifactId {
     artifact_type: String,
     name: String,
     version: String,
+}
+
+impl NgcArtifactId {
+    fn canonical_name(&self) -> String {
+        match &self.team {
+            Some(team) => format!(
+                "{}/{}/{}/{}/{}",
+                self.org, team, self.artifact_type, self.name, self.version
+            ),
+            None => format!("{}/{}/{}", self.org, self.name, self.version),
+        }
+    }
+}
+
+fn validate_ngc_segment(segment: &str, label: &str) -> Result<()> {
+    if segment.is_empty() || segment.trim() != segment {
+        anyhow::bail!("NGC {label} must be non-empty without surrounding whitespace");
+    }
+    if segment.contains('\0')
+        || segment.contains('/')
+        || segment.contains(':')
+        || segment == "."
+        || segment == ".."
+    {
+        anyhow::bail!("NGC {label} '{segment}' is not a valid path segment");
+    }
+    let mut components = Path::new(segment).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => anyhow::bail!("NGC {label} '{segment}' must be a single normal path segment"),
+    }
 }
 
 /// Parse an NGC artifact name into its components.
@@ -41,51 +73,87 @@ fn parse_model_name(model_name: &str) -> Result<NgcArtifactId> {
     let model_name = model_name.trim();
     let model_name = model_name.strip_prefix("ngc://").unwrap_or(model_name);
     let parts: Vec<&str> = model_name.split('/').collect();
-    if parts.iter().any(|s| *s == "." || *s == "..") {
-        anyhow::bail!("NGC model name segments must not be '.' or '..'; got '{model_name}'");
-    }
-    match parts.len() {
+    let id = match parts.len() {
         3 => {
             // If the last segment contains a colon it is a `ngc://` URI of the form
             // `catalog/org/name:version` (e.g. `nim/nvidia/nemotron-3-super:v1`).
             // Map it to the team-models format so the correct NGC API path is used.
             if let Some((name, version)) = parts[2].split_once(':') {
-                Ok(NgcArtifactId {
+                NgcArtifactId {
                     org: parts[0].to_string(),
                     team: Some(parts[1].to_string()),
                     artifact_type: "models".to_string(),
                     name: name.to_string(),
                     version: version.to_string(),
-                })
+                }
             } else {
-                Ok(NgcArtifactId {
+                NgcArtifactId {
                     org: parts[0].to_string(),
                     team: None,
                     artifact_type: "models".to_string(),
                     name: parts[1].to_string(),
                     version: parts[2].to_string(),
-                })
+                }
             }
         }
-        4 => Ok(NgcArtifactId {
+        4 => NgcArtifactId {
             org: parts[0].to_string(),
             team: Some(parts[1].to_string()),
             artifact_type: "models".to_string(),
             name: parts[2].to_string(),
             version: parts[3].to_string(),
-        }),
-        5 => Ok(NgcArtifactId {
+        },
+        5 => NgcArtifactId {
             org: parts[0].to_string(),
             team: Some(parts[1].to_string()),
             artifact_type: parts[2].to_string(),
             name: parts[3].to_string(),
             version: parts[4].to_string(),
-        }),
+        },
         _ => anyhow::bail!(
             "NGC model name must be 'org/name/version', 'org/team/name/version', or \
              'org/team/type/name/version'; got '{model_name}'"
         ),
+    };
+
+    validate_ngc_segment(&id.org, "org")?;
+    if let Some(team) = &id.team {
+        validate_ngc_segment(team, "team")?;
+        if team == "models" {
+            anyhow::bail!("Invalid NGC model name '{model_name}': team must not be 'models'");
+        }
     }
+    validate_ngc_segment(&id.artifact_type, "artifact type")?;
+    validate_ngc_segment(&id.name, "name")?;
+    validate_ngc_segment(&id.version, "version")?;
+
+    Ok(id)
+}
+
+fn dir_has_completed_file(root: &Path) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".tmp"))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Resolve the cache directory for NGC models.
@@ -767,12 +835,37 @@ fn collect_ngc_models(ngc_root: &Path, dir: &Path, models: &mut Vec<ModelInfo>) 
     Ok(())
 }
 
+fn remove_ngc_model_dir(cache_root: &Path, id: &NgcArtifactId) -> Result<bool> {
+    let path = model_dir(cache_root, id);
+    if !crate::providers::ensure_delete_target_within_cache_root(cache_root, &path)? {
+        return Ok(false);
+    }
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| format!("Failed to inspect '{}'", path.display()));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err).with_context(|| format!("Failed to remove '{}'", path.display())),
+        }
+    } else {
+        match fs::remove_dir_all(&path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err).with_context(|| format!("Failed to remove '{}'", path.display())),
+        }
+    }
+}
+
 impl ProviderCache for NgcProviderCache {
     fn clear_model(&self, cache_root: &Path, model_name: &str) -> Result<()> {
         let id = parse_model_name(model_name)?;
-        let path = model_dir(cache_root, &id);
-        if path.exists() {
-            fs::remove_dir_all(&path).with_context(|| format!("Failed to remove {path:?}"))?;
+        if remove_ngc_model_dir(cache_root, &id)? {
             info!("Cleared NGC model: {model_name}");
         } else {
             warn!("NGC model '{model_name}' not found in cache");
@@ -885,18 +978,9 @@ impl ModelProviderTrait for NgcProvider {
     }
 
     async fn delete_model(&self, model_name: &str, cache_dir: PathBuf) -> Result<()> {
-        let id = match parse_model_name(model_name) {
-            Ok(id) => id,
-            Err(e) => {
-                warn!("Invalid NGC model name '{model_name}': {e}");
-                return Ok(());
-            }
-        };
+        let id = parse_model_name(model_name)?;
         let path = model_dir(&cache_dir, &id);
-        if path.exists() {
-            tokio::fs::remove_dir_all(&path)
-                .await
-                .with_context(|| format!("Failed to remove {path:?}"))?;
+        if remove_ngc_model_dir(&cache_dir, &id)? {
             info!("Deleted NGC model cache: {}", path.display());
         } else {
             info!(
@@ -931,6 +1015,23 @@ impl ModelProviderTrait for NgcProvider {
             path.display()
         );
         Ok(path)
+    }
+
+    async fn has_cached_files(
+        &self,
+        model_name: &str,
+        cache_dir: PathBuf,
+        revision: Option<&str>,
+        _ignore_weights: bool,
+    ) -> Result<bool> {
+        reject_unsupported_revision(self.provider_name(), revision)?;
+        let id = parse_model_name(model_name)?;
+        let path = model_dir(&cache_dir, &id);
+        Ok(path.is_dir() && dir_has_completed_file(&path))
+    }
+
+    fn canonical_model_name(&self, model_name: &str) -> Result<String> {
+        Ok(parse_model_name(model_name)?.canonical_name())
     }
 
     fn provider_name(&self) -> &'static str {
@@ -1781,5 +1882,289 @@ mod tests {
             .await;
 
         assert!(result.is_ok(), "nvapi key download failed: {result:?}");
+    }
+
+    #[test]
+    fn test_canonical_model_name_normalizes_all_aliases() {
+        let provider = NgcProvider;
+        for alias in ["nvidia/llama_v2_70b/1", "ngc://nvidia/llama_v2_70b/1"] {
+            assert_eq!(
+                provider
+                    .canonical_model_name(alias)
+                    .expect("Expected canonical org model name"),
+                "nvidia/llama_v2_70b/1",
+                "alias={alias}"
+            );
+        }
+
+        for alias in [
+            "nim/meta/llama-3.1-8b-instruct/hf-8c22764",
+            "ngc://nim/meta/llama-3.1-8b-instruct/hf-8c22764",
+            "nim/meta/llama-3.1-8b-instruct:hf-8c22764",
+            "ngc://nim/meta/llama-3.1-8b-instruct:hf-8c22764",
+            "nim/meta/models/llama-3.1-8b-instruct/hf-8c22764",
+            "ngc://nim/meta/models/llama-3.1-8b-instruct/hf-8c22764",
+        ] {
+            assert_eq!(
+                provider
+                    .canonical_model_name(alias)
+                    .expect("Expected canonical team model name"),
+                "nim/meta/models/llama-3.1-8b-instruct/hf-8c22764",
+                "alias={alias}"
+            );
+        }
+
+        assert_eq!(
+            provider
+                .canonical_model_name("nvidia/team/resources/my-resource/v1")
+                .expect("Expected canonical resource name"),
+            "nvidia/team/resources/my-resource/v1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_model_rejects_invalid_and_traversal_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let victim = dir.path().join("ngc/nim/nvidia/models/keep/v1");
+        fs::create_dir_all(&victim).expect("create victim");
+        fs::write(victim.join("config.json"), b"{}").expect("write victim");
+
+        let invalid_names = [
+            "",
+            "org/name",
+            "ngc://nim/nvidia/model:..",
+            "ngc://nim/nvidia/model:.",
+            "ngc://nim/nvidia/:v1",
+            "ngc://nim/nvidia/model:",
+            "ngc://nim/nvidia/a:b:c",
+            "nvidia//llama/1",
+            "nvidia/llama/1/",
+            "nvidia/llama/1\0",
+            "nvidia/ /llama/1",
+            "nvidia/team/type/name/..",
+        ];
+
+        for invalid in invalid_names {
+            assert!(
+                NgcProvider.canonical_model_name(invalid).is_err(),
+                "canonical_model_name should reject '{invalid}'"
+            );
+            assert!(
+                NgcProvider
+                    .delete_model(invalid, dir.path().to_path_buf())
+                    .await
+                    .is_err(),
+                "delete_model should return Err for '{invalid}'"
+            );
+            assert!(
+                NgcProviderCache.clear_model(dir.path(), invalid).is_err(),
+                "clear_model should reject '{invalid}'"
+            );
+            assert!(
+                NgcProvider
+                    .has_cached_files(invalid, dir.path().to_path_buf(), None, false)
+                    .await
+                    .is_err(),
+                "has_cached_files should reject '{invalid}'"
+            );
+        }
+
+        assert!(
+            victim.join("config.json").exists(),
+            "Invalid NGC names must leave cached models untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_delete_model_does_not_follow_symlink_outside_cache() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        let keep = outside_dir.path().join("keep.txt");
+        fs::write(&keep, b"important").expect("write outside");
+
+        let parent = cache_dir.path().join("ngc/nvidia/models/linked");
+        fs::create_dir_all(&parent).expect("create parent");
+        let model_link = parent.join("v1");
+        std::os::unix::fs::symlink(outside_dir.path(), &model_link).expect("symlink");
+
+        NgcProvider
+            .delete_model("nvidia/linked/v1", cache_dir.path().to_path_buf())
+            .await
+            .expect("delete symlinked model dir");
+
+        assert!(model_link.symlink_metadata().is_err());
+        assert!(keep.exists(), "External symlink target must stay intact");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_has_cached_files_after_download_in_each_weight_mode() {
+        let env_lock = acquire_env_mutex();
+        let server = MockServer::start().await;
+        let uri = server.uri();
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "mock-jwt"})),
+            )
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/models/[^/]+/[^/]+/files$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "requestStatus": {"statusCode": "SUCCESS"},
+                "paginationInfo": {"totalPages": 1},
+                "urls": [
+                    format!("{uri}/dl/config.json"),
+                    format!("{uri}/dl/model.safetensors")
+                ],
+                "filepath": ["config.json", "model.safetensors"]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/dl/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"payload".to_vec()))
+            .mount(&server)
+            .await;
+
+        let _api = EnvVarGuard::set(&env_lock, envs::NGC_API_ENDPOINT, &server.uri());
+        let _auth = EnvVarGuard::set(&env_lock, envs::NGC_AUTH_ENDPOINT, &server.uri());
+        let _key = EnvVarGuard::set(&env_lock, envs::NGC_API_KEY, "mock-key");
+
+        for ignore_weights in [false, true] {
+            let temp_dir = tempfile::TempDir::new().expect("tempdir");
+            assert!(
+                !NgcProvider
+                    .has_cached_files(
+                        "nim/nvidia/test-model/v1",
+                        temp_dir.path().to_path_buf(),
+                        None,
+                        ignore_weights,
+                    )
+                    .await
+                    .expect("empty cache check")
+            );
+
+            NgcProvider
+                .download_model(
+                    "nim/nvidia/test-model/v1",
+                    Some(temp_dir.path().to_path_buf()),
+                    ignore_weights,
+                )
+                .await
+                .expect("download should succeed");
+
+            assert!(
+                NgcProvider
+                    .has_cached_files(
+                        "ngc://nim/nvidia/test-model:v1",
+                        temp_dir.path().to_path_buf(),
+                        None,
+                        ignore_weights,
+                    )
+                    .await
+                    .expect("downloaded cache check"),
+                "has_cached_files must be true after download for ignore_weights={ignore_weights}"
+            );
+        }
+
+        // Temp-only directory must report absent, and pinned revisions must fail.
+        let temp_only_dir = tempfile::TempDir::new().expect("tempdir");
+        let model_path = temp_only_dir.path().join("ngc/nvidia/models/partial/1");
+        fs::create_dir_all(&model_path).expect("create dir");
+        fs::write(model_path.join("config.json.tmp"), b"partial").expect("write tmp");
+        assert!(
+            !NgcProvider
+                .has_cached_files(
+                    "nvidia/partial/1",
+                    temp_only_dir.path().to_path_buf(),
+                    None,
+                    false
+                )
+                .await
+                .expect("tmp-only dir should return false")
+        );
+        assert!(
+            NgcProvider
+                .has_cached_files(
+                    "nvidia/partial/1",
+                    temp_only_dir.path().to_path_buf(),
+                    Some("rev1"),
+                    false
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ngc_rejects_team_named_models() {
+        let cache = tempfile::TempDir::new().expect("tempdir");
+        let live_model = cache.path().join("ngc/nvidia/models/llama/1");
+        let tokenizer_dir = live_model.join("tokenizer");
+        fs::create_dir_all(&tokenizer_dir).expect("create live model and tokenizer dir");
+        fs::write(live_model.join("config.json"), b"{}").expect("write config");
+        fs::write(tokenizer_dir.join("vocab.json"), b"{}").expect("write vocab");
+
+        for invalid in [
+            "nvidia/models/llama/1/tokenizer",
+            "nvidia/models/llama/1",
+            "ngc://nvidia/models/llama:1",
+        ] {
+            assert!(
+                parse_model_name(invalid).is_err(),
+                "Expected team 'models' name '{invalid}' to be rejected"
+            );
+            assert!(
+                NgcProvider
+                    .delete_model(invalid, cache.path().to_path_buf())
+                    .await
+                    .is_err(),
+                "Expected delete_model('{invalid}') to fail"
+            );
+        }
+
+        assert!(
+            tokenizer_dir.join("vocab.json").is_file(),
+            "Live NGC model subdirectory must remain intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_ngc_delete_rejects_symlinked_ancestor() {
+        let cache = tempfile::TempDir::new().expect("tempdir");
+        let outside = tempfile::TempDir::new().expect("outside dir");
+        let outside_model = outside.path().join("models/llama/1");
+        fs::create_dir_all(&outside_model).expect("create outside model");
+        fs::write(outside_model.join("keep.txt"), b"keep").expect("write outside file");
+
+        let ngc_root = cache.path().join("ngc");
+        fs::create_dir_all(&ngc_root).expect("create ngc root");
+        std::os::unix::fs::symlink(outside.path(), ngc_root.join("nvidia"))
+            .expect("create ancestor symlink");
+
+        let err = NgcProvider
+            .delete_model("nvidia/llama/1", cache.path().to_path_buf())
+            .await
+            .expect_err("Expected symlinked ancestor to be rejected");
+        assert!(
+            err.to_string().contains("symlink"),
+            "Unexpected error: {err}"
+        );
+        assert!(
+            NgcProviderCache
+                .clear_model(cache.path(), "nvidia/llama/1")
+                .is_err()
+        );
+        assert!(
+            outside_model.join("keep.txt").is_file(),
+            "Outside files must not be deleted through symlinked NGC ancestor"
+        );
     }
 }

@@ -217,6 +217,35 @@ impl RegistryBackend for InMemoryRegistryBackend {
         }
     }
 
+    async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let mut state = self.lock();
+        let now = Utc::now();
+        let lease_expires_at = Self::lease_deadline(now, lease_duration);
+        match state.models.get_mut(model_name) {
+            Some(record) if record.status == ModelStatus::DOWNLOADED => {
+                record.provider = provider;
+                record.status = ModelStatus::DOWNLOADING;
+                record.message = Some("Re-downloading missing cached files...".to_string());
+                record.last_used_at = now;
+                state.leases.insert(
+                    model_name.to_string(),
+                    DownloadLease {
+                        claim_id: claim_id.to_string(),
+                        expires_at: lease_expires_at,
+                    },
+                );
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn refresh_download_claim(
         &self,
         model_name: &str,
@@ -560,6 +589,70 @@ mod tests {
         assert_eq!(
             backend.get_status("m").await.expect("get"),
             Some(ModelStatus::DOWNLOADED)
+        );
+    }
+
+    #[tokio::test]
+    async fn try_reclaim_downloaded_only_from_downloaded_and_establishes_lease() {
+        let backend = InMemoryRegistryBackend::new();
+        let provider = ModelProvider::HuggingFace;
+        let lease = std::time::Duration::from_secs(30);
+
+        assert!(
+            !backend
+                .try_reclaim_downloaded("m", provider, "owner-1", lease)
+                .await
+                .expect("reclaim missing")
+        );
+
+        backend
+            .set_status("m", provider, ModelStatus::ERROR, None)
+            .await
+            .expect("set error");
+        assert!(
+            !backend
+                .try_reclaim_downloaded("m", provider, "owner-1", lease)
+                .await
+                .expect("reclaim error")
+        );
+
+        backend
+            .set_status("m", provider, ModelStatus::DOWNLOADED, None)
+            .await
+            .expect("set downloaded");
+        assert!(
+            backend
+                .try_reclaim_downloaded("m", provider, "owner-1", lease)
+                .await
+                .expect("reclaim downloaded")
+        );
+        assert!(
+            !backend
+                .try_reclaim_downloaded("m", provider, "owner-2", lease)
+                .await
+                .expect("second reclaim must lose")
+        );
+        assert_eq!(
+            backend.get_status("m").await.expect("get"),
+            Some(ModelStatus::DOWNLOADING)
+        );
+        assert!(
+            backend
+                .refresh_download_claim("m", provider, "owner-1", lease)
+                .await
+                .expect("owner-1 owns reclaimed lease")
+        );
+        assert!(
+            !backend
+                .finish_download_claim("m", provider, "owner-2", ModelStatus::DOWNLOADED, None)
+                .await
+                .expect("owner-2 fenced")
+        );
+        assert!(
+            backend
+                .finish_download_claim("m", provider, "owner-1", ModelStatus::DOWNLOADED, None)
+                .await
+                .expect("owner-1 finishes")
         );
     }
 }

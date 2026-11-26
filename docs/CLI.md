@@ -131,11 +131,14 @@ modelexpress-cli model list --detailed
 # Check model storage status
 modelexpress-cli model status
 
-# Clear specific model from storage. This removes the local files and also
-# deletes the model's record from the server-side registry, so a later
-# `model download` re-fetches the model instead of returning a false cache hit.
-# If the server is unreachable, the local files are still cleared and a warning
-# notes that the registry record may remain.
+# Clear specific model from storage. This removes local files and sends
+# DeleteModel to the server, which deletes matching registry records and
+# reclaims cached files on the server (or defers file removal until after the
+# lease window when a download is in flight). If the server is unreachable,
+# local files are still cleared and a warning notes that server-side records
+# and files may remain. Re-run `model clear` to reclaim leftover files after a
+# failed eviction delete, a Redis replica restart during a deferred cleanup
+# window, or an S3/GCS parent delete deferred while a descendant was downloading.
 modelexpress-cli model clear google-t5/t5-small
 
 # Clear a Google Cloud Storage model from storage

@@ -49,7 +49,7 @@ impl ModelName {
             if component == "." || component == ".." {
                 anyhow::bail!("GCS model path must not contain '.' or '..' segments");
             }
-            if component.contains('\\') || has_windows_drive_prefix {
+            if component.contains('\0') || component.contains('\\') || has_windows_drive_prefix {
                 anyhow::bail!("GCS model path must contain only portable path segments");
             }
             components.push(component);
@@ -106,7 +106,7 @@ impl BucketName {
             anyhow::bail!("trimmed bucket name must not be empty");
         }
 
-        if without_trailing.contains('/') {
+        if without_trailing.contains('/') || without_trailing.contains('\0') {
             anyhow::bail!("bucket name must contain only the bucket name (no object path)");
         }
 

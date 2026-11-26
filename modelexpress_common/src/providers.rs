@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use anyhow::Result;
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 /// Install Ring before constructing clients that use a providerless Rustls transport.
 #[cfg(any(feature = "gcs", all(feature = "s3", feature = "tls-rustls")))]
@@ -45,6 +45,94 @@ pub fn reject_unsupported_revision(provider_name: &str, revision: Option<&str>) 
         ),
         None => Ok(()),
     }
+}
+
+/// Verify that every existing ancestor of `target` below `cache_dir` is a real
+/// directory resolving inside `cache_dir`.
+///
+/// Does not inspect or follow `target` itself so a symlink placed at the final
+/// path component can still be unlinked without following it.
+///
+/// Returns `Ok(true)` when `target`'s parent exists and is contained within
+/// `cache_dir`, `Ok(false)` when `cache_dir` or an intermediate ancestor does
+/// not exist yet, and `Err` when any ancestor is a symlink, is not a
+/// directory, or resolves outside `cache_dir`.
+pub(crate) fn ensure_delete_target_within_cache_root(
+    cache_dir: &Path,
+    target: &Path,
+) -> Result<bool> {
+    let relative = target.strip_prefix(cache_dir).map_err(|_| {
+        anyhow::anyhow!(
+            "Refusing to delete '{}': path is outside cache directory '{}'",
+            target.display(),
+            cache_dir.display()
+        )
+    })?;
+
+    let mut components = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(segment) => components.push(segment),
+            _ => anyhow::bail!(
+                "Refusing to delete '{}': unsafe path component relative to '{}'",
+                target.display(),
+                cache_dir.display()
+            ),
+        }
+    }
+    let Some((_, ancestors)) = components.split_last() else {
+        anyhow::bail!(
+            "Refusing to delete cache root directory '{}'",
+            cache_dir.display()
+        );
+    };
+
+    match std::fs::metadata(cache_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => anyhow::bail!(
+            "Refusing to delete '{}': cache directory '{}' is not a directory",
+            target.display(),
+            cache_dir.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "Failed to inspect cache directory '{}'",
+                    cache_dir.display()
+                )
+            });
+        }
+    }
+
+    let mut ancestor = cache_dir.to_path_buf();
+    for segment in ancestors {
+        ancestor.push(segment);
+        let meta = match std::fs::symlink_metadata(&ancestor) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to inspect '{}'", ancestor.display()));
+            }
+        };
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Refusing to delete '{}': ancestor '{}' is a symlink",
+                target.display(),
+                ancestor.display()
+            );
+        }
+        if !meta.file_type().is_dir() {
+            anyhow::bail!(
+                "Refusing to delete '{}': ancestor '{}' is not a directory",
+                target.display(),
+                ancestor.display()
+            );
+        }
+    }
+
+    Ok(true)
 }
 
 /// Trait for model providers
@@ -153,6 +241,26 @@ pub trait ModelProviderTrait: Send + Sync {
     ) -> Result<PathBuf> {
         reject_unsupported_revision(self.provider_name(), revision)?;
         self.get_model_path(model_name, cache_dir).await
+    }
+
+    /// Check whether the local cache contains files that satisfy a request for this model
+    /// and optional revision without contacting any remote service.
+    ///
+    /// Providers that distinguish metadata-only caches from full-weight caches use
+    /// `ignore_weights` so a metadata-only copy does not satisfy a full-weight request.
+    async fn has_cached_files(
+        &self,
+        model_name: &str,
+        cache_dir: PathBuf,
+        revision: Option<&str>,
+        ignore_weights: bool,
+    ) -> Result<bool> {
+        reject_unsupported_revision(self.provider_name(), revision)?;
+        let _ = ignore_weights;
+        Ok(self
+            .get_model_path_revision(model_name, cache_dir, revision)
+            .await
+            .is_ok())
     }
 
     /// Return the canonical model name for this provider.
@@ -269,6 +377,16 @@ pub mod s3 {
             anyhow::bail!(FEATURE_DISABLED)
         }
 
+        async fn has_cached_files(
+            &self,
+            _model_name: &str,
+            _cache_dir: PathBuf,
+            _revision: Option<&str>,
+            _ignore_weights: bool,
+        ) -> Result<bool> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
         fn provider_name(&self) -> &'static str {
             "S3"
         }
@@ -328,6 +446,16 @@ pub mod gcs {
         }
 
         async fn get_model_path(&self, _model_name: &str, _cache_dir: PathBuf) -> Result<PathBuf> {
+            anyhow::bail!(FEATURE_DISABLED)
+        }
+
+        async fn has_cached_files(
+            &self,
+            _model_name: &str,
+            _cache_dir: PathBuf,
+            _revision: Option<&str>,
+            _ignore_weights: bool,
+        ) -> Result<bool> {
             anyhow::bail!(FEATURE_DISABLED)
         }
 
@@ -458,5 +586,30 @@ mod tests {
                 "Expected '{model_name}' to be rejected, got {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_canonical_model_name_rejects_nul_byte_for_all_providers() {
+        use crate::download::canonical_model_name;
+        use crate::models::ModelProvider;
+
+        assert!(
+            canonical_model_name("org/mo\0del", ModelProvider::HuggingFace).is_err(),
+            "Hugging Face must reject NUL in model name"
+        );
+        assert!(
+            canonical_model_name("nvidia/mo\0del/1", ModelProvider::Ngc).is_err(),
+            "NGC must reject NUL in model name"
+        );
+        #[cfg(feature = "s3")]
+        assert!(
+            canonical_model_name("s3://bucket/a\0b", ModelProvider::S3).is_err(),
+            "S3 must reject NUL in model name"
+        );
+        #[cfg(feature = "gcs")]
+        assert!(
+            canonical_model_name("gs://bucket/a\0b", ModelProvider::Gcs).is_err(),
+            "GCS must reject NUL in model name"
+        );
     }
 }

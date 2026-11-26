@@ -224,14 +224,16 @@ impl RegistryMetrics {
     /// listed still records correctly -- `get_or_create` makes it on demand --
     /// but its first occurrence in each process is invisible to `increase()`,
     /// which is the whole reason this pre-creation exists.
-    const REACHABLE_TRANSITIONS: [(StatusLabel, StatusLabel); 6] = [
+    const REACHABLE_TRANSITIONS: [(StatusLabel, StatusLabel); 7] = [
         // record_claim(Claimed): a first claim on an entry that did not exist.
         (StatusLabel::Absent, StatusLabel::Downloading),
         // record_claim(Takeover): ownership changed, the entry never left
         // DOWNLOADING, so this is an arrival and a departure that cancel.
         (StatusLabel::Downloading, StatusLabel::Downloading),
-        // reset_download_claim: an error-retry restarting a failed download.
+        // try_reset_error_for_retry: an error-retry restarting a failed download.
         (StatusLabel::Error, StatusLabel::Downloading),
+        // try_reclaim_downloaded: reclaiming a stale DOWNLOADED record whose files disappeared.
+        (StatusLabel::Downloaded, StatusLabel::Downloading),
         // finish_download_claim, both terminal outcomes.
         (StatusLabel::Downloading, StatusLabel::Downloaded),
         (StatusLabel::Downloading, StatusLabel::Error),
@@ -281,7 +283,7 @@ impl RegistryMetrics {
         // second. Born at zero, the increment is a visible step.
         //
         // Scoped to these three families deliberately. Their alerts key on rare
-        // one-shot events, and the domains are small: 4 + 3 + 6 series. The
+        // one-shot events, and the domains are small: 4 + 3 + 7 series. The
         // gRPC and backend families would cost 154 and 93 permanently-zero
         // series per pod for ratio alerts that need sustained traffic to fire
         // anyway.
@@ -754,6 +756,7 @@ mod tests {
         metrics.record_claim(ClaimResult::Claimed);
         metrics.record_claim(ClaimResult::Takeover);
         metrics.record_transition(StatusLabel::Error, StatusLabel::Downloading);
+        metrics.record_transition(StatusLabel::Downloaded, StatusLabel::Downloading);
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Downloaded);
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Error);
         metrics.record_transition(StatusLabel::Downloading, StatusLabel::Absent);

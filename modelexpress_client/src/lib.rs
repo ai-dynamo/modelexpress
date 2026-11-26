@@ -1526,12 +1526,34 @@ mod tests {
             "test/model",
             Some("../../../../outside"),
         )
-        .expect_err("Expected escaped model directory to fail validation");
-
+        .expect_err("Expected traversal revision to fail resolution");
         assert!(
-            matches!(err.as_ref(), modelexpress_common::Error::Validation(message) if message.contains("outside cache root")),
+            matches!(err.as_ref(), modelexpress_common::Error::Io(_)),
             "Unexpected error: {err}"
         );
+        assert!(
+            !temp_dir.path().join("outside").exists(),
+            "Traversal revision must be rejected before creating directories"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside_dir = temp_dir.path().join("outside-symlink-target");
+            std::fs::create_dir_all(&outside_dir).expect("Failed to create outside dir");
+            symlink(&outside_dir, cache_root.join("models--test--symlink"))
+                .expect("Failed to create symlink");
+            let err = prepare_stream_model_dir(
+                &cache_root,
+                ModelProvider::HuggingFace,
+                "test/symlink",
+                Some("abc123"),
+            )
+            .expect_err("Expected symlinked model directory outside cache root to fail validation");
+            assert!(
+                matches!(err.as_ref(), modelexpress_common::Error::Validation(message) if message.contains("outside cache root")),
+                "Unexpected error: {err}"
+            );
+        }
     }
 
     #[test]

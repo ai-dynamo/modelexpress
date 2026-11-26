@@ -128,6 +128,19 @@ pub trait RegistryBackend: Send + Sync {
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool>;
 
+    /// Atomic compare-and-set: if the current status is `DOWNLOADED` (and not being
+    /// deleted), flip it in place to `DOWNLOADING`, establish `claim_id` as the lease
+    /// owner for `lease_duration`, and return `true`. Otherwise return `false` without
+    /// mutation. Used when a `DOWNLOADED` record's files are absent from disk so
+    /// recovery does not delete the record and at most one replica re-downloads it.
+    async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool>;
+
     /// Renew a download lease only while `claim_id` still owns the `DOWNLOADING` record.
     async fn refresh_download_claim(
         &self,

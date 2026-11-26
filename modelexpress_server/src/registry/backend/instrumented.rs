@@ -187,6 +187,30 @@ impl RegistryBackend for InstrumentedRegistryBackend {
         reset
     }
 
+    async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let reclaimed = self
+            .metrics
+            .time(
+                Store::Registry,
+                "try_reclaim_downloaded",
+                self.inner
+                    .try_reclaim_downloaded(model_name, provider, claim_id, lease_duration),
+            )
+            .await;
+        // Only the winner sees `true`, so only it books `downloaded -> downloading`.
+        if matches!(reclaimed, Ok(true)) {
+            self.lifecycle
+                .record_transition(StatusLabel::Downloaded, StatusLabel::Downloading);
+        }
+        reclaimed
+    }
+
     async fn refresh_download_claim(
         &self,
         model_name: &str,
@@ -326,6 +350,9 @@ mod tests {
         mock.expect_try_reset_error_for_retry()
             .times(1)
             .returning(|_, _, _, _| Ok(false));
+        mock.expect_try_reclaim_downloaded()
+            .times(1)
+            .returning(|_, _, _, _| Ok(false));
         mock.expect_refresh_download_claim()
             .times(1)
             .returning(|_, _, _, _| Ok(true));
@@ -364,6 +391,9 @@ mod tests {
             .try_reset_error_for_retry(model, ModelProvider::HuggingFace, "claim-1", lease)
             .await;
         let _ = backend
+            .try_reclaim_downloaded(model, ModelProvider::HuggingFace, "claim-1", lease)
+            .await;
+        let _ = backend
             .refresh_download_claim(model, ModelProvider::HuggingFace, "claim-1", lease)
             .await;
         let _ = backend
@@ -388,6 +418,7 @@ mod tests {
             "get_status_counts",
             "try_claim_for_download",
             "try_reset_error_for_retry",
+            "try_reclaim_downloaded",
             "refresh_download_claim",
             "finish_download_claim",
         ] {
@@ -722,6 +753,51 @@ mod tests {
         assert!(
             no_transition_booked(&encoded),
             "a fenced stale owner booked a departure it did not make: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_won_downloaded_reclaim_records_arrival_from_downloaded() {
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_try_reclaim_downloaded()
+            .times(1)
+            .returning(|_, _, _, _| Ok(true));
+
+        let (backend, prom) = instrumented(mock);
+        let won = backend
+            .try_reclaim_downloaded(MODEL, ModelProvider::HuggingFace, CLAIM, lease())
+            .await
+            .expect("reclaim");
+        assert!(won);
+
+        let encoded = scrape(&prom);
+        assert!(
+            encoded.contains(
+                r#"mx_registry_status_transitions_total{from="downloaded",to="downloading"} 1"#
+            ),
+            "a won reclaim did not book downloaded -> downloading: {encoded}"
+        );
+        assert_eq!(in_flight(&encoded), 1, "reclaim is in flight: {encoded}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_downloaded_reclaim_records_no_arrival() {
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_try_reclaim_downloaded()
+            .times(1)
+            .returning(|_, _, _, _| Ok(false));
+
+        let (backend, prom) = instrumented(mock);
+        let won = backend
+            .try_reclaim_downloaded(MODEL, ModelProvider::HuggingFace, CLAIM, lease())
+            .await
+            .expect("reclaim");
+        assert!(!won);
+
+        let encoded = scrape(&prom);
+        assert!(
+            no_transition_booked(&encoded),
+            "a lost reclaim must not book a transition: {encoded}"
         );
     }
 }

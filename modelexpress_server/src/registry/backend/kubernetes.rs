@@ -14,8 +14,17 @@
 
 use super::{ClaimOutcome, ModelRecord, RegistryBackend, RegistryResult};
 use crate::registry::k8s_types::{ModelCacheEntry, ModelCacheEntrySpec, phase};
+
+pub mod finalizer;
+
+/// Finalizer attached to `ModelCacheEntry` CRs so deleting a CR reclaims its
+/// cached files before the CR disappears from Kubernetes.
+pub const CACHE_FILES_FINALIZER: &str = "modelexpress.nvidia.com/cache-files";
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use k8s_openapi::api::authorization::v1::{
+    ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+};
 use kube::{
     Client,
     api::{Api, ListParams, Patch, PatchParams, PostParams},
@@ -193,11 +202,48 @@ impl KubernetesRegistryBackend {
         Ok(names)
     }
 
-    /// First existing CR among the candidates (provider-scoped keys, then legacy). Used by
-    /// name-addressed reads; in practice a name maps to a single provider.
+    /// Build a new `ModelCacheEntry` carrying the cache-files finalizer at creation.
+    fn new_cr_with_finalizer(cr_name: &str, model_name: &str, provider: &str) -> ModelCacheEntry {
+        let mut cr = ModelCacheEntry::new(
+            cr_name,
+            ModelCacheEntrySpec {
+                model_name: model_name.to_string(),
+                provider: provider.to_string(),
+            },
+        );
+        cr.metadata.finalizers = Some(vec![CACHE_FILES_FINALIZER.to_string()]);
+        cr
+    }
+
+    pub(crate) fn is_terminating(cr: &ModelCacheEntry) -> bool {
+        cr.metadata.deletion_timestamp.is_some()
+    }
+
+    /// Status reported to download callers inspecting an existing CR.
+    ///
+    /// A terminating CR is always observed as `DOWNLOADING` so callers wait for
+    /// finalizer cleanup and CR disappearance rather than treating a deleting CR as
+    /// `DOWNLOADED`, retrying it, or taking over its lease.
+    fn observed_claim_status(cr: &ModelCacheEntry) -> ModelStatus {
+        if Self::is_terminating(cr) {
+            return ModelStatus::DOWNLOADING;
+        }
+        let phase = cr
+            .status
+            .as_ref()
+            .map(|s| s.phase.as_str())
+            .unwrap_or_default();
+        Self::status_from_phase(phase)
+    }
+
+    /// First live (non-terminating) existing CR among the candidates (provider-scoped
+    /// keys, then legacy). Used by name-addressed reads; in practice a name maps to a
+    /// single provider.
     async fn find_existing_cr(&self, model_name: &str) -> RegistryResult<Option<ModelCacheEntry>> {
         for cr_name in Self::candidate_cr_names(model_name)? {
-            if let Some(cr) = self.get_cr(&cr_name).await? {
+            if let Some(cr) = self.get_cr(&cr_name).await?
+                && !Self::is_terminating(&cr)
+            {
                 return Ok(Some(cr));
             }
         }
@@ -221,14 +267,15 @@ impl KubernetesRegistryBackend {
         if Self::provider_from_str(&legacy_cr.spec.provider)? != provider {
             return Ok(None);
         }
+        if Self::is_terminating(&legacy_cr) {
+            return Ok(Some(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING)));
+        }
 
         let legacy_status = legacy_cr.status.clone().unwrap_or_default();
-        let new_cr = ModelCacheEntry::new(
+        let new_cr = Self::new_cr_with_finalizer(
             scoped_name,
-            ModelCacheEntrySpec {
-                model_name: legacy_cr.spec.model_name.clone(),
-                provider: legacy_cr.spec.provider.clone(),
-            },
+            &legacy_cr.spec.model_name,
+            &legacy_cr.spec.provider,
         );
         // create is atomic; a 409 means a concurrent claim/migration already made the
         // provider-scoped CR, so we adopt whatever it holds.
@@ -265,15 +312,13 @@ impl KubernetesRegistryBackend {
             warn!("Failed to delete legacy CR {legacy_name} after migration: {e}");
         }
 
-        let phase = self
+        let status = self
             .get_cr(scoped_name)
             .await?
-            .and_then(|cr| cr.status)
-            .unwrap_or_default()
-            .phase;
-        Ok(Some(ClaimOutcome::AlreadyExists(Self::status_from_phase(
-            &phase,
-        ))))
+            .map_or(ModelStatus::DOWNLOADING, |cr| {
+                Self::observed_claim_status(&cr)
+            });
+        Ok(Some(ClaimOutcome::AlreadyExists(status)))
     }
 
     fn provider_str(p: ModelProvider) -> &'static str {
@@ -285,7 +330,7 @@ impl KubernetesRegistryBackend {
         }
     }
 
-    fn provider_from_str(s: &str) -> RegistryResult<ModelProvider> {
+    pub(crate) fn provider_from_str(s: &str) -> RegistryResult<ModelProvider> {
         match s {
             "HuggingFace" => Ok(ModelProvider::HuggingFace),
             "Ngc" => Ok(ModelProvider::Ngc),
@@ -357,7 +402,7 @@ impl KubernetesRegistryBackend {
             .remove(cr_name);
     }
 
-    fn record_from_cr(cr: &ModelCacheEntry) -> RegistryResult<ModelRecord> {
+    pub(crate) fn record_from_cr(cr: &ModelCacheEntry) -> RegistryResult<ModelRecord> {
         let status = cr.status.clone().unwrap_or_default();
         let provider = Self::provider_from_str(&cr.spec.provider)?;
         let model_status = Self::status_from_phase(&status.phase);
@@ -427,6 +472,39 @@ impl KubernetesRegistryBackend {
         }
     }
 
+    fn build_reclaim_downloaded_patch(
+        existing: &ModelCacheEntry,
+        claim_id: &str,
+        now: &str,
+        lease_expires_at: &str,
+    ) -> RegistryResult<Option<serde_json::Value>> {
+        if existing.metadata.deletion_timestamp.is_some() {
+            return Ok(None);
+        }
+        let current_phase = existing
+            .status
+            .as_ref()
+            .map(|s| s.phase.as_str())
+            .unwrap_or_default();
+        if current_phase != phase::DOWNLOADED {
+            return Ok(None);
+        }
+        let resource_version = existing
+            .metadata
+            .resource_version
+            .as_deref()
+            .ok_or("ModelCacheEntry has no resourceVersion")?;
+        Ok(Some(json!([
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
+            { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADED },
+            { "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADING },
+            { "op": "add", "path": "/status/message", "value": "Re-downloading missing cached files..." },
+            { "op": "add", "path": "/status/lastUsedAt", "value": now },
+            { "op": "add", "path": "/status/claimId", "value": claim_id },
+            { "op": "add", "path": "/status/leaseExpiresAt", "value": lease_expires_at },
+        ])))
+    }
+
     async fn try_claim_existing(
         &self,
         cr: ModelCacheEntry,
@@ -434,6 +512,12 @@ impl KubernetesRegistryBackend {
         lease_duration: std::time::Duration,
         claim_uninitialized: bool,
     ) -> RegistryResult<ClaimOutcome> {
+        if Self::is_terminating(&cr) {
+            if let Some(cr_name) = cr.metadata.name.as_deref() {
+                self.clear_lease_observation(cr_name);
+            }
+            return Ok(ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING));
+        }
         let status_missing = cr.status.is_none();
         let status = cr.status.unwrap_or_default();
         let current = Self::status_from_phase(&status.phase);
@@ -512,22 +596,168 @@ impl KubernetesRegistryBackend {
                 let current = self
                     .get_cr(cr_name)
                     .await?
-                    .and_then(|entry| entry.status)
-                    .map_or(ModelStatus::DOWNLOADING, |status| {
-                        Self::status_from_phase(&status.phase)
+                    .map_or(ModelStatus::DOWNLOADING, |entry| {
+                        Self::observed_claim_status(&entry)
                     });
                 Ok(ClaimOutcome::AlreadyExists(current))
             }
             Err(e) => Err(e.into()),
         }
     }
+    /// Maximum retries for `refresh_download_claim` / `finish_download_claim`
+    /// when a concurrent metadata-only update bumps `resourceVersion`.
+    const MAX_CLAIM_PATCH_RETRIES: usize = 5;
+
+    /// Patch `/status` on an owned `DOWNLOADING` CR while guarding UID,
+    /// `resourceVersion`, phase, and `claimId`. Retries with a bound on 409/422
+    /// conflicts caused by unrelated metadata updates (such as finalizer or
+    /// annotation edits) so long as the CR still has the same UID, is not
+    /// terminating, and still belongs to `claim_id` in phase `Downloading`.
+    async fn patch_owned_downloading_status<F>(
+        &self,
+        cr_name: &str,
+        claim_id: &str,
+        op_label: &str,
+        build_mutations: F,
+    ) -> RegistryResult<bool>
+    where
+        F: Fn(&str) -> Vec<serde_json::Value>,
+    {
+        let mut expected_uid: Option<String> = None;
+
+        for attempt in 0..Self::MAX_CLAIM_PATCH_RETRIES {
+            let Some(existing) = self.get_cr(cr_name).await? else {
+                return Ok(false);
+            };
+            if Self::is_terminating(&existing) {
+                debug!("{op_label} for {cr_name} rejected: CR is terminating");
+                return Ok(false);
+            }
+
+            let current_uid = existing.metadata.uid.as_deref();
+            if let Some(uid) = expected_uid.as_deref() {
+                if current_uid != Some(uid) {
+                    debug!("{op_label} for {cr_name} rejected: CR UID changed");
+                    return Ok(false);
+                }
+            } else {
+                expected_uid = current_uid.map(str::to_string);
+            }
+
+            let Some(status) = existing.status.as_ref() else {
+                return Ok(false);
+            };
+            if status.phase != phase::DOWNLOADING || status.claim_id.as_deref() != Some(claim_id) {
+                debug!("{op_label} for {cr_name} rejected: lease ownership or phase changed");
+                return Ok(false);
+            }
+
+            let resource_version = existing
+                .metadata
+                .resource_version
+                .as_deref()
+                .ok_or("ModelCacheEntry has no resourceVersion")?;
+            let now = Utc::now().to_rfc3339();
+            let mut ops = Vec::with_capacity(8);
+            if let Some(uid) = expected_uid.as_deref() {
+                ops.push(json!({ "op": "test", "path": "/metadata/uid", "value": uid }));
+            }
+            ops.push(json!({ "op": "test", "path": "/metadata/resourceVersion", "value": resource_version }));
+            ops.push(json!({ "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING }));
+            ops.push(json!({ "op": "test", "path": "/status/claimId", "value": claim_id }));
+            ops.extend(build_mutations(&now));
+
+            match self
+                .api()
+                .patch_status(
+                    cr_name,
+                    &PatchParams::default(),
+                    &Patch::<()>::Json(
+                        serde_json::from_value(serde_json::Value::Array(ops))
+                            .map_err(|e| e.to_string())?,
+                    ),
+                )
+                .await
+            {
+                Ok(_) => return Ok(true),
+                Err(kube::Error::Api(e)) if e.code == 404 => return Ok(false),
+                Err(kube::Error::Api(e)) if e.code == 409 || e.code == 422 => {
+                    debug!(
+                        "{op_label} for {cr_name} hit conflict/precondition (attempt {}); re-checking",
+                        attempt.saturating_add(1)
+                    );
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        Err(format!(
+            "{op_label} for {cr_name} exhausted {} retries on concurrent resourceVersion conflicts",
+            Self::MAX_CLAIM_PATCH_RETRIES
+        )
+        .into())
+    }
+
+    /// Verify via `SelfSubjectAccessReview` that the server ServiceAccount has `verb`
+    /// on `modelcacheentries` (or a subresource such as `"status"`) in `self.namespace`.
+    async fn verify_rbac_permission(
+        &self,
+        verb: &str,
+        subresource: Option<&str>,
+    ) -> RegistryResult<()> {
+        let review_api: Api<SelfSubjectAccessReview> = Api::all(self.client.clone());
+        let review = SelfSubjectAccessReview {
+            spec: SelfSubjectAccessReviewSpec {
+                resource_attributes: Some(ResourceAttributes {
+                    group: Some("modelexpress.nvidia.com".to_string()),
+                    namespace: Some(self.namespace.clone()),
+                    resource: Some("modelcacheentries".to_string()),
+                    subresource: subresource.map(str::to_string),
+                    verb: Some(verb.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let response = review_api.create(&PostParams::default(), &review).await?;
+        let allowed = response
+            .status
+            .as_ref()
+            .is_some_and(|status| status.allowed);
+        if !allowed {
+            let target = match subresource {
+                Some(sub) => format!("modelcacheentries/{sub}"),
+                None => "modelcacheentries".to_string(),
+            };
+            let reason = response
+                .status
+                .and_then(|status| status.reason)
+                .filter(|r| !r.is_empty())
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default();
+            return Err(format!(
+                "Kubernetes RBAC check failed: ServiceAccount lacks '{verb}' permission on \
+                 '{target}.modelexpress.nvidia.com' in namespace '{}'{reason}",
+                self.namespace
+            )
+            .into());
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl RegistryBackend for KubernetesRegistryBackend {
     async fn connect(&self) -> RegistryResult<()> {
-        // Exercise the ModelCacheEntry API to surface missing CRDs or RBAC errors early.
+        // Exercise the ModelCacheEntry API to surface missing CRDs or RBAC errors early,
+        // then verify the verbs required by the finalizer controller (watch, metadata
+        // patch, and status patch). Intentionally does not check `delete` so read-only
+        // or non-deleting roles remain valid.
         let _ = self.api().list(&ListParams::default().limit(1)).await?;
+        self.verify_rbac_permission("watch", None).await?;
+        self.verify_rbac_permission("patch", None).await?;
+        self.verify_rbac_permission("patch", Some("status")).await?;
         info!(
             "Registry: connected to Kubernetes, namespace '{}'",
             self.namespace
@@ -566,6 +796,9 @@ impl RegistryBackend for KubernetesRegistryBackend {
         // otherwise a subsequent DOWNLOADING -> DOWNLOADED transition would clobber the
         // original timestamp.
         let existing = self.get_cr(&cr_name).await?;
+        if existing.as_ref().is_some_and(Self::is_terminating) {
+            return Err(format!("ModelCacheEntry {cr_name} is terminating").into());
+        }
         let is_new = existing.is_none();
         let needs_created_at = existing
             .as_ref()
@@ -574,13 +807,8 @@ impl RegistryBackend for KubernetesRegistryBackend {
             .is_none();
 
         if is_new {
-            let cr = ModelCacheEntry::new(
-                &cr_name,
-                ModelCacheEntrySpec {
-                    model_name: model_name.to_string(),
-                    provider: Self::provider_str(provider).to_string(),
-                },
-            );
+            let cr =
+                Self::new_cr_with_finalizer(&cr_name, model_name, Self::provider_str(provider));
             match self.api().create(&PostParams::default(), &cr).await {
                 Ok(_) => debug!("Created ModelCacheEntry {cr_name} via set_status"),
                 Err(kube::Error::Api(e)) if e.code == 409 => {
@@ -657,6 +885,9 @@ impl RegistryBackend for KubernetesRegistryBackend {
         let crs = self.api().list(&ListParams::default()).await?;
         let mut records: Vec<ModelRecord> = Vec::with_capacity(crs.items.len());
         for cr in &crs.items {
+            if Self::is_terminating(cr) {
+                continue;
+            }
             match Self::record_from_cr(cr) {
                 Ok(r) => records.push(r),
                 Err(e) => {
@@ -678,6 +909,9 @@ impl RegistryBackend for KubernetesRegistryBackend {
         let mut downloaded = 0u32;
         let mut error = 0u32;
         for cr in &crs.items {
+            if Self::is_terminating(cr) {
+                continue;
+            }
             let phase = cr
                 .status
                 .as_ref()
@@ -715,13 +949,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
             return Ok(outcome);
         }
 
-        let cr = ModelCacheEntry::new(
-            &cr_name,
-            ModelCacheEntrySpec {
-                model_name: model_name.to_string(),
-                provider: Self::provider_str(provider).to_string(),
-            },
-        );
+        let cr = Self::new_cr_with_finalizer(&cr_name, model_name, Self::provider_str(provider));
 
         match self.api().create(&PostParams::default(), &cr).await {
             Ok(created) => {
@@ -755,6 +983,9 @@ impl RegistryBackend for KubernetesRegistryBackend {
         let Some(existing) = self.get_cr(&cr_name).await? else {
             return Ok(false);
         };
+        if Self::is_terminating(&existing) {
+            return Ok(false);
+        }
         let current_phase = existing
             .status
             .as_ref()
@@ -764,12 +995,17 @@ impl RegistryBackend for KubernetesRegistryBackend {
         if current_phase != phase::ERROR {
             return Ok(false);
         }
-        // Use a JSON Patch `test` op as a server-side precondition — kube rejects the
-        // patch with 422 if the status phase was flipped out from under us between
-        // GET and PATCH, and we report the CAS miss.
+        let resource_version = existing
+            .metadata
+            .resource_version
+            .as_deref()
+            .ok_or("ModelCacheEntry has no resourceVersion")?;
+        // Use JSON Patch `test` ops on resourceVersion and phase so a concurrent
+        // delete (setting deletionTimestamp) or retry flips the CAS to Ok(false).
         let now = Utc::now().to_rfc3339();
         let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
         let patch = json!([
+            { "op": "test", "path": "/metadata/resourceVersion", "value": resource_version },
             { "op": "test", "path": "/status/phase", "value": phase::ERROR },
             { "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADING },
             { "op": "replace", "path": "/status/message", "value": "Retrying download..." },
@@ -790,7 +1026,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
                 self.clear_lease_observation(&cr_name);
                 Ok(true)
             }
-            Err(kube::Error::Api(e)) if e.code == 422 || e.code == 409 => {
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 422 || e.code == 409 => {
                 debug!("Error-retry CAS for {cr_name} lost to a concurrent write");
                 Ok(false)
             }
@@ -798,7 +1034,7 @@ impl RegistryBackend for KubernetesRegistryBackend {
         }
     }
 
-    async fn refresh_download_claim(
+    async fn try_reclaim_downloaded(
         &self,
         model_name: &str,
         provider: ModelProvider,
@@ -806,54 +1042,16 @@ impl RegistryBackend for KubernetesRegistryBackend {
         lease_duration: std::time::Duration,
     ) -> RegistryResult<bool> {
         let cr_name = Self::cr_name_for(provider, model_name)?;
+        let Some(existing) = self.get_cr(&cr_name).await? else {
+            return Ok(false);
+        };
         let now = Utc::now().to_rfc3339();
         let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
-        let patch = json!([
-            { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING },
-            { "op": "test", "path": "/status/claimId", "value": claim_id },
-            { "op": "add", "path": "/status/leaseExpiresAt", "value": lease_expires_at },
-            { "op": "add", "path": "/status/lastUsedAt", "value": now },
-        ]);
-        match self
-            .api()
-            .patch_status(
-                &cr_name,
-                &PatchParams::default(),
-                &Patch::<()>::Json(serde_json::from_value(patch).map_err(|e| e.to_string())?),
-            )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 || e.code == 422 => {
-                warn!(
-                    "Download lease refresh for {cr_name} lost ownership: {}: {}",
-                    e.reason, e.message
-                );
-                Ok(false)
-            }
-            Err(e) => Err(e.into()),
-        }
-    }
-
-    async fn finish_download_claim(
-        &self,
-        model_name: &str,
-        provider: ModelProvider,
-        claim_id: &str,
-        status: ModelStatus,
-        message: Option<String>,
-    ) -> RegistryResult<bool> {
-        let cr_name = Self::cr_name_for(provider, model_name)?;
-        let now = Utc::now().to_rfc3339();
-        let patch = json!([
-            { "op": "test", "path": "/status/phase", "value": phase::DOWNLOADING },
-            { "op": "test", "path": "/status/claimId", "value": claim_id },
-            { "op": "replace", "path": "/status/phase", "value": Self::phase_from_status(status) },
-            { "op": "add", "path": "/status/message", "value": message },
-            { "op": "add", "path": "/status/lastUsedAt", "value": now },
-            { "op": "add", "path": "/status/claimId", "value": null },
-            { "op": "add", "path": "/status/leaseExpiresAt", "value": null },
-        ]);
+        let Some(patch) =
+            Self::build_reclaim_downloaded_patch(&existing, claim_id, &now, &lease_expires_at)?
+        else {
+            return Ok(false);
+        };
         match self
             .api()
             .patch_status(
@@ -868,11 +1066,56 @@ impl RegistryBackend for KubernetesRegistryBackend {
                 Ok(true)
             }
             Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 || e.code == 422 => {
-                debug!("Download completion for {cr_name} lost ownership");
+                debug!("Stale-downloaded reclaim CAS for {cr_name} lost to a concurrent write");
                 Ok(false)
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    async fn refresh_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        let cr_name = Self::cr_name_for(provider, model_name)?;
+        self.patch_owned_downloading_status(&cr_name, claim_id, "Download lease refresh", |now| {
+            let lease_expires_at = Self::lease_deadline(lease_duration).to_rfc3339();
+            vec![
+                json!({ "op": "add", "path": "/status/leaseExpiresAt", "value": lease_expires_at }),
+                json!({ "op": "add", "path": "/status/lastUsedAt", "value": now }),
+            ]
+        })
+        .await
+    }
+
+    async fn finish_download_claim(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        status: ModelStatus,
+        message: Option<String>,
+    ) -> RegistryResult<bool> {
+        let cr_name = Self::cr_name_for(provider, model_name)?;
+        let phase_str = Self::phase_from_status(status);
+        let updated = self
+            .patch_owned_downloading_status(&cr_name, claim_id, "Download completion", |now| {
+                vec![
+                    json!({ "op": "replace", "path": "/status/phase", "value": phase_str }),
+                    json!({ "op": "add", "path": "/status/message", "value": message }),
+                    json!({ "op": "add", "path": "/status/lastUsedAt", "value": now }),
+                    json!({ "op": "add", "path": "/status/claimId", "value": null }),
+                    json!({ "op": "add", "path": "/status/leaseExpiresAt", "value": null }),
+                ]
+            })
+            .await?;
+        if updated {
+            self.clear_lease_observation(&cr_name);
+        }
+        Ok(updated)
     }
 }
 
@@ -1161,6 +1404,806 @@ mod tests {
             written,
             crd_string_enum("/status/properties/phase/enum"),
             "the CRD's status.phase enum must accept exactly the phases the backend writes, plus the empty initial phase"
+        );
+    }
+
+    type RecordedRequests = std::sync::Arc<Mutex<Vec<(http::Method, String, serde_json::Value)>>>;
+
+    fn backend_with_fake_responses(
+        responses: Vec<(http::StatusCode, serde_json::Value)>,
+    ) -> (KubernetesRegistryBackend, RecordedRequests) {
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+
+        let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let service = tower::service_fn({
+            let queue = Arc::clone(&queue);
+            let recorded = Arc::clone(&recorded);
+            move |request: http::Request<kube::client::Body>| {
+                let queue = Arc::clone(&queue);
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    let method = request.method().clone();
+                    let uri = request.uri().path().to_string();
+                    let body_bytes = request
+                        .into_body()
+                        .collect_bytes()
+                        .await
+                        .expect("read request body");
+                    let body_json = if body_bytes.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null)
+                    };
+                    recorded
+                        .lock()
+                        .expect("record lock")
+                        .push((method, uri, body_json));
+                    let (status, response_json) = queue
+                        .lock()
+                        .expect("queue lock")
+                        .pop_front()
+                        .expect("expected fake k8s response");
+                    let bytes = serde_json::to_vec(&response_json).expect("serialize response");
+                    let response = http::Response::builder()
+                        .status(status)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(kube::client::Body::from(bytes))
+                        .expect("build response");
+                    Ok::<_, tower::BoxError>(response)
+                }
+            }
+        });
+        let backend = KubernetesRegistryBackend {
+            client: Client::new(service, "default"),
+            namespace: "default".to_string(),
+            lease_observations: Mutex::new(HashMap::new()),
+        };
+        (backend, recorded)
+    }
+
+    fn downloaded_cr_json(
+        name: &str,
+        model_name: &str,
+        deletion_timestamp: Option<&str>,
+    ) -> serde_json::Value {
+        let mut meta = json!({
+            "name": name,
+            "namespace": "default",
+            "resourceVersion": "42",
+        });
+        if let Some(ts) = deletion_timestamp {
+            meta["deletionTimestamp"] = json!(ts);
+        }
+        json!({
+            "apiVersion": "modelexpress.nvidia.com/v1alpha1",
+            "kind": "ModelCacheEntry",
+            "metadata": meta,
+            "spec": {
+                "modelName": model_name,
+                "provider": "HuggingFace",
+            },
+            "status": {
+                "phase": phase::DOWNLOADED,
+                "createdAt": "2026-01-01T00:00:00Z",
+                "lastUsedAt": "2026-01-01T00:00:00Z",
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn try_reclaim_downloaded_patches_status_with_rv_and_phase_guards() {
+        let model_name = "org/model";
+        let cr_name =
+            KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, model_name)
+                .expect("cr name");
+        let cr = downloaded_cr_json(&cr_name, model_name, None);
+        let (backend, recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, cr.clone()),
+            (http::StatusCode::OK, cr),
+        ]);
+
+        let won = backend
+            .try_reclaim_downloaded(
+                model_name,
+                ModelProvider::HuggingFace,
+                "claim-reclaim",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("reclaim should succeed");
+        assert!(won);
+
+        let calls = recorded.lock().expect("recorded").clone();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, http::Method::GET);
+        assert_eq!(calls[1].0, http::Method::PATCH);
+        assert!(calls[1].1.ends_with("/status"));
+        let ops = calls[1].2.as_array().expect("JSON Patch array");
+        assert!(
+            ops.contains(
+                &json!({ "op": "test", "path": "/metadata/resourceVersion", "value": "42" })
+            ),
+            "patch must guard resourceVersion: {ops:?}"
+        );
+        assert!(
+            ops.contains(
+                &json!({ "op": "test", "path": "/status/phase", "value": phase::DOWNLOADED })
+            ),
+            "patch must guard status.phase: {ops:?}"
+        );
+        assert!(
+            ops.contains(
+                &json!({ "op": "replace", "path": "/status/phase", "value": phase::DOWNLOADING })
+            ),
+            "patch must flip phase to Downloading: {ops:?}"
+        );
+        assert!(
+            ops.contains(
+                &json!({ "op": "add", "path": "/status/claimId", "value": "claim-reclaim" })
+            ),
+            "patch must stamp claimId: {ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_reclaim_downloaded_skips_terminating_cr_without_patching() {
+        let model_name = "org/terminating";
+        let cr_name =
+            KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, model_name)
+                .expect("cr name");
+        let cr = downloaded_cr_json(&cr_name, model_name, Some("2026-01-01T00:01:00Z"));
+        let (backend, recorded) = backend_with_fake_responses(vec![(http::StatusCode::OK, cr)]);
+
+        let won = backend
+            .try_reclaim_downloaded(
+                model_name,
+                ModelProvider::HuggingFace,
+                "claim-reclaim",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("reclaim should return Ok(false)");
+        assert!(!won);
+        assert_eq!(
+            recorded.lock().expect("recorded").len(),
+            1,
+            "must not PATCH terminating CR"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_reclaim_downloaded_returns_false_on_conflict() {
+        let model_name = "org/raced";
+        let cr_name =
+            KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, model_name)
+                .expect("cr name");
+        let cr = downloaded_cr_json(&cr_name, model_name, None);
+        let conflict = json!({
+            "kind": "Status",
+            "apiVersion": "v1",
+            "status": "Failure",
+            "message": "test operation failed",
+            "reason": "Invalid",
+            "code": 422,
+        });
+        let (backend, _recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, cr),
+            (http::StatusCode::UNPROCESSABLE_ENTITY, conflict),
+        ]);
+
+        let won = backend
+            .try_reclaim_downloaded(
+                model_name,
+                ModelProvider::HuggingFace,
+                "claim-reclaim",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("422 conflict maps to Ok(false)");
+        assert!(!won);
+    }
+
+    fn empty_cr_list_json() -> serde_json::Value {
+        json!({
+            "apiVersion": "modelexpress.nvidia.com/v1alpha1",
+            "kind": "ModelCacheEntryList",
+            "metadata": { "resourceVersion": "1" },
+            "items": [],
+        })
+    }
+
+    fn ssar_response_json(allowed: bool, reason: Option<&str>) -> serde_json::Value {
+        json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectAccessReview",
+            "metadata": {},
+            "spec": {},
+            "status": {
+                "allowed": allowed,
+                "reason": reason,
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn connect_checks_list_watch_patch_and_status_patch_without_checking_delete() {
+        let (backend, recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, empty_cr_list_json()),
+            (http::StatusCode::CREATED, ssar_response_json(true, None)),
+            (http::StatusCode::CREATED, ssar_response_json(true, None)),
+            (http::StatusCode::CREATED, ssar_response_json(true, None)),
+        ]);
+
+        backend
+            .connect()
+            .await
+            .expect("connect should succeed when list, watch, patch, and status patch are allowed");
+
+        let calls = recorded.lock().expect("recorded").clone();
+        assert_eq!(calls.len(), 4, "expected list + 3 SSAR checks: {calls:?}");
+        assert_eq!(calls[0].0, http::Method::GET);
+        assert!(calls[0].1.ends_with("/modelcacheentries"));
+
+        let expected_checks = [("watch", None), ("patch", None), ("patch", Some("status"))];
+        for (idx, (verb, subresource)) in expected_checks.iter().enumerate() {
+            let (method, path, body) = &calls[idx + 1];
+            assert_eq!(*method, http::Method::POST);
+            assert!(
+                path.ends_with("/selfsubjectaccessreviews"),
+                "unexpected path: {path}"
+            );
+            let attrs = body
+                .pointer("/spec/resourceAttributes")
+                .expect("resourceAttributes in SSAR");
+            assert_eq!(attrs["group"], "modelexpress.nvidia.com");
+            assert_eq!(attrs["resource"], "modelcacheentries");
+            assert_eq!(attrs["namespace"], "default");
+            assert_eq!(attrs["verb"], *verb);
+            assert_eq!(
+                attrs.get("subresource").and_then(|v| v.as_str()),
+                *subresource
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_fails_when_watch_permission_is_denied() {
+        let (backend, _recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, empty_cr_list_json()),
+            (
+                http::StatusCode::CREATED,
+                ssar_response_json(false, Some("watch denied")),
+            ),
+        ]);
+
+        let err = backend
+            .connect()
+            .await
+            .expect_err("connect must fail when watch is denied");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("watch") && msg.contains("modelcacheentries"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_fails_when_metadata_patch_permission_is_denied() {
+        let (backend, _recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, empty_cr_list_json()),
+            (http::StatusCode::CREATED, ssar_response_json(true, None)),
+            (
+                http::StatusCode::CREATED,
+                ssar_response_json(false, Some("patch denied")),
+            ),
+        ]);
+
+        let err = backend
+            .connect()
+            .await
+            .expect_err("connect must fail when metadata patch is denied");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("patch") && msg.contains("modelcacheentries"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_fails_when_status_patch_permission_is_denied() {
+        let (backend, _recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, empty_cr_list_json()),
+            (http::StatusCode::CREATED, ssar_response_json(true, None)),
+            (http::StatusCode::CREATED, ssar_response_json(true, None)),
+            (
+                http::StatusCode::CREATED,
+                ssar_response_json(false, Some("status patch denied")),
+            ),
+        ]);
+
+        let err = backend
+            .connect()
+            .await
+            .expect_err("connect must fail when status patch is denied");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("patch") && msg.contains("modelcacheentries/status"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    fn cr_json(
+        name: &str,
+        model_name: &str,
+        provider: &str,
+        phase: &str,
+        claim_id: Option<&str>,
+        deleting: bool,
+    ) -> serde_json::Value {
+        let mut metadata = json!({
+            "name": name,
+            "namespace": "default",
+            "uid": format!("uid-{name}"),
+            "resourceVersion": "42",
+            "finalizers": [CACHE_FILES_FINALIZER],
+        });
+        if deleting {
+            metadata["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        }
+        let mut status = json!({
+            "phase": phase,
+            "createdAt": "2026-01-01T00:00:00Z",
+            "lastUsedAt": "2026-01-01T00:00:00Z",
+        });
+        if let Some(id) = claim_id {
+            status["claimId"] = json!(id);
+            status["leaseExpiresAt"] = json!("2026-01-01T00:05:00Z");
+        }
+        json!({
+            "apiVersion": "modelexpress.nvidia.com/v1alpha1",
+            "kind": "ModelCacheEntry",
+            "metadata": metadata,
+            "spec": {
+                "modelName": model_name,
+                "provider": provider,
+            },
+            "status": status,
+        })
+    }
+
+    fn not_found_json() -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "reason": "NotFound",
+            "code": 404,
+            "message": "not found",
+        })
+    }
+
+    #[tokio::test]
+    async fn try_claim_for_download_attaches_finalizer_at_creation() {
+        let cr_name =
+            KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, "org/model")
+                .expect("cr name");
+        let created = json!({
+            "apiVersion": "modelexpress.nvidia.com/v1alpha1",
+            "kind": "ModelCacheEntry",
+            "metadata": {
+                "name": cr_name,
+                "namespace": "default",
+                "uid": "uid-created",
+                "resourceVersion": "1",
+                "finalizers": [CACHE_FILES_FINALIZER],
+            },
+            "spec": {
+                "modelName": "org/model",
+                "provider": "HuggingFace",
+            },
+        });
+        let patched = cr_json(
+            &cr_name,
+            "org/model",
+            "HuggingFace",
+            phase::DOWNLOADING,
+            Some("claim-1"),
+            false,
+        );
+        let (backend, recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::NOT_FOUND, not_found_json()), // scoped GET
+            (http::StatusCode::NOT_FOUND, not_found_json()), // legacy GET
+            (http::StatusCode::CREATED, created),            // POST create
+            (http::StatusCode::OK, patched),                 // PATCH status
+        ]);
+
+        let outcome = backend
+            .try_claim_for_download(
+                "org/model",
+                ModelProvider::HuggingFace,
+                "claim-1",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("claim should succeed");
+        assert_eq!(outcome, ClaimOutcome::Claimed);
+
+        let calls = recorded.lock().expect("recorded").clone();
+        let create_call = calls
+            .iter()
+            .find(|(method, _, _)| *method == http::Method::POST)
+            .expect("POST create call");
+        assert_eq!(
+            create_call.2.pointer("/metadata/finalizers"),
+            Some(&json!([CACHE_FILES_FINALIZER]))
+        );
+    }
+
+    #[tokio::test]
+    async fn terminating_crs_are_excluded_from_reads_lists_counts_and_mutations() {
+        let cr_name =
+            KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, "org/model")
+                .expect("cr name");
+        let terminating_downloaded = cr_json(
+            &cr_name,
+            "org/model",
+            "HuggingFace",
+            phase::DOWNLOADED,
+            None,
+            true,
+        );
+        let terminating_downloading = cr_json(
+            &cr_name,
+            "org/model",
+            "HuggingFace",
+            phase::DOWNLOADING,
+            Some("claim-1"),
+            true,
+        );
+        let terminating_error = cr_json(
+            &cr_name,
+            "org/model",
+            "HuggingFace",
+            phase::ERROR,
+            None,
+            true,
+        );
+        let live_cr = cr_json(
+            "hf-live",
+            "org/live",
+            "HuggingFace",
+            phase::DOWNLOADED,
+            None,
+            false,
+        );
+        let list_with_both = json!({
+            "apiVersion": "modelexpress.nvidia.com/v1alpha1",
+            "kind": "ModelCacheEntryList",
+            "metadata": { "resourceVersion": "50" },
+            "items": [terminating_downloaded.clone(), live_cr],
+        });
+
+        // 1. get_models_by_last_used and get_status_counts skip terminating CRs.
+        let (backend, _) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, list_with_both.clone()),
+            (http::StatusCode::OK, list_with_both),
+        ]);
+        let records = backend
+            .get_models_by_last_used(None)
+            .await
+            .expect("list records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model_name, "org/live");
+        assert_eq!(
+            backend.get_status_counts().await.expect("status counts"),
+            (0, 1, 0)
+        );
+
+        // 2. get_status, get_model_record, and touch_model ignore terminating CRs.
+        let candidate_count = KubernetesRegistryBackend::candidate_cr_names("org/model")
+            .expect("candidates")
+            .len();
+        let mut responses = Vec::new();
+        for _ in 0..3 {
+            responses.push((http::StatusCode::OK, terminating_downloaded.clone()));
+            for _ in 1..candidate_count {
+                responses.push((http::StatusCode::NOT_FOUND, not_found_json()));
+            }
+        }
+        let (backend, recorded) = backend_with_fake_responses(responses);
+        assert_eq!(
+            backend.get_status("org/model").await.expect("get_status"),
+            None
+        );
+        assert!(
+            backend
+                .get_model_record("org/model")
+                .await
+                .expect("get_model_record")
+                .is_none()
+        );
+        backend
+            .touch_model("org/model")
+            .await
+            .expect("touch_model should be no-op");
+        assert!(
+            recorded
+                .lock()
+                .expect("recorded")
+                .iter()
+                .all(|(method, _, _)| *method == http::Method::GET),
+            "touch_model must not patch a terminating CR"
+        );
+
+        // 3. try_claim_for_download treats a terminating CR as AlreadyExists(DOWNLOADING)
+        //    even if its phase was Downloaded.
+        let (backend, recorded) = backend_with_fake_responses(vec![(
+            http::StatusCode::OK,
+            terminating_downloaded.clone(),
+        )]);
+        let claim = backend
+            .try_claim_for_download(
+                "org/model",
+                ModelProvider::HuggingFace,
+                "claim-2",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("claim on terminating CR");
+        assert_eq!(claim, ClaimOutcome::AlreadyExists(ModelStatus::DOWNLOADING));
+        assert_eq!(recorded.lock().expect("recorded").len(), 1);
+
+        // 4. set_status rejects terminating CRs; try_reset_error_for_retry,
+        //    refresh_download_claim, and finish_download_claim return Ok(false).
+        let (backend, recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, terminating_downloaded),
+            (http::StatusCode::OK, terminating_error),
+            (http::StatusCode::OK, terminating_downloading.clone()),
+            (http::StatusCode::OK, terminating_downloading),
+        ]);
+        assert!(
+            backend
+                .set_status(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    ModelStatus::DOWNLOADED,
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !backend
+                .try_reset_error_for_retry(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    "claim-2",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("reset error on terminating CR")
+        );
+        assert!(
+            !backend
+                .refresh_download_claim(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    "claim-1",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("refresh on terminating CR")
+        );
+        assert!(
+            !backend
+                .finish_download_claim(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    "claim-1",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("finish on terminating CR")
+        );
+        assert!(
+            recorded
+                .lock()
+                .expect("recorded")
+                .iter()
+                .all(|(method, _, _)| *method == http::Method::GET),
+            "no PATCH or POST may be issued against terminating CRs"
+        );
+    }
+
+    fn conflict_status_json(code: u16, reason: &str, message: &str) -> serde_json::Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "reason": reason,
+            "code": code,
+            "message": message,
+        })
+    }
+
+    #[tokio::test]
+    async fn refresh_and_finish_retry_after_metadata_only_conflict() {
+        let cr_name =
+            KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, "org/model")
+                .expect("cr name");
+        let rv42 = cr_json(
+            &cr_name,
+            "org/model",
+            "HuggingFace",
+            phase::DOWNLOADING,
+            Some("claim-1"),
+            false,
+        );
+        let mut rv43 = rv42.clone();
+        rv43["metadata"]["resourceVersion"] = json!("43");
+        rv43["metadata"]["annotations"] = json!({"unrelated": "updated"});
+
+        // Refresh: GET rv=42 -> PATCH 422 (unrelated metadata bump) -> GET rv=43 -> PATCH 200.
+        // Finish:  GET rv=42 -> PATCH 409 (unrelated metadata bump) -> GET rv=43 -> PATCH 200.
+        let (backend, recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, rv42.clone()),
+            (
+                http::StatusCode::UNPROCESSABLE_ENTITY,
+                conflict_status_json(422, "Invalid", "resourceVersion mismatch"),
+            ),
+            (http::StatusCode::OK, rv43.clone()),
+            (http::StatusCode::OK, rv43.clone()),
+            (http::StatusCode::OK, rv42),
+            (
+                http::StatusCode::CONFLICT,
+                conflict_status_json(409, "Conflict", "resourceVersion mismatch"),
+            ),
+            (http::StatusCode::OK, rv43.clone()),
+            (http::StatusCode::OK, rv43),
+        ]);
+
+        assert!(
+            backend
+                .refresh_download_claim(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    "claim-1",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("refresh should succeed after metadata-only conflict")
+        );
+        assert!(
+            backend
+                .finish_download_claim(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    "claim-1",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("finish should succeed after metadata-only conflict")
+        );
+
+        let calls = recorded.lock().expect("recorded").clone();
+        let patch_rvs: Vec<_> = calls
+            .iter()
+            .filter(|(method, _, _)| *method == http::Method::PATCH)
+            .map(|(_, _, body)| {
+                body.as_array()
+                    .expect("patch ops")
+                    .iter()
+                    .find(|op| op["path"] == "/metadata/resourceVersion")
+                    .expect("resourceVersion test op")["value"]
+                    .clone()
+            })
+            .collect();
+        assert_eq!(
+            patch_rvs,
+            vec![json!("42"), json!("43"), json!("42"), json!("43")],
+            "both refresh and finish must retry with the refreshed resourceVersion"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_and_finish_fail_when_conflict_is_from_delete_or_uid_change() {
+        let cr_name =
+            KubernetesRegistryBackend::cr_name_for(ModelProvider::HuggingFace, "org/model")
+                .expect("cr name");
+        let live_rv42 = cr_json(
+            &cr_name,
+            "org/model",
+            "HuggingFace",
+            phase::DOWNLOADING,
+            Some("claim-1"),
+            false,
+        );
+        let mut terminating_rv43 = cr_json(
+            &cr_name,
+            "org/model",
+            "HuggingFace",
+            phase::DOWNLOADING,
+            Some("claim-1"),
+            true,
+        );
+        terminating_rv43["metadata"]["resourceVersion"] = json!("43");
+
+        let mut recreated_uid = live_rv42.clone();
+        recreated_uid["metadata"]["uid"] = json!("uid-recreated");
+        recreated_uid["metadata"]["resourceVersion"] = json!("43");
+
+        // 1. Delete conflict on refresh: GET live -> PATCH 422 -> GET terminating -> Ok(false).
+        // 2. Delete conflict on finish:  GET live -> PATCH 422 -> GET terminating -> Ok(false).
+        // 3. UID change on refresh:      GET uid-1 -> PATCH 422 -> GET uid-recreated -> Ok(false).
+        let (backend, recorded) = backend_with_fake_responses(vec![
+            (http::StatusCode::OK, live_rv42.clone()),
+            (
+                http::StatusCode::UNPROCESSABLE_ENTITY,
+                conflict_status_json(422, "Invalid", "resourceVersion mismatch"),
+            ),
+            (http::StatusCode::OK, terminating_rv43.clone()),
+            (http::StatusCode::OK, live_rv42.clone()),
+            (
+                http::StatusCode::UNPROCESSABLE_ENTITY,
+                conflict_status_json(422, "Invalid", "resourceVersion mismatch"),
+            ),
+            (http::StatusCode::OK, terminating_rv43),
+            (http::StatusCode::OK, live_rv42),
+            (
+                http::StatusCode::UNPROCESSABLE_ENTITY,
+                conflict_status_json(422, "Invalid", "resourceVersion mismatch"),
+            ),
+            (http::StatusCode::OK, recreated_uid),
+        ]);
+
+        assert!(
+            !backend
+                .refresh_download_claim(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    "claim-1",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("refresh after delete conflict")
+        );
+        assert!(
+            !backend
+                .finish_download_claim(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    "claim-1",
+                    ModelStatus::DOWNLOADED,
+                    None,
+                )
+                .await
+                .expect("finish after delete conflict")
+        );
+        assert!(
+            !backend
+                .refresh_download_claim(
+                    "org/model",
+                    ModelProvider::HuggingFace,
+                    "claim-1",
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .expect("refresh after UID change conflict")
+        );
+
+        let patch_count = recorded
+            .lock()
+            .expect("recorded")
+            .iter()
+            .filter(|(method, _, _)| *method == http::Method::PATCH)
+            .count();
+        assert_eq!(
+            patch_count, 3,
+            "no retry PATCH may be sent once re-read shows deletion or UID change"
         );
     }
 }

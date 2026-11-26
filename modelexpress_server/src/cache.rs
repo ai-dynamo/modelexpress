@@ -10,10 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::registry::backend::ModelRecord;
-use crate::registry::entry_key::EntryKey;
+use crate::registry::cache_cleanup::{CleanupPlan, execute_cleanup_plan, plan_cleanup_for_entry};
 use crate::registry::state::RegistryManager;
 use modelexpress_common::config::DurationConfig;
-use modelexpress_common::download::get_provider;
 use modelexpress_common::models::ModelStatus;
 
 /// Configuration for cache eviction policies
@@ -334,7 +333,7 @@ impl CacheEvictionService {
         for candidate in &models_to_evict {
             let model_name = &candidate.model_name;
             match self.evict_model(model_name).await {
-                Ok(()) => {
+                Ok(true) => {
                     successfully_evicted.push(model_name.clone());
                     // Counted per model, with the rule that actually selected it:
                     // one cycle can evict some models for age and others for the
@@ -342,6 +341,12 @@ impl CacheEvictionService {
                     self.metrics.record_eviction(candidate.reason);
                     info!(
                         "Successfully evicted model: {model_name}",
+                        model_name = model_name
+                    );
+                }
+                Ok(false) => {
+                    debug!(
+                        "Skipped eviction of '{model_name}': record is no longer DOWNLOADED",
                         model_name = model_name
                     );
                 }
@@ -378,69 +383,74 @@ impl CacheEvictionService {
         Ok(result)
     }
 
-    /// Evict a single entry (remove from filesystem, then from the registry).
+    /// Evict a single entry (remove from registry first, then clean up cached files).
     ///
-    /// `entry_key` is a registry key, so it has to be parsed back into the model name
-    /// and revision the provider needs in order to delete the right snapshot.
+    /// Returns `Ok(true)` if the entry was evicted, or `Ok(false)` if the re-read
+    /// record is no longer `DOWNLOADED` (for example, reclaimed for a new download
+    /// after selection) and was skipped without touching the registry or disk.
+    ///
+    /// Removing the registry entry first ensures that a failed registry deletion
+    /// never leaves a live `DOWNLOADED` record pointing at missing files, and that
+    /// survivor discovery runs after the entry is no longer visible. If filesystem
+    /// deletion fails after the record is gone, this logs at `error!` and returns
+    /// `Err` so the eviction is not counted as successful; operators can reclaim
+    /// leftover files with `model clear`.
     async fn evict_model(
         &self,
         entry_key: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Look up the model record to determine the provider
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
         let record = self
             .registry
             .get_model_record(entry_key)
             .await?
             .ok_or_else(|| format!("model '{entry_key}' not found in registry"))?;
 
-        let key = EntryKey::parse(entry_key);
-
-        // Entries that outlive this one and belong to the same model. Which files we can
-        // delete depends entirely on what they still reference.
-        let siblings = self.registry.get_models_by_last_used(None).await?;
-        let survivors: Vec<EntryKey> = siblings
-            .iter()
-            .filter(|sibling| sibling.model_name != entry_key)
-            .map(|sibling| EntryKey::parse(&sibling.model_name))
-            .filter(|other| other.model_name == key.model_name)
-            .collect();
-
-        // An entry with no revision covers every snapshot of its model, so it shares
-        // files with all of them. That is how a record written before revisions existed
-        // behaves: evicting it must not delete a snapshot a revision-scoped entry uses,
-        // and a revision-scoped evict must not delete files the legacy entry covers.
-        let snapshot_still_referenced = survivors.iter().any(|other| {
-            other.revision == key.revision || other.revision.is_none() || key.revision.is_none()
-        });
-
-        // Delete files from disk first. If this fails, we keep the registry record
-        // so the next eviction cycle can retry.
-        let delete_revision = if survivors.is_empty() {
-            // Nothing else references this model. Drop the whole cache entry rather than
-            // just this revision, so snapshots left behind by an earlier shared-file
-            // decision cannot outlive the last record pointing at them.
-            Some(None)
-        } else if snapshot_still_referenced {
+        if record.status != ModelStatus::DOWNLOADED {
             debug!(
-                "Keeping files for '{entry_key}': another registry entry still references \
-                 the same snapshot"
+                "Skipping eviction of '{entry_key}': status changed to {:?}",
+                record.status
             );
-            None
-        } else {
-            Some(key.revision.as_deref())
-        };
-
-        if let Some(revision) = delete_revision {
-            get_provider(record.provider)
-                .delete_model_revision(&key.model_name, self.cache_directory.clone(), revision)
-                .await
-                .map_err(|e| format!("failed to delete model files for '{entry_key}': {e}"))?;
+            return Ok(false);
         }
 
-        // Only remove from registry after successful filesystem deletion
+        // Validate target before removing the record so we know if it is malformed,
+        // while still deleting the invalid record without touching disk.
+        if let CleanupPlan::InvalidTarget { reason } =
+            plan_cleanup_for_entry(record.provider, entry_key, &[])
+        {
+            warn!("Evicting invalid registry entry '{entry_key}' without touching disk: {reason}");
+            self.registry.delete_model(entry_key).await?;
+            return Ok(true);
+        }
+
+        // Delete the registry record first. If this fails, leave all files intact.
         self.registry.delete_model(entry_key).await?;
 
-        Ok(())
+        let live_records = match self.registry.get_models_by_last_used(None).await {
+            Ok(records) => records,
+            Err(err) => {
+                error!(
+                    "Removed evicted registry entry '{entry_key}', but failed to list surviving \
+                     entries before deleting cached files: {err}. Run 'model clear' to reclaim \
+                     leftover files."
+                );
+                return Err(format!(
+                    "failed to list surviving registry entries after deleting '{entry_key}': {err}"
+                )
+                .into());
+            }
+        };
+
+        let plan = plan_cleanup_for_entry(record.provider, entry_key, &live_records);
+        if let Err(err) = execute_cleanup_plan(&plan, &self.cache_directory).await {
+            error!(
+                "Removed evicted registry entry '{entry_key}', but failed to delete cached \
+                 files: {err}. Run 'model clear' to reclaim leftover files."
+            );
+            return Err(format!("failed to delete model files for '{entry_key}': {err}").into());
+        }
+
+        Ok(true)
     }
 
     /// Get statistics about the current cache state
@@ -491,6 +501,7 @@ pub struct CacheStats {
 mod tests {
     use super::*;
     use crate::registry::backend::MockRegistryBackend;
+    use crate::registry::entry_key::EntryKey;
     use modelexpress_common::models::ModelProvider;
     use tempfile::TempDir;
 
@@ -802,19 +813,20 @@ mod tests {
         entry_key: &str,
         siblings: Vec<String>,
     ) -> Vec<String> {
-        let evicted = entry_key.to_string();
         let mut mock = MockRegistryBackend::new();
         mock.expect_get_model_record()
             .once()
             .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+        // Eviction deletes the registry record before listing surviving live records.
         mock.expect_get_models_by_last_used()
             .once()
             .returning(move |_| {
-                let mut records = vec![downloaded_record(&evicted)];
-                records.extend(siblings.iter().map(|name| downloaded_record(name)));
-                Ok(records)
+                Ok(siblings
+                    .iter()
+                    .map(|name| downloaded_record(name))
+                    .collect())
             });
-        mock.expect_delete_model().once().returning(|_| Ok(()));
 
         let (service, cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
         let snapshots_dir = cache_dir.path().join("models--test--model/snapshots");
@@ -1026,5 +1038,356 @@ mod tests {
             0,
             "a failed eviction freed nothing and must not be counted: {encoded}"
         );
+    }
+
+    fn record_with(
+        model_name: &str,
+        provider: ModelProvider,
+        status: ModelStatus,
+        days_ago: i64,
+    ) -> ModelRecord {
+        let then = Utc::now()
+            .checked_sub_signed(Duration::days(days_ago))
+            .expect("timestamp in range");
+        ModelRecord {
+            model_name: model_name.to_string(),
+            provider,
+            status,
+            created_at: then,
+            last_used_at: then,
+            message: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_evict_failed_record_delete_keeps_cached_files() {
+        let entry = key(Some("abc123"), false);
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_model_record()
+            .once()
+            .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_delete_model()
+            .once()
+            .returning(|_| Err(anyhow::anyhow!("backend unavailable").into()));
+
+        let (service, cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
+        let snapshot = cache_dir
+            .path()
+            .join("models--test--model/snapshots/abc123");
+        std::fs::create_dir_all(&snapshot).expect("create snapshot");
+        std::fs::write(snapshot.join("config.json"), b"{}").expect("write config");
+
+        let err = service
+            .evict_model(&entry)
+            .await
+            .expect_err("failed record delete must fail eviction");
+        assert!(
+            err.to_string().contains("backend unavailable"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            snapshot.join("config.json").is_file(),
+            "cached files must remain intact when record deletion fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_evict_failed_file_delete_is_not_counted_and_does_not_follow_symlink() {
+        let victim = key(Some("rev1"), false);
+        let survivor = key(Some("rev2"), false);
+        let records = vec![
+            record_with(
+                &victim,
+                ModelProvider::HuggingFace,
+                ModelStatus::DOWNLOADED,
+                10,
+            ),
+            record_with(
+                &survivor,
+                ModelProvider::HuggingFace,
+                ModelStatus::DOWNLOADED,
+                1,
+            ),
+        ];
+
+        let mut mock = MockRegistryBackend::new();
+        let initial_list = records.clone();
+        let post_delete_list = vec![records[1].clone()];
+        mock.expect_get_models_by_last_used()
+            .times(1)
+            .returning(move |_| Ok(initial_list.clone()));
+        mock.expect_get_model_record()
+            .once()
+            .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+        mock.expect_get_models_by_last_used()
+            .times(1)
+            .returning(move |_| Ok(post_delete_list.clone()));
+
+        let (service, cache_dir, metrics_registry) =
+            service_with_mock_and_registry(mock, lru_config(7, None));
+
+        let outside = TempDir::new().expect("create outside dir");
+        let outside_rev1 = outside.path().join("rev1");
+        std::fs::create_dir_all(&outside_rev1).expect("create outside rev1");
+        std::fs::write(outside_rev1.join("secret.txt"), b"keep").expect("write secret");
+
+        let repo_root = cache_dir.path().join("models--test--model");
+        std::fs::create_dir_all(&repo_root).expect("create repo root");
+        std::os::unix::fs::symlink(outside.path(), repo_root.join("snapshots"))
+            .expect("create snapshots symlink");
+
+        let result = service.run_eviction_cycle().await.expect("eviction cycle");
+        assert_eq!(
+            result.evicted_count, 0,
+            "eviction with failed file deletion must not be counted as successful"
+        );
+        assert!(
+            outside_rev1.join("secret.txt").is_file(),
+            "outside files must not be deleted through symlinked snapshots ancestor"
+        );
+
+        let encoded = crate::metrics::encode_text(&metrics_registry)
+            .unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(
+            evictions_for(&encoded, "time_threshold"),
+            0,
+            "failed file delete must not increment eviction counter: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_invalid_traversal_revision_deletes_only_record() {
+        let crafted =
+            EntryKey::new("test/model", Some("../../../outside".to_string()), false).to_string();
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_model_record()
+            .once()
+            .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+
+        let (service, cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
+        let model_dir = cache_dir
+            .path()
+            .join("models--test--model/snapshots/validrev");
+        std::fs::create_dir_all(&model_dir).expect("create valid snapshot");
+        std::fs::write(model_dir.join("config.json"), b"{}").expect("write config");
+
+        service
+            .evict_model(&crafted)
+            .await
+            .expect("invalid record should be removed from registry without touching disk");
+        assert!(
+            model_dir.join("config.json").is_file(),
+            "invalid revision must never fall back to whole-model deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_hf_sibling_downloading_preserves_blobs_and_repo_root() {
+        let evicted = key(Some("rev1"), false);
+        let downloading_sibling = key(Some("rev2"), false);
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_model_record()
+            .once()
+            .returning(move |name| Ok(Some(downloaded_record(name))));
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+        mock.expect_get_models_by_last_used()
+            .once()
+            .returning(move |_| {
+                Ok(vec![record_with(
+                    &downloading_sibling,
+                    ModelProvider::HuggingFace,
+                    ModelStatus::DOWNLOADING,
+                    0,
+                )])
+            });
+
+        let (service, cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
+        let repo_root = cache_dir.path().join("models--test--model");
+        let snap1 = repo_root.join("snapshots/rev1");
+        let blobs = repo_root.join("blobs");
+        let refs = repo_root.join("refs");
+        std::fs::create_dir_all(&snap1).expect("create snap1");
+        std::fs::create_dir_all(&blobs).expect("create blobs");
+        std::fs::create_dir_all(&refs).expect("create refs");
+        std::fs::write(snap1.join("config.json"), b"{}").expect("write snap1");
+        std::fs::write(blobs.join("inflight.sync.part"), b"partial").expect("write part");
+        std::fs::write(refs.join("main"), "rev1").expect("write ref");
+
+        service
+            .evict_model(&evicted)
+            .await
+            .expect("evict with downloading sibling should succeed");
+        assert!(!snap1.exists(), "evicted snapshot must be removed");
+        assert!(!refs.join("main").exists(), "stale ref must be removed");
+        assert!(
+            blobs.join("inflight.sync.part").is_file(),
+            "blobs must be preserved while sibling revision is DOWNLOADING"
+        );
+        assert!(
+            repo_root.is_dir(),
+            "repo root must remain while sibling revision is DOWNLOADING"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_s3_overlap_and_ngc_canonical_survivor_protection() {
+        // 1. S3 child evicted while ancestor lives -> keeps files.
+        let mut mock = MockRegistryBackend::new();
+        mock.expect_get_model_record().once().returning(|_| {
+            Ok(Some(record_with(
+                "s3://bkt/org/child",
+                ModelProvider::S3,
+                ModelStatus::DOWNLOADED,
+                10,
+            )))
+        });
+        mock.expect_delete_model().once().returning(|_| Ok(()));
+        mock.expect_get_models_by_last_used().once().returning(|_| {
+            Ok(vec![record_with(
+                "s3://bkt/org",
+                ModelProvider::S3,
+                ModelStatus::DOWNLOADED,
+                1,
+            )])
+        });
+        let (service, cache_dir) = service_with_mock(mock, CacheEvictionConfig::default());
+        let child_dir = cache_dir.path().join("s3/bkt/org/child");
+        std::fs::create_dir_all(&child_dir).expect("create child dir");
+        std::fs::write(child_dir.join(".mx-model"), b"").expect("write child marker");
+        std::fs::write(child_dir.join("config.json"), b"{}").expect("write child config");
+
+        service
+            .evict_model("s3://bkt/org/child")
+            .await
+            .expect("evict child under live ancestor");
+        assert!(
+            child_dir.join("config.json").is_file(),
+            "live S3 ancestor must protect shared files"
+        );
+
+        // 2. NGC raw spelling evicted while canonical URI metadata-only entry lives -> keeps files.
+        let mut ngc_mock = MockRegistryBackend::new();
+        let ngc_meta = EntryKey::new("ngc://nim/nvidia/llama:1", None, true).to_string();
+        ngc_mock.expect_get_model_record().once().returning(|_| {
+            Ok(Some(record_with(
+                "nim/nvidia/llama/1",
+                ModelProvider::Ngc,
+                ModelStatus::DOWNLOADED,
+                10,
+            )))
+        });
+        ngc_mock.expect_delete_model().once().returning(|_| Ok(()));
+        ngc_mock
+            .expect_get_models_by_last_used()
+            .once()
+            .returning(move |_| {
+                Ok(vec![record_with(
+                    &ngc_meta,
+                    ModelProvider::Ngc,
+                    ModelStatus::DOWNLOADED,
+                    1,
+                )])
+            });
+        let (ngc_service, ngc_cache) = service_with_mock(ngc_mock, CacheEvictionConfig::default());
+        let ngc_dir = ngc_cache.path().join("ngc/nim/nvidia/models/llama/1");
+        std::fs::create_dir_all(&ngc_dir).expect("create ngc dir");
+        std::fs::write(ngc_dir.join("config.json"), b"{}").expect("write ngc config");
+
+        ngc_service
+            .evict_model("nim/nvidia/llama/1")
+            .await
+            .expect("evict NGC raw spelling");
+        assert!(
+            ngc_dir.join("config.json").is_file(),
+            "surviving canonical NGC spelling must protect shared model directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evict_skips_record_that_became_downloading_without_touching_registry_or_disk() {
+        let entry = key(Some("rev1"), false);
+
+        // 1. Direct evict_model call observes DOWNLOADING -> returns Ok(false), touches nothing.
+        let mut direct_mock = MockRegistryBackend::new();
+        direct_mock
+            .expect_get_model_record()
+            .once()
+            .returning(|name| {
+                Ok(Some(record_with(
+                    name,
+                    ModelProvider::HuggingFace,
+                    ModelStatus::DOWNLOADING,
+                    0,
+                )))
+            });
+        direct_mock.expect_delete_model().times(0);
+
+        let (direct_service, direct_cache) =
+            service_with_mock(direct_mock, CacheEvictionConfig::default());
+        let direct_snap = direct_cache
+            .path()
+            .join("models--test--model/snapshots/rev1");
+        std::fs::create_dir_all(&direct_snap).expect("create snapshot");
+        std::fs::write(direct_snap.join("config.json"), b"{}").expect("write config");
+
+        let evicted = direct_service
+            .evict_model(&entry)
+            .await
+            .expect("skipping DOWNLOADING record must succeed as no-op");
+        assert!(!evicted, "DOWNLOADING record must not be evicted");
+        assert!(
+            direct_snap.join("config.json").is_file(),
+            "files must stay untouched when record became DOWNLOADING"
+        );
+
+        // 2. Full eviction cycle selects aged DOWNLOADED record, then re-read sees
+        //    DOWNLOADING -> cycle skips it with evicted_count == 0 and metric == 0.
+        let listed = vec![record_with(
+            &entry,
+            ModelProvider::HuggingFace,
+            ModelStatus::DOWNLOADED,
+            10,
+        )];
+        let mut cycle_mock = MockRegistryBackend::new();
+        cycle_mock
+            .expect_get_models_by_last_used()
+            .once()
+            .returning(move |_| Ok(listed.clone()));
+        cycle_mock
+            .expect_get_model_record()
+            .once()
+            .returning(|name| {
+                Ok(Some(record_with(
+                    name,
+                    ModelProvider::HuggingFace,
+                    ModelStatus::DOWNLOADING,
+                    0,
+                )))
+            });
+        cycle_mock.expect_delete_model().times(0);
+
+        let (cycle_service, cycle_cache, metrics_registry) =
+            service_with_mock_and_registry(cycle_mock, lru_config(7, None));
+        let cycle_snap = cycle_cache
+            .path()
+            .join("models--test--model/snapshots/rev1");
+        std::fs::create_dir_all(&cycle_snap).expect("create snapshot");
+        std::fs::write(cycle_snap.join("config.json"), b"{}").expect("write config");
+
+        let result = cycle_service
+            .run_eviction_cycle()
+            .await
+            .expect("eviction cycle");
+        assert_eq!(result.evicted_count, 0);
+        assert!(
+            cycle_snap.join("config.json").is_file(),
+            "files must stay untouched when eviction cycle skips DOWNLOADING record"
+        );
+        let encoded = crate::metrics::encode_text(&metrics_registry)
+            .unwrap_or_else(|_| String::from("<encode failed>"));
+        assert_eq!(evictions_for(&encoded, "time_threshold"), 0, "{encoded}");
     }
 }

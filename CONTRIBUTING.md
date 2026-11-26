@@ -113,7 +113,7 @@ Run pre-commit after every code change, even before creating commits. Do not wai
 |----------|---------|-------------|
 | `MODEL_EXPRESS_SERVER_HOST` | `0.0.0.0` | Server bind address |
 | `MODEL_EXPRESS_SERVER_PORT` | `8001` | Server port |
-| `MODEL_EXPRESS_CACHE_DIRECTORY` | `./cache` | Model cache directory |
+| `MODEL_EXPRESS_CACHE_DIRECTORY` | unset (auto-resolved) | Model cache directory |
 | `MODEL_EXPRESS_CACHE_EVICTION_ENABLED` | `true` | Enable cache eviction |
 | `MODEL_EXPRESS_LOG_LEVEL` | `info` | Log level (trace, debug, info, warn, error) |
 | `MODEL_EXPRESS_LOG_FORMAT` | `pretty` | Log format (json, pretty, compact) |

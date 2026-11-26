@@ -24,11 +24,15 @@ use k8s_openapi::api::{
 };
 use kube::{
     Client,
-    api::{Api, AttachParams, DeleteParams, ListParams, PostParams},
+    api::{
+        Api, ApiResource, AttachParams, DeleteParams, DynamicObject, GroupVersionKind, ListParams,
+        Patch, PatchParams, PostParams,
+    },
     config::{KubeConfigOptions, Kubeconfig},
 };
 
 const MX_RBAC_SA: &str = "modelexpress";
+const CACHE_FILES_FINALIZER: &str = "modelexpress.nvidia.com/cache-files";
 use std::collections::BTreeSet;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -110,6 +114,57 @@ async fn select_nodes(client: &Client) -> Result<(String, String)> {
     Ok((schedulable[0].clone(), schedulable[1].clone()))
 }
 
+/// Delete `ModelCacheEntry` CRs in `namespace` and clear `CACHE_FILES_FINALIZER`
+/// from any stuck entries so namespace deletion cannot hang if the server pod is
+/// already gone.
+async fn cleanup_namespace_model_cache_entries(client: &Client, namespace: &str) {
+    let gvk = GroupVersionKind::gvk("modelexpress.nvidia.com", "v1alpha1", "ModelCacheEntry");
+    let ar = ApiResource::from_gvk(&gvk);
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+
+    let Ok(list) = api.list(&ListParams::default()).await else {
+        return;
+    };
+    for obj in list.items {
+        let Some(name) = obj.metadata.name.as_deref() else {
+            continue;
+        };
+        let _ = api.delete(name, &DeleteParams::default()).await;
+    }
+
+    // Wait briefly for a running finalizer controller to finish naturally.
+    for _ in 0..10 {
+        match api.list(&ListParams::default()).await {
+            Ok(remaining) if remaining.items.is_empty() => return,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+            Err(_) => return,
+        }
+    }
+
+    // Fallback: remove only our finalizer from any entries that remain stuck.
+    if let Ok(remaining) = api.list(&ListParams::default()).await {
+        for obj in remaining.items {
+            let Some(name) = obj.metadata.name.as_deref() else {
+                continue;
+            };
+            let Some(finalizers) = obj.metadata.finalizers.as_ref() else {
+                continue;
+            };
+            if let Some(index) = finalizers.iter().position(|f| f == CACHE_FILES_FINALIZER) {
+                let path = format!("/metadata/finalizers/{index}");
+                if let Ok(patch) = serde_json::from_value(serde_json::json!([
+                    { "op": "test", "path": path, "value": CACHE_FILES_FINALIZER },
+                    { "op": "remove", "path": path },
+                ])) {
+                    let _ = api
+                        .patch(name, &PatchParams::default(), &Patch::<()>::Json(patch))
+                        .await;
+                }
+            }
+        }
+    }
+}
+
 /// Create a namespace, returning a guard that deletes it on drop.
 async fn create_namespace(client: &Client, name: &str) -> Result<NamespaceGuard> {
     let ns_api: Api<Namespace> = Api::all(client.clone());
@@ -120,8 +175,10 @@ async fn create_namespace(client: &Client, name: &str) -> Result<NamespaceGuard>
     }))?;
 
     // Delete if leftover from a previous failed run, wait until fully gone
+    cleanup_namespace_model_cache_entries(client, name).await;
     let _ = ns_api.delete(name, &DeleteParams::default()).await;
     while ns_api.get(name).await.is_ok() {
+        cleanup_namespace_model_cache_entries(client, name).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
@@ -144,6 +201,7 @@ impl Drop for NamespaceGuard {
         let name = self.name.clone();
         // Best-effort cleanup - fire and forget
         tokio::spawn(async move {
+            cleanup_namespace_model_cache_entries(&client, &name).await;
             let ns_api: Api<Namespace> = Api::all(client);
             let _ = ns_api.delete(&name, &DeleteParams::default()).await;
         });
@@ -177,7 +235,7 @@ async fn create_kubernetes_backend_rbac(client: &Client, namespace: &str) -> Res
                     "modelmetadatas", "modelmetadatas/status",
                     "modelcacheentries", "modelcacheentries/status",
                 ],
-                "verbs": ["get", "list", "create", "update", "patch", "delete"],
+                "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
             },
             {
                 "apiGroups": [""],

@@ -208,9 +208,15 @@ pub async fn run_server(
         }
     }
 
-    // Initialize the download tracker, injected with the registry.
+    // Resolve the single cache directory used by downloads, file serving,
+    // deletion, and LRU eviction.
+    let resolved_cache = config.resolve_cache_directory();
+    let cache_directory = resolved_cache.path;
+
+    // Initialize the download tracker, injected with the registry and cache directory.
     let tracker = Arc::new(ModelDownloadTracker::new(
         registry.clone(),
+        cache_directory.clone(),
         download_metrics,
         registry_metrics.clone(),
     ));
@@ -219,12 +225,33 @@ pub async fn run_server(
     let cache_service = CacheEvictionService::new(
         registry.clone(),
         config.cache.eviction.clone(),
-        config.cache.directory.clone(),
+        cache_directory.clone(),
         cache_metrics.clone(),
     );
 
     // Create shutdown channels
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+    // Start Kubernetes ModelCacheEntry finalizer controller when the Kubernetes
+    // registry backend is active.
+    let (finalizer_shutdown_tx, finalizer_handle) = match &backend {
+        BackendConfig::Kubernetes { namespace } => {
+            let kube_client = kube::Client::try_default().await.map_err(|e| {
+                error!("Failed to initialize Kubernetes client for finalizer controller: {e}");
+                e
+            })?;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let handle =
+                crate::registry::backend::kubernetes::finalizer::spawn_finalizer_controller(
+                    kube_client,
+                    namespace.clone(),
+                    cache_directory,
+                    rx,
+                );
+            (Some(tx), Some(handle))
+        }
+        _ => (None, None),
+    };
 
     // Start cache eviction service in background
     let cache_handle = if config.cache.eviction.enabled {
@@ -386,6 +413,13 @@ pub async fn run_server(
         if stats_shutdown_tx.send(()).is_err() {
             error!("Failed to send shutdown signal to registry stats refresh");
         }
+
+        // Signal Kubernetes finalizer controller to shutdown
+        if let Some(tx) = finalizer_shutdown_tx
+            && tx.send(()).is_err()
+        {
+            error!("Failed to send shutdown signal to Kubernetes finalizer controller");
+        }
     };
 
     let mode = config.security.resolve_mode();
@@ -458,6 +492,11 @@ pub async fn run_server(
         && let Err(e) = handle.await
     {
         error!("Cache eviction service join error: {e}");
+    }
+    if let Some(handle) = finalizer_handle
+        && let Err(e) = handle.await
+    {
+        error!("Kubernetes finalizer controller join error: {e}");
     }
     if let Err(e) = stats_handle.await {
         error!("Registry stats refresh join error: {e}");

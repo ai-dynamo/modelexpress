@@ -75,11 +75,18 @@ impl ProviderCache for GcsProviderCache {
         let model_dir_state = ModelDir::new(cache_dir, &model_dir);
 
         if !model_dir_state.is_removable()? {
-            info!(
-                "Model not found in cache: {} ({:?})",
-                model_name,
-                ModelProvider::Gcs
-            );
+            if let Some((relation, overlap)) = model_dir_state.find_overlap()? {
+                warn!(
+                    "Skipping clear for GCS model '{}': overlaps cached {} model '{}'",
+                    model_name, relation, overlap
+                );
+            } else {
+                info!(
+                    "Model not found in cache: {} ({:?})",
+                    model_name,
+                    ModelProvider::Gcs
+                );
+            }
             return Ok(());
         }
 

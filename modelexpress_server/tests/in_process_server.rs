@@ -50,6 +50,7 @@ fn start_server_with_metrics(
     port: u16,
     metrics_port: u16,
 ) -> (oneshot::Sender<()>, JoinHandle<ServerResult>) {
+    let cache_dir = tempfile::TempDir::new().expect("temp cache dir");
     let mut config = ServerConfig::default();
     config.server.host = "127.0.0.1".to_string();
     config.server.port = NonZeroU16::new(port).expect("port is non-zero");
@@ -58,13 +59,17 @@ fn start_server_with_metrics(
     // the bind — which the server tolerates by design, but which would leave the
     // tests silently exercising the degraded path.
     config.server.metrics_port = metrics_port;
+    config.cache.directory = Some(cache_dir.path().to_path_buf());
     config.cache.eviction.enabled = false;
 
     let (tx, rx) = oneshot::channel::<()>();
     let shutdown = async move {
         let _ = rx.await;
     };
-    let handle = tokio::spawn(run_server(config, BackendConfig::Memory, shutdown));
+    let handle = tokio::spawn(async move {
+        let _cache_dir = cache_dir;
+        run_server(config, BackendConfig::Memory, shutdown).await
+    });
     (tx, handle)
 }
 
@@ -212,10 +217,12 @@ async fn an_early_failure_releases_the_metrics_port() {
 
     let [port, metrics_port, dead_port] = free_ports::<3>();
 
+    let _cache_dir = tempfile::TempDir::new().expect("temp cache dir");
     let mut config = ServerConfig::default();
     config.server.host = "127.0.0.1".to_string();
     config.server.port = NonZeroU16::new(port).expect("port is non-zero");
     config.server.metrics_port = metrics_port;
+    config.cache.directory = Some(_cache_dir.path().to_path_buf());
     config.cache.eviction.enabled = false;
 
     // Redis on a port nothing is listening on: the registry connect fails and

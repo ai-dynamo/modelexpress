@@ -45,7 +45,7 @@ The server accepts redis, kubernetes, k8s, and crd. Redis requires REDIS_URL, or
 | server.host | --host | MODEL_EXPRESS_SERVER_HOST | 0.0.0.0 |
 | server.port | --port / -p | MODEL_EXPRESS_SERVER_PORT | 8001 |
 | server.metrics_port | --metrics-port | MODEL_EXPRESS_SERVER_METRICS_PORT | 9401; 0 disables |
-| cache.directory | --cache-directory | MODEL_EXPRESS_CACHE_DIRECTORY | ./cache |
+| cache.directory | --cache-directory | MODEL_EXPRESS_CACHE_DIRECTORY | unset (auto-resolved) |
 | cache.eviction.enabled | --cache-eviction-enabled | MODEL_EXPRESS_CACHE_EVICTION_ENABLED | true |
 | logging.level | --log-level / -l | MODEL_EXPRESS_LOG_LEVEL | info |
 | logging.format | --log-format | MODEL_EXPRESS_LOG_FORMAT | pretty |

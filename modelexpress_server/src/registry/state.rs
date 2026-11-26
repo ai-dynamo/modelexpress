@@ -21,15 +21,18 @@ pub struct RegistryManager {
     config: Option<BackendConfig>,
     metrics: Option<BackendMetrics>,
     lifecycle: Option<RegistryMetrics>,
+    manages_deletion_cleanup: bool,
 }
 
 impl RegistryManager {
     pub fn with_config(config: BackendConfig) -> Self {
+        let manages_deletion_cleanup = matches!(config, BackendConfig::Kubernetes { .. });
         Self {
             backend: Arc::new(RwLock::new(None)),
             config: Some(config),
             metrics: None,
             lifecycle: None,
+            manages_deletion_cleanup,
         }
     }
 
@@ -71,7 +74,24 @@ impl RegistryManager {
             config: None,
             metrics: None,
             lifecycle: None,
+            manages_deletion_cleanup: false,
         }
+    }
+
+    /// Override whether this manager represents a backend whose own controller
+    /// handles deferred cleanup on deletion (tests only).
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_manages_deletion_cleanup(mut self, enabled: bool) -> Self {
+        self.manages_deletion_cleanup = enabled;
+        self
+    }
+
+    /// Whether the configured registry backend manages deferred file cleanup on
+    /// record deletion (for example via the Kubernetes finalizer controller).
+    #[must_use]
+    pub fn manages_deletion_cleanup(&self) -> bool {
+        self.manages_deletion_cleanup
     }
 
     /// Eagerly connect to the configured backend. Returns the backend type name.
@@ -195,6 +215,19 @@ impl RegistryManager {
             .await
     }
 
+    pub async fn try_reclaim_downloaded(
+        &self,
+        model_name: &str,
+        provider: ModelProvider,
+        claim_id: &str,
+        lease_duration: std::time::Duration,
+    ) -> RegistryResult<bool> {
+        self.get_backend()
+            .await?
+            .try_reclaim_downloaded(model_name, provider, claim_id, lease_duration)
+            .await
+    }
+
     pub async fn refresh_download_claim(
         &self,
         model_name: &str,
@@ -236,6 +269,7 @@ mod tests {
             config: None,
             metrics: None,
             lifecycle: None,
+            manages_deletion_cleanup: false,
         };
         assert!(mgr.connect().await.is_err());
     }

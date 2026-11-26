@@ -280,12 +280,12 @@ impl<'a> ModelDir<'a> {
         Ok(matched_entry)
     }
 
-    fn find_overlap(&self) -> Result<Option<(&'static str, ModelName)>> {
+    pub(crate) fn find_overlap(&self) -> Result<Option<(&'static str, ModelName)>> {
         let model = self.model_name()?;
         let bucket_dir = model.bucket_dir(self.cache_dir);
         let mut current = self.model_dir.parent();
         while let Some(ancestor) = current {
-            if !ancestor.starts_with(&bucket_dir) {
+            if ancestor == bucket_dir || !ancestor.starts_with(&bucket_dir) {
                 break;
             }
 
@@ -294,27 +294,48 @@ impl<'a> ModelDir<'a> {
                 return Ok(Some(("ancestor", ancestor_model_dir.model_name()?)));
             }
 
-            if ancestor == bucket_dir {
-                break;
-            }
             current = ancestor.parent();
         }
 
-        if !self.model_dir.is_dir() {
+        let meta = match fs::symlink_metadata(self.model_dir) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to inspect '{}'", self.model_dir.display()));
+            }
+        };
+        if !meta.file_type().is_dir() {
             return Ok(None);
         }
 
         let mut pending = vec![self.model_dir.to_path_buf()];
         while let Some(current_dir) = pending.pop() {
-            for entry in fs::read_dir(&current_dir)
-                .with_context(|| format!("Failed to read directory '{}'", current_dir.display()))?
-            {
-                let entry = entry?;
-                let path = entry.path();
-                if !path.is_dir() {
+            let entries = match fs::read_dir(&current_dir) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("Failed to read directory '{}'", current_dir.display())
+                    });
+                }
+            };
+            for entry in entries {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err.into()),
+                };
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err.into()),
+                };
+                if !file_type.is_dir() {
                     continue;
                 }
 
+                let path = entry.path();
                 let child_model_dir = ModelDir::new(self.cache_dir, &path);
                 if child_model_dir.has_manifest_file() {
                     return Ok(Some(("descendant", child_model_dir.model_name()?)));
@@ -328,40 +349,83 @@ impl<'a> ModelDir<'a> {
     }
 
     pub fn is_removable(&self) -> Result<bool> {
-        if self.has_manifest_file() {
-            self.model_name()?;
-            return Ok(true);
-        }
-
-        if !self.model_dir.exists() {
+        self.model_name()?;
+        if !crate::providers::ensure_delete_target_within_cache_root(
+            self.cache_dir,
+            self.model_dir,
+        )? {
             return Ok(false);
+        }
+        let meta = match fs::symlink_metadata(self.model_dir) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to inspect '{}'", self.model_dir.display()));
+            }
+        };
+
+        if meta.file_type().is_symlink() {
+            return Ok(true);
         }
 
         Ok(self.find_overlap()?.is_none())
     }
 
     pub fn remove(&self) -> Result<()> {
+        if !crate::providers::ensure_delete_target_within_cache_root(
+            self.cache_dir,
+            self.model_dir,
+        )? {
+            return Ok(());
+        }
         if !self.is_removable()? {
+            if fs::symlink_metadata(self.model_dir)
+                .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+            {
+                return Ok(());
+            }
             anyhow::bail!(
                 "GCS model directory '{}' is not removable",
                 self.model_dir.display()
             );
         }
 
-        if self.model_dir.is_dir() {
-            fs::remove_dir_all(self.model_dir).with_context(|| {
-                format!(
-                    "Failed to remove cached GCS model directory '{}'",
-                    self.model_dir.display()
-                )
-            })?;
+        let meta = match fs::symlink_metadata(self.model_dir) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Failed to inspect '{}'", self.model_dir.display()));
+            }
+        };
+
+        if meta.file_type().is_dir() {
+            match fs::remove_dir_all(self.model_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to remove cached GCS model directory '{}'",
+                            self.model_dir.display()
+                        )
+                    });
+                }
+            }
         } else {
-            fs::remove_file(self.model_dir).with_context(|| {
-                format!(
-                    "Failed to remove cached GCS model file '{}'",
-                    self.model_dir.display()
-                )
-            })?;
+            match fs::remove_file(self.model_dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to remove cached GCS model file '{}'",
+                            self.model_dir.display()
+                        )
+                    });
+                }
+            }
         }
 
         Ok(())
