@@ -1122,12 +1122,18 @@ class _VllmInstaller(EngineInstaller):
                         )
                     if current is not graph_tensor:
                         graph_tensor.copy_(current)
+                    if persistent is None:
+                        # A plain attribute, possibly holding another module's
+                        # Parameter (vLLM's routed experts keep the gate's
+                        # hash-routing table this way). Module.__setattr__ would
+                        # register it as a parameter of this module.
+                        module.__dict__[name] = graph_tensor
+                        continue
                     setattr(module, name, graph_tensor)
-                    if persistent is not None:
-                        if persistent:
-                            module._non_persistent_buffers_set.discard(name)
-                        else:
-                            module._non_persistent_buffers_set.add(name)
+                    if persistent:
+                        module._non_persistent_buffers_set.discard(name)
+                    else:
+                        module._non_persistent_buffers_set.add(name)
             for path, reference, layout in runtime_layouts.values():
                 _validate_runtime_tensor_layout(path, reference(), layout)
 

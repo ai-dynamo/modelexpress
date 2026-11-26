@@ -147,7 +147,8 @@ for setup and eviction behavior.
 ## FSDP precision and trainer staging
 
 
-The FSDP publisher transfers floating tensors in BF16 by default. Frameworks
+The FSDP publisher transfers floating tensors in BF16 by default; tensors of
+other dtypes, such as integer lookup tables, travel unchanged. Frameworks
 whose models require higher precision for selected tensors can provide exact
 state-dict names through the trainer context:
 

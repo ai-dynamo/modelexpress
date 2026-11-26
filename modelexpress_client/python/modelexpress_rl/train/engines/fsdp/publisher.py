@@ -8,20 +8,21 @@ engine-neutral manifest (``PublishedTensor`` / ``PublishedShard`` +
 receiver maps these native trainer-format sources into the HF/vLLM param layout
 (see the ``convert_native_to_hf=`` field on ``VllmGeneratorContext``).
 
-Extraction rules (per state_dict tensor, floating point only):
+Extraction rules (per state_dict tensor, every dtype):
 - unsharded (not a DTensor): every rank holds + publishes the full tensor;
   the identical copies across ranks are deduped by box upstream of the
   transfer planner (merge_shard_tables)
 - replicated DTensor: same as unsharded
 - sharded DTensor: this rank serves its per-dim local box (general: FSDP dim 0,
   tensor-parallel dim 1, or 2-D meshes) via compute_local_shape_and_global_offset
-- served in the selected per-tensor wire dtype, cast into the staging arena for
-  COPY_TO_HOST or COPY_TO_DEVICE only when the source differs
+- floating-point tensors are served in the selected per-tensor wire dtype, cast
+  into the staging arena for COPY_TO_HOST or COPY_TO_DEVICE only when the source
+  differs; other dtypes (integer lookup tables such as a hash-routing map) are
+  served unchanged, so a full refit can write every engine parameter
 """
 
 from __future__ import annotations
 
-import logging
 import time
 from dataclasses import dataclass
 
@@ -37,7 +38,6 @@ from modelexpress_rl.refit.reshard.rendezvous import (
 )
 from modelexpress_rl.train.adapter import NixlMetadataProvider
 
-logger = logging.getLogger("modelexpress_rl.train.engines.fsdp.publisher")
 
 # Default transfer dtype; FSDPTrainerContext can override it per tensor.
 WIRE_DTYPE = torch.bfloat16
@@ -82,11 +82,7 @@ def capture_local_shards(
     the transfer planner (merge_shard_tables), not here.
     """
     shards: list[LocalTensorShard] = []
-    skipped: list[str] = []
     for name, value in state_dict.items():
-        if not value.is_floating_point():
-            skipped.append(name)
-            continue
         full_shape = tuple(value.shape)
         zero_offset = tuple(0 for _ in full_shape)
 
@@ -141,12 +137,6 @@ def capture_local_shards(
                     source_tensor=local,
                 )
             )
-    if skipped:
-        logger.debug(
-            "capture_local_shards: skipped %d non-floating-point entries: %s",
-            len(skipped),
-            sorted(skipped),
-        )
     return shards
 
 
