@@ -543,6 +543,10 @@ def _initialize(
             staging_buffer_bytes=staging_buffer_bytes,
             staging_buffers_count=staging_buffers_count,
             staging_device=staging_device,
+            # These tests cover the client staging in its own process, behind
+            # a runtime that exists only here. test_refit_stage_process.py
+            # covers the stage process.
+            stage_process=False,
         )
     )
 

@@ -866,14 +866,14 @@ def test_worker_that_never_reads_its_configuration_is_killed(harness, monkeypatc
     assert [proc.poll() for proc in harness.procs] == killed
 
 
-def test_stage_process_is_off_unless_asked_for(harness, monkeypatch):
+def test_stage_process_is_on_unless_turned_off(harness, monkeypatch):
     client, _ = harness.client(stage_process=None)
-    assert client._stage_process is None and harness.procs == []
-
-    monkeypatch.setenv("MX_REFIT_STAGE_PROCESS", "true")
-    client, _ = harness.client(worker_id="generator-1", stage_process=None)
     assert client._stage_process is not None
-    client, _ = harness.client(worker_id="generator-2", stage_process=False)
+    client, _ = harness.client(worker_id="generator-1", stage_process=False)
+    assert client._stage_process is None
+
+    monkeypatch.setenv("MX_REFIT_STAGE_PROCESS", "false")
+    client, _ = harness.client(worker_id="generator-2", stage_process=None)
     assert client._stage_process is None
     assert len(harness.procs) == 1
 

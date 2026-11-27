@@ -284,13 +284,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MX_REFIT_STREAM_WINDOW_LAYERS",
     ),
     # ── Stage process (the staging step outside the engine process) ──
-    # Run the generator client's staging step in a child process. Applies only
-    # when object storage is the client's only source. Only the child stages
-    # then: the client replaces a child as soon as it exits and never stages
-    # itself, except a version whose install reads the weights from their
-    # source (a streamed full checkpoint), which has nothing to stage ahead.
+    # Run the generator client's staging step in a child process. On by
+    # default. Applies only when object storage is the client's only source.
+    # Only the child stages then: the client replaces a child as soon as it
+    # exits and never stages itself, except a version whose install reads the
+    # weights from their source (a streamed full checkpoint), which has nothing
+    # to stage ahead. Off, the client stages in its own process.
     "MX_REFIT_STAGE_PROCESS": lambda: parse_bool(
-        os.environ.get("MX_REFIT_STAGE_PROCESS", "false"),
+        os.environ.get("MX_REFIT_STAGE_PROCESS", "true"),
         "MX_REFIT_STAGE_PROCESS",
     ),
     # Deadline for one stage request; a child that exceeds it is killed and
