@@ -15,6 +15,7 @@ import pytest
 import torch
 import torch.nn as nn
 from modelexpress import p2p_pb2
+from modelexpress.engines.sglang import adapter as adapter_mod
 from modelexpress.engines.sglang.adapter import (
     SglangAdapter,
     build_sglang_load_context,
@@ -56,6 +57,19 @@ def _stub_accelerator_backend_selection(monkeypatch, mock_accelerator_backend_cl
         "modelexpress.engines.sglang.adapter.accelerator_backend_for",
         lambda device: mock_accelerator_backend_cls(),
     )
+    monkeypatch.setattr(
+        adapter_mod,
+        "_get_layout_parameters",
+        lambda tensor_parallel_size: {
+            "attention_tp_size": str(tensor_parallel_size),
+            "attention_cp_size": "1",
+            "attention_dp_size": "1",
+            "dense_mlp_tp_size": str(tensor_parallel_size),
+        },
+    )
+
+
+_REAL_GET_LAYOUT_PARAMETERS = adapter_mod._get_layout_parameters
 
 
 def test_sglang_adapter_builds_identity_from_sglang_configs():
@@ -79,6 +93,59 @@ def test_sglang_adapter_builds_identity_from_sglang_configs():
     assert identity.dtype == "bfloat16"
     assert identity.quantization == "fp8"
     assert identity.revision == "abc123"
+    assert dict(identity.extra_parameters) == {
+        "attention_tp_size": "8",
+        "attention_cp_size": "1",
+        "attention_dp_size": "1",
+        "dense_mlp_tp_size": "8",
+    }
+
+
+def test_sglang_adapter_includes_effective_layout_parallelism(monkeypatch):
+    sglang_mod = ModuleType("sglang")
+    srt_mod = ModuleType("sglang.srt")
+    runtime_context_mod = ModuleType("sglang.srt.runtime_context")
+    runtime_context_mod.get_parallel = lambda: SimpleNamespace(
+        attn_tp_size=1,
+        attn_cp_size=4,
+        attn_dp_size=1,
+    )
+    runtime_context_mod.get_server_args = lambda: SimpleNamespace(
+        moe_dense_tp_size=1,
+    )
+    sglang_mod.srt = srt_mod
+    srt_mod.runtime_context = runtime_context_mod
+
+    monkeypatch.setitem(sys.modules, "sglang", sglang_mod)
+    monkeypatch.setitem(sys.modules, "sglang.srt", srt_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.runtime_context",
+        runtime_context_mod,
+    )
+    monkeypatch.setattr(
+        adapter_mod,
+        "_get_layout_parameters",
+        _REAL_GET_LAYOUT_PARAMETERS,
+    )
+
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    with patch(
+        "modelexpress.engines.sglang.adapter._get_parallel_size",
+        side_effect=lambda name: {
+            "get_tensor_model_parallel_world_size": 4,
+            "get_pipeline_model_parallel_world_size": 1,
+            "get_moe_expert_parallel_world_size": 4,
+        }[name],
+    ):
+        identity = adapter.build_identity()
+
+    assert dict(identity.extra_parameters) == {
+        "attention_tp_size": "1",
+        "attention_cp_size": "4",
+        "attention_dp_size": "1",
+        "dense_mlp_tp_size": "1",
+    }
 
 
 def test_sglang_context_uses_tp_rank_for_matching_and_url_override():
