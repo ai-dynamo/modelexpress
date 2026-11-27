@@ -670,6 +670,10 @@ RL trainers and generators use the optional `modelexpress_rl` namespace from the
 Trainer NIXL refit stages ordered source replay batches for engine installation.
 Direct generator-peer refit owns its donor leases and reads in the runtime-tensor
 update method, borrowing the inference NIXL manager independently of trainer staging.
+The `modelexpress_nccl` vLLM weight-transfer backend
+(`modelexpress_rl/inference/engines/vllm/nccl_publication_engine.py`) keeps
+NCCL-updated generators published as P2P sources; see the
+[RL refit architecture](rl/ARCHITECTURE.md#python-engine-integration).
 
 ### MxClient
 

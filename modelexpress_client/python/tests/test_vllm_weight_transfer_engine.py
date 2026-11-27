@@ -433,7 +433,12 @@ def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
             "modelexpress",
             "modelexpress_rl.inference.engines.vllm.weight_transfer_engine",
             "ModelExpressWeightTransferEngine",
-        )
+        ),
+        (
+            "modelexpress_nccl",
+            "modelexpress_rl.inference.engines.vllm.nccl_publication_engine",
+            "ModelExpressNCCLWeightTransferEngine",
+        ),
     ]
 
 
