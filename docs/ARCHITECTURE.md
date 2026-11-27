@@ -852,6 +852,20 @@ This does not add optimized support for Hopper's optional BF16 weight cache or
 ROCm MXFP8 layouts; mismatches remain failures. Warm reloads skip cold-load
 preparation and retain their existing same-identity restrictions.
 
+**Weight release, resume and reload.** SGLang keeps the loader alive after boot
+and calls optional hooks around `release_memory_occupation` and
+`resume_memory_occupation`.
+- `before_weights_release` unpublishes the worker, shuts down the NIXL agent and
+  unregisters TransferEngine memory.
+- `after_weights_resume` republishes only on `nixl`, and only if SGLang preserved
+  the weights; otherwise the worker stays unpublished until `reload_model`.
+- `reload_model` backs `update_weights_from_disk` with
+  `load_format=remote_instance`. It reuses the boot context, runs the strategy
+  chain and republishes. It supports only `nixl`, so a `transfer_engine` worker
+  stays unpublished after release until the process restarts. SGLang reloads
+  only the target, so the reload re-adds the draft tensors the boot draft pass
+  published, at their unchanged addresses.
+
 **Speculative draft pass.** SGLang's EAGLE worker builds a second ModelRunner
 for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
 unless `speculative_draft_load_format` names another format, it loads through the
