@@ -67,6 +67,8 @@ def get_modelexpress_generator(model_runner: Any) -> ModelExpressGeneratorClient
                 endpoint_url=config.get("object_storage_endpoint_url"),
                 region_name=config.get("object_storage_region_name"),
             ),
+            # Absent or null follows MX_REFIT_STAGE_PROCESS.
+            stage_process=config.get("stage_process"),
         )
     )
     model_runner.modelexpress_generator = generator

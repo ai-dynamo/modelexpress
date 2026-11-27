@@ -529,11 +529,6 @@ class _LocalCheckpoint:
                 and self.store.state() is None
             ):
                 return False
-            if cached_seed and not initial_checkpoint.is_dir():
-                raise FileNotFoundError(
-                    f"cached seed checkpoint for {self.initial_version!r} "
-                    f"not found: {initial_checkpoint}"
-                )
             version = self._initialize_checkpoint_state(
                 state=self.store.state(),
                 initial_checkpoint=initial_checkpoint,
@@ -577,6 +572,14 @@ class _LocalCheckpoint:
 
         self.local_checkpoint = initial_checkpoint
         if cached_seed:
+            # Only a cache without a verified head needs its initial checkpoint.
+            # A cache built by a full checkpoint never had one, and it may have
+            # been evicted.
+            if not initial_checkpoint.is_dir():
+                raise FileNotFoundError(
+                    f"cached seed checkpoint for {self.initial_version!r} "
+                    f"not found: {initial_checkpoint}"
+                )
             self._restore_cached_initial_checkpoint()
         else:
             self.reset_initial_checkpoint()

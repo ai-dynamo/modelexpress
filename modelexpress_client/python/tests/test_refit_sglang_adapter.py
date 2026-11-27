@@ -248,6 +248,44 @@ def test_generator_factory_preserves_explicit_cache_quota(
     assert config.object_storage.refit_checkpoint_max_size_gb == quota
 
 
+@pytest.mark.parametrize("as_json", [False, True])
+@pytest.mark.parametrize(
+    "stage_process_config",
+    [{}, {"stage_process": None}, {"stage_process": True}, {"stage_process": False}],
+)
+def test_generator_factory_passes_the_stage_process_switch(
+    tmp_path, monkeypatch, as_json, stage_process_config
+):
+    initialize = Mock()
+    monkeypatch.setattr(ModelExpressGeneratorClient, "initialize", initialize)
+    runner = _runner(tmp_path)
+    runner.server_args.modelexpress_config.update(stage_process_config)
+    if as_json:
+        runner.server_args.modelexpress_config = json.dumps(
+            runner.server_args.modelexpress_config
+        )
+
+    get_modelexpress_generator(runner)
+
+    # Left out or null, the client follows MX_REFIT_STAGE_PROCESS.
+    config = initialize.call_args.args[0]
+    assert config.stage_process is stage_process_config.get("stage_process")
+
+
+def test_generator_factory_rejects_a_non_boolean_stage_process_switch(
+    tmp_path, monkeypatch
+):
+    initialize = Mock()
+    monkeypatch.setattr(ModelExpressGeneratorClient, "initialize", initialize)
+    runner = _runner(tmp_path)
+    runner.server_args.modelexpress_config["stage_process"] = "true"
+
+    with pytest.raises(TypeError, match="stage_process must be a bool or None"):
+        get_modelexpress_generator(runner)
+
+    initialize.assert_not_called()
+
+
 def test_generator_factory_can_retry_initialization(tmp_path, monkeypatch):
     runner = _runner(tmp_path)
     generator = object()

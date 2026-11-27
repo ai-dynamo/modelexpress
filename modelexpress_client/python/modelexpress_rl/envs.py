@@ -56,6 +56,10 @@ if TYPE_CHECKING:
     MX_MAX_REPLAY_CHAIN_LENGTH: int
     MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
+    MX_REFIT_STAGE_PROCESS: bool
+    MX_REFIT_STAGE_PROCESS_TIMEOUT_SECONDS: float
+    MX_REFIT_STAGE_PROCESS_START_TIMEOUT_SECONDS: float
+    MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS: float
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_BACKEND: str
     MX_S3_DOWNLOAD_RANGE_BYTES: int
@@ -279,6 +283,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.environ.get("MX_REFIT_STREAM_WINDOW_LAYERS", 2)),
         "MX_REFIT_STREAM_WINDOW_LAYERS",
     ),
+    # ── Stage process (the staging step outside the engine process) ──
+    # Run the generator client's staging step in a child process. On by
+    # default. Applies only when object storage is the client's only source.
+    # Only the child stages then: the client replaces a child as soon as it
+    # exits and never stages itself, except a version whose install reads the
+    # weights from their source (a streamed full checkpoint), which has nothing
+    # to stage ahead. Off, the client stages in its own process.
+    "MX_REFIT_STAGE_PROCESS": lambda: parse_bool(
+        os.environ.get("MX_REFIT_STAGE_PROCESS", "true"),
+        "MX_REFIT_STAGE_PROCESS",
+    ),
+    # Deadline for one stage request; a child that exceeds it is killed and
+    # the request fails.
+    "MX_REFIT_STAGE_PROCESS_TIMEOUT_SECONDS": lambda: positive_float_env(
+        "MX_REFIT_STAGE_PROCESS_TIMEOUT_SECONDS", 3600.0
+    ),
+    # Deadline for the child to start and report ready. Client initialization
+    # waits for it, and so does a request that has to replace the child.
+    "MX_REFIT_STAGE_PROCESS_START_TIMEOUT_SECONDS": lambda: positive_float_env(
+        "MX_REFIT_STAGE_PROCESS_START_TIMEOUT_SECONDS", 60.0
+    ),
+    # How long closing the client waits for the child before leaving it to
+    # finish its current staging step on its own, within that request's
+    # deadline.
+    "MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS": lambda: non_negative_float_env(
+        "MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS", 2.0
+    ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
     # them costs a few perf_counter calls and one log line, against a refit
@@ -346,6 +377,33 @@ def parse_bool(value: str, name: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{name} must be a boolean")
+
+
+def parse_float(value: str, name: str) -> float:
+    """Parse one finite float environment setting."""
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ValueError(f"{name} must be a number") from None
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    return parsed
+
+
+def positive_float_env(name: str, default: float) -> float:
+    """Read a finite positive float while retaining its setting name in errors."""
+    value = parse_float(os.environ.get(name, str(default)), name)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def non_negative_float_env(name: str, default: float) -> float:
+    """Read a finite non-negative float while retaining its setting name in errors."""
+    value = parse_float(os.environ.get(name, str(default)), name)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative")
+    return value
 
 
 def __getattr__(name: str) -> Any:
