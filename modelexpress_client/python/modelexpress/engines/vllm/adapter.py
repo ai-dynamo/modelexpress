@@ -434,6 +434,13 @@ def cold_start_load_config(load_config):
     ``.bin``/``.pt`` checkpoints, which ``auto`` would load through ``torch.load``.
     """
     disk_config = copy.copy(load_config)
+    # ModelStreamer options are not accepted by the default checkpoint loader.
+    extra_config = {
+        key: value
+        for key, value in (getattr(load_config, "model_loader_extra_config", None) or {}).items()
+        if key not in {"memory_limit", "concurrency", "distributed"}
+    }
+    _set_load_config_extra_config(disk_config, extra_config)
     fmt = validate_cold_start_format()
     try:
         disk_config.load_format = fmt

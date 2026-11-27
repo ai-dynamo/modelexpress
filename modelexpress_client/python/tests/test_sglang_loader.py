@@ -2268,3 +2268,129 @@ def test_sglang_context_captures_http_readiness(monkeypatch, local_dummy):
     monkeypatch.setenv("MX_ARTIFACT_READY_URL", "https://custom-health/ready")
     assert ctx.artifact_ready_fn()
     assert probe.call_args.args == ("https://custom-health/ready",)
+
+
+def _patch_sglang_default_loader(tensors, *, has_instanttensor=True):
+    load_format = SimpleNamespace(AUTO="auto")
+    if has_instanttensor:
+        load_format.INSTANTTENSOR = "instanttensor"
+    loader_instance = MagicMock()
+    loader_instance._get_all_weights.return_value = iter(tensors)
+    loader_cls = MagicMock(return_value=loader_instance)
+    return patch.dict(
+        sys.modules,
+        {
+            "sglang.srt.configs.load_config": SimpleNamespace(LoadFormat=load_format),
+            "sglang.srt.model_loader.loader": SimpleNamespace(DefaultModelLoader=loader_cls),
+        },
+    ), loader_cls, loader_instance
+
+
+def test_sglang_instanttensor_iter_uses_instanttensor_load_format():
+    tensor = torch.randn(2, 2)
+    model_config = _model_config()
+    load_config = _load_config(load_format="remote_instance")
+    adapter = SglangAdapter(load_config, model_config, _device_config())
+    patcher, loader_cls, loader_instance = _patch_sglang_default_loader([("w", tensor)])
+    model = MagicMock()
+
+    with patcher:
+        weights = list(adapter.build_instanttensor_weight_iter(model=model))
+
+    assert loader_cls.call_args.args[0].load_format == "instanttensor"
+    assert load_config.load_format == "remote_instance"
+    loader_instance._get_all_weights.assert_called_once_with(model_config, model)
+    assert weights == [("w", tensor)]
+
+
+def test_sglang_instanttensor_iter_drops_default_loader_options():
+    extra_config = {"enable_multithread_load": True, "num_threads": 8, "enable_gds": True, "other": 1}
+    load_config = _load_config(model_loader_extra_config=extra_config)
+    adapter = SglangAdapter(load_config, _model_config(), _device_config())
+    patcher, loader_cls, _ = _patch_sglang_default_loader([])
+
+    with patcher:
+        adapter.build_instanttensor_weight_iter(model=MagicMock())
+
+    assert loader_cls.call_args.args[0].model_loader_extra_config == {"other": 1}
+    assert load_config.model_loader_extra_config is extra_config
+    assert len(extra_config) == 4
+
+
+def test_sglang_apply_weight_iter_uses_sglang_load_weights_only():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    weights_iter = iter([("w", torch.randn(2))])
+    model = MagicMock()
+    loader_cls = SimpleNamespace(load_weights_only=MagicMock())
+    result = LoadResult(value=None, model=model)
+
+    with patch.dict(
+        sys.modules,
+        {"sglang.srt.model_loader.loader": SimpleNamespace(DefaultModelLoader=loader_cls)},
+    ):
+        assert adapter.apply_weight_iter(result, weights_iter) is result
+
+    loader_cls.load_weights_only.assert_called_once_with(
+        model, weights_iter, adapter.target_device
+    )
+    model.load_weights.assert_not_called()
+
+
+def test_sglang_apply_weight_iter_without_load_weights_only_calls_model():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    weights_iter = iter([("w", torch.randn(2))])
+    model = MagicMock()
+    result = LoadResult(value=None, model=model)
+
+    with patch.dict(
+        sys.modules,
+        {"sglang.srt.model_loader.loader": SimpleNamespace(DefaultModelLoader=SimpleNamespace())},
+    ):
+        adapter.apply_weight_iter(result, weights_iter)
+
+    model.load_weights.assert_called_once_with(weights_iter)
+
+
+def test_sglang_instanttensor_iter_requires_model():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    with pytest.raises(RuntimeError, match="requires result.model"):
+        adapter.build_instanttensor_weight_iter(model=None)
+
+
+def test_sglang_instanttensor_iter_requires_sglang_with_instanttensor():
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    patcher, loader_cls, _ = _patch_sglang_default_loader([], has_instanttensor=False)
+    with patcher, pytest.raises(RuntimeError, match="SGLang >= 0.5.22"):
+        adapter.build_instanttensor_weight_iter(model=MagicMock())
+    loader_cls.assert_not_called()
+
+
+def test_sglang_adapter_is_eligible_for_instant_tensor_strategy(monkeypatch):
+    from modelexpress.load_strategy.instant_tensor_strategy import InstantTensorStrategy
+
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    monkeypatch.setattr(SglangAdapter, "is_cuda_alike", lambda self: True)
+    monkeypatch.setattr(
+        "modelexpress.load_strategy.instant_tensor_strategy.importlib.util.find_spec",
+        lambda name: object(),
+    )
+    monkeypatch.setenv("MX_INSTANT_TENSOR", "1")
+    monkeypatch.delenv("MX_MODEL_URI", raising=False)
+    ctx = SimpleNamespace(adapter=adapter, global_rank=0)
+
+    assert InstantTensorStrategy().is_available(ctx)
+
+
+def test_sglang_after_weight_iter_load_releases_cache_before_post_processing(monkeypatch):
+    adapter = SglangAdapter(_load_config(), _model_config(), _device_config())
+    calls_at_processing = []
+
+    def process(result):
+        calls_at_processing.append(adapter.accelerator_backend.empty_cache_calls)
+        return result
+
+    monkeypatch.setattr(adapter, "_process_weights_after_loading", process)
+    result = LoadResult(value=MagicMock(), model=MagicMock())
+
+    assert adapter.after_weight_iter_load(result) is result
+    assert calls_at_processing == [1]

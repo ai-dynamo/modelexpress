@@ -201,8 +201,21 @@ class SglangAdapter(EngineAdapter):
     ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("SGLang weight iterator loading requires result.model")
+        try:
+            from sglang.srt.model_loader.loader import DefaultModelLoader
+        except ImportError:
+            DefaultModelLoader = None
+        # Added in SGLang 0.5.20.
+        load_weights_only = getattr(DefaultModelLoader, "load_weights_only", None)
         with capture_tensor_attrs(self.accelerator_backend):
-            result.model.load_weights(weights_iter)
+            if load_weights_only is None:
+                result.model.load_weights(weights_iter)
+            else:
+                # SGLang's own loaders go through load_weights_only, which
+                # renames checkpoint tensors the model expects under another
+                # name (MXFP8 .weight_scale -> .weight_scale_inv) before
+                # model.load_weights.
+                load_weights_only(result.model, weights_iter, self.target_device)
         return result
 
     def build_model_streamer_weight_iter(
@@ -249,7 +262,44 @@ class SglangAdapter(EngineAdapter):
         loader.target_device_str = str(self.target_device)
         yield from loader._get_all_weights(stream_model_config, model)
 
+    def build_instanttensor_weight_iter(
+        self,
+        model: torch.nn.Module | None = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        if model is None:
+            raise RuntimeError("SGLang InstantTensor loading requires result.model")
+
+        from sglang.srt.configs.load_config import LoadFormat
+        from sglang.srt.model_loader.loader import DefaultModelLoader
+
+        instanttensor_format = getattr(LoadFormat, "INSTANTTENSOR", None)
+        if instanttensor_format is None:
+            raise RuntimeError("SGLang InstantTensor loading requires SGLang >= 0.5.22")
+
+        # SGLang's DefaultModelLoader selects instanttensor_weights_iterator when
+        # load_format is INSTANTTENSOR; _get_all_weights() resolves the model's own
+        # safetensors and the iterator loads them across the TP group.
+        it_config = copy.copy(self.load_config)
+        _set_load_config_attr(it_config, "load_format", instanttensor_format)
+        # SGLang hands model_loader_extra_config to InstantTensor unchecked, so
+        # drop the options meant for the safetensors loader the engine was
+        # configured with; InstantTensor would reject them.
+        extra_config = {
+            key: value
+            for key, value in (
+                getattr(it_config, "model_loader_extra_config", None) or {}
+            ).items()
+            if key not in {"enable_multithread_load", "num_threads", "enable_gds"}
+        }
+        _set_load_config_attr(it_config, "model_loader_extra_config", extra_config)
+        return DefaultModelLoader(it_config)._get_all_weights(self.model_config, model)
+
     def after_weight_iter_load(self, result: LoadResult) -> LoadResult:
+        # Release the loader's cached staging memory before post-processing, as
+        # SGLang's DefaultModelLoader.load_weights_only does. Otherwise tensors
+        # created by process_weights_after_loading can land in those cached
+        # segments and keep them reserved, shrinking the KV cache.
+        self.accelerator_backend.empty_cache()
         with capture_tensor_attrs(self.accelerator_backend):
             return self._process_weights_after_loading(result)
 
