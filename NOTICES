@@ -466,7 +466,7 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTI
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-## async-trait - 0.1.89
+## async-trait - 0.1.92
 **Repository URL**: https://github.com/dtolnay/async-trait
 **License Type(s)**: MIT OR Apache-2.0
 ### License: https://raw.githubusercontent.com/dtolnay/async-trait/HEAD/LICENSE-MIT
@@ -11474,7 +11474,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 ```
 
-## rustls - 0.23.45
+## rustls - 0.23.46
 **Repository URL**: https://github.com/rustls/rustls
 **License Type(s)**: Apache-2.0 OR ISC OR MIT
 ### License: https://raw.githubusercontent.com/rustls/rustls/HEAD/LICENSE-MIT
@@ -11630,7 +11630,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## rustls-webpki - 0.103.15
+## rustls-webpki - 0.103.16
 **Repository URL**: https://github.com/rustls/webpki
 **License Type(s)**: ISC
 ### License: https://raw.githubusercontent.com/rustls/webpki/HEAD/LICENSE
@@ -12605,6 +12605,36 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
 ## syn - 2.0.106
+**Repository URL**: https://github.com/dtolnay/syn
+**License Type(s)**: MIT OR Apache-2.0
+### License: https://raw.githubusercontent.com/dtolnay/syn/HEAD/LICENSE-MIT
+```
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+## syn - 3.0.6
 **Repository URL**: https://github.com/dtolnay/syn
 **License Type(s)**: MIT OR Apache-2.0
 ### License: https://raw.githubusercontent.com/dtolnay/syn/HEAD/LICENSE-MIT
@@ -14266,7 +14296,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 ```
 
-## webpki-roots - 1.0.2
+## webpki-roots - 1.0.10
 **Repository URL**: https://github.com/rustls/webpki-roots
 **License Type(s)**: CDLA-Permissive-2.0
 ### License: https://raw.githubusercontent.com/rustls/webpki-roots/HEAD/LICENSE
@@ -15037,7 +15067,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## azure-storage-blob - 12.30.0
+## azure-storage-blob - 12.31.1
 **Project URL**: https://github.com/Azure/azure-sdk-for-python/tree/main/sdk/storage/azure-storage-blob
 **License Type(s)**: MIT
 ### License: LICENSE
@@ -40518,7 +40548,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## runai-model-streamer - 0.16.0
+## runai-model-streamer - 0.17.3
 **Project URL**: UNKNOWN
 **License Type(s)**: Unknown
 ### License: LICENSE
@@ -40726,7 +40756,7 @@ SOFTWARE.
    limitations under the License.
 ```
 
-## runai-model-streamer-azure - 0.16.0
+## runai-model-streamer-azure - 0.17.3
 **Project URL**: UNKNOWN
 **License Type(s)**: Unknown
 ### License: LICENSE
@@ -40934,7 +40964,7 @@ SOFTWARE.
    limitations under the License.
 ```
 
-## runai-model-streamer-gcs - 0.16.0
+## runai-model-streamer-gcs - 0.17.3
 **Project URL**: UNKNOWN
 **License Type(s)**: Unknown
 ### License: LICENSE
@@ -41142,7 +41172,7 @@ SOFTWARE.
    limitations under the License.
 ```
 
-## runai-model-streamer-s3 - 0.16.0
+## runai-model-streamer-s3 - 0.17.3
 **Project URL**: UNKNOWN
 **License Type(s)**: Unknown
 ### License: LICENSE
@@ -51414,7 +51444,7 @@ OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
 PERFORMANCE OF THIS SOFTWARE.
 ```
 
-## urllib3 - 2.7.0
+## urllib3 - 2.8.0
 **Project URL**: https://github.com/urllib3/urllib3/blob/main/CHANGES.rst
 **License Type(s)**: MIT
 ### License: LICENSE.txt
