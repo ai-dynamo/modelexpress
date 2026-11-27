@@ -3240,3 +3240,176 @@ def test_trainer_installation_requires_capture_before_reload(monkeypatch, stream
         else:
             installer.install_tensors(batch)
     torch.testing.assert_close(model.weight, original)
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_runtime_only_alias_slot_is_written_through_its_reloaded_slot(
+    monkeypatch, bounded
+):
+    """A router bias that an MoE kernel also holds under a name the reload skips.
+
+    vLLM reloads the router's ``bias`` slot into a skeleton but leaves the
+    kernel's ``e_score_correction_bias`` slot on the live tensor, so after
+    ``initialize_layerwise_reload`` the two names hold different tensors. The
+    kernel slot is updated by the router slot's copy-back and must not be
+    required as a destination of its own.
+    """
+    from tests.test_refit_ordered_installer import _transfer_and_install
+
+    skipped = {"e_score_correction_bias"}
+
+    class Kernel(nn.Module):
+        def __init__(self, bias):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+            self.e_score_correction_bias = bias
+
+    class Router(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bias = nn.Parameter(torch.zeros(2), requires_grad=False)
+            self.experts = Kernel(self.bias)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = Router()
+
+        def load_weights(self, weights):
+            for name, value in weights:
+                layer_path, _, leaf = name.rpartition(".")
+                param = getattr(self.get_submodule(layer_path), leaf)
+                param.weight_loader(param, value)
+
+    model = Model()
+    live_bias, live_weight = model.mlp.bias, model.mlp.experts.weight
+    _install_fake_vllm(monkeypatch, lambda target: None)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    for layer in (model.mlp, model.mlp.experts):
+        info = SimpleNamespace(
+            restore_metadata=(
+                {
+                    name: value
+                    for name, value in layer._parameters.items()
+                    if name not in skipped
+                },
+                {},
+            ),
+            kernel_tensors=None,
+            loaded_weights=(),
+        )
+        info.reset = lambda info=info: setattr(info, "kernel_tensors", None)
+        layerwise.LAYERWISE_INFO[layer] = info
+
+    def initialize(target):
+        for layer in (target.mlp, target.mlp.experts):
+            info = layerwise.LAYERWISE_INFO[layer]
+            info.kernel_tensors = (dict(layer._parameters), {})
+            for name, value in info.restore_metadata[0].items():
+                skeleton = torch.empty_like(value, device="meta")
+                setattr(layer, name, nn.Parameter(skeleton, requires_grad=False))
+
+    layerwise.initialize_layerwise_reload = initialize
+
+    def place(layer, info):
+        for name, value in info.kernel_tensors[0].items():
+            setattr(layer, name, value)
+
+    def commit(layer, info):
+        for name, value in info.kernel_tensors[0].items():
+            value.data.copy_(getattr(layer, name))
+        place(layer, info)
+
+    layerwise._place_kernel_tensors = place
+    layerwise._copy_and_restore_kernel_tensors = commit
+    utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    utils.default_weight_loader = lambda target, value: target.copy_(value)
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    installer = _cpu_installer(model)
+
+    captured, layout = installer.capture(
+        [
+            ("mlp.bias", torch.float32, (2,)),
+            ("mlp.experts.weight", torch.float32, (2, 2)),
+        ]
+    )
+    assert set(layout) == {"mlp.bias", "mlp.experts.weight"}
+    assert {copy.param_name for copy in captured.copies} == set(layout)
+
+    for value in (3.0, 7.0):
+        sources = {
+            "mlp.bias": torch.full((2,), value),
+            "mlp.experts.weight": torch.full((2, 2), -value),
+        }
+        _transfer_and_install(installer, sources, captured, layout, bounded)
+        assert model.mlp.bias is model.mlp.experts.e_score_correction_bias is live_bias
+        assert model.mlp.experts.weight is live_weight
+        torch.testing.assert_close(live_bias, sources["mlp.bias"])
+        torch.testing.assert_close(live_weight, sources["mlp.experts.weight"])
+
+
+@pytest.mark.parametrize("bounded", [False, True])
+def test_source_replay_applies_a_loader_post_copy_transform(monkeypatch, bounded):
+    """Mamba2's ``A`` loader copies ``A_log`` and then stores ``-exp(A)``."""
+    from tests.test_refit_ordered_installer import _transfer_and_install
+
+    def composed(param, loaded):
+        param.data.copy_(loaded)
+        param.data.copy_(-torch.exp(param.float()))
+
+    class Mixer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.A = nn.Parameter(torch.zeros(4), requires_grad=False)
+            self.A.weight_loader = composed
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mixer = Mixer()
+
+        def load_weights(self, weights):
+            for _, value in weights:
+                self.mixer.A.weight_loader(self.mixer.A, value)
+
+    model = Model()
+    live = model.mixer.A
+    _install_fake_vllm(monkeypatch, lambda target: None)
+    layerwise = sys.modules["vllm.model_executor.model_loader.reload.layerwise"]
+    info = SimpleNamespace(
+        restore_metadata=({"A": live}, {}), kernel_tensors=None, loaded_weights=()
+    )
+    info.reset = lambda: setattr(info, "kernel_tensors", None)
+    layerwise.LAYERWISE_INFO[model.mixer] = info
+
+    def initialize(target):
+        info.kernel_tensors = (dict(target.mixer._parameters), {})
+        skeleton = nn.Parameter(torch.empty(4, device="meta"), requires_grad=False)
+        skeleton.weight_loader = composed
+        target.mixer.A = skeleton
+
+    def place(layer, info):
+        layer.A = info.kernel_tensors[0]["A"]
+
+    def commit(layer, info):
+        info.kernel_tensors[0]["A"].data.copy_(layer.A)
+        place(layer, info)
+
+    layerwise.initialize_layerwise_reload = initialize
+    layerwise._place_kernel_tensors = place
+    layerwise._copy_and_restore_kernel_tensors = commit
+    utils = ModuleType("vllm.model_executor.model_loader.weight_utils")
+    utils.default_weight_loader = lambda target, value: target.copy_(value)
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
+    installer = _cpu_installer(model)
+
+    captured, layout = installer.capture([("mixer.A", torch.float32, (4,))])
+    (copy,) = captured.copies
+    assert copy.epilogue
+    for scale in (1.0, 2.0):
+        a_log = torch.arange(4.0) * scale
+        _transfer_and_install(installer, {"mixer.A": a_log}, captured, layout, bounded)
+        assert model.mixer.A is live
+        torch.testing.assert_close(live, -torch.exp(a_log))

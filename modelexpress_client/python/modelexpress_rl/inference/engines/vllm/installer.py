@@ -567,6 +567,36 @@ class _VllmInstaller(EngineInstaller):
         modules = dict(self._model.named_modules(remove_duplicate=False))
         return _compile_parameter_aliases(self._model, groups, modules)
 
+    @staticmethod
+    def _runtime_alias_slots(
+        aliases: _ParameterAliases, layerwise_info: Mapping
+    ) -> frozenset[str]:
+        """Name alias slots that vLLM's reload keeps live beside a reloaded slot.
+
+        vLLM rebuilds only the tensors it recorded at load. A slot it leaves out
+        (an MoE kernel's ``e_score_correction_bias`` holding the router's bias
+        parameter, say) keeps the live tensor while the recorded slot in its
+        group gets a load-time skeleton. The reload copies the recorded slot back
+        into that same live tensor, so the left-out slot is written through it
+        and is not a destination of its own.
+        """
+        owners = iter(aliases.owners)
+        names = set()
+        for group in aliases.groups:
+            loaded, runtime = [], []
+            for module, name in group:
+                path, _ = next(owners)
+                info = layerwise_info.get(module)
+                metadata = getattr(info, "restore_metadata", None)
+                full_name = f"{path}.{name}" if path else name
+                if metadata is not None and name not in metadata[0]:
+                    runtime.append(full_name)
+                else:
+                    loaded.append(full_name)
+            if loaded:
+                names.update(runtime)
+        return frozenset(names)
+
     def _restore_parameter_aliases(self, aliases: _ParameterAliases) -> None:
         # vLLM restores metadata separately for each module. Reconnect shared
         # parameters so a tied loader still covers one canonical destination.
@@ -645,9 +675,11 @@ class _VllmInstaller(EngineInstaller):
                     default_weight_loader=default_weight_loader,
                     source_replay=True,
                 )
+                runtime_slots = self._reload_plan.runtime_alias_slots
                 param_layout = {
                     name: (tuple(p.shape), p.dtype)
                     for name, p in model.named_parameters()
+                    if name not in runtime_slots
                 }
                 copied = {item.param_name for item in capture.copies}
                 persistent_names = frozenset(
@@ -948,12 +980,13 @@ class _VllmInstaller(EngineInstaller):
 
     def _capture_engine_install_plan(self):
         inputs = []
+        runtime_slots = self._reload_plan.runtime_alias_slots
         for path, layer in self._model.named_modules():
             slots = []
             for is_buffer, values in ((False, layer._parameters), (True, layer._buffers)):
                 for leaf, tensor in values.items():
-                    if tensor is not None:
-                        name = f"{path}.{leaf}" if path else leaf
+                    name = f"{path}.{leaf}" if path else leaf
+                    if tensor is not None and name not in runtime_slots:
                         slots.append(_InputSlot(name, leaf, id(tensor), is_buffer))
             inputs.append(_InputOwner(path, ref(layer), tuple(slots)))
         return EngineInstallPlan(self._reload_plan, tuple(inputs))
@@ -1024,6 +1057,7 @@ class _VllmInstaller(EngineInstaller):
         }
         aliases = self._parameter_aliases(self._model)
         load_aliases = self._load_time_parameter_aliases(aliases, LAYERWISE_INFO)
+        runtime_alias_slots = self._runtime_alias_slots(aliases, LAYERWISE_INFO)
 
         return _EngineRuntimeBindings(
             owners,
@@ -1033,6 +1067,7 @@ class _VllmInstaller(EngineInstaller):
             replay_tensors,
             aliases,
             load_aliases,
+            runtime_alias_slots,
         )
 
     @torch.no_grad()

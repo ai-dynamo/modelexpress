@@ -37,15 +37,20 @@ import math
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_leaves
+from torch.utils._pytree import tree_leaves, tree_map
 
+from modelexpress_rl.refit.reshard.slice_plan import (
+    _row_major_strides,
+    _view_to_box_perm,
+)
 from modelexpress_rl.refit.reshard.types import (
     CaptureResult,
+    EpilogueRef,
     _connected_groups,
     OpChain,
     OpSpec,
@@ -105,6 +110,17 @@ _SUPPORTED_OPS: dict[Callable, str] = {
     torch.Tensor.zero_: "zero_",
 }
 
+# Shape-of-another-tensor views. Recorded as the explicit-shape op so a chain
+# never holds a tensor argument (mamba-style loaders `view_as` a destination
+# slice).
+_SHAPE_AS_OPS: dict[Callable, Callable] = {
+    torch.Tensor.view_as: torch.Tensor.view,
+    torch.Tensor.reshape_as: torch.Tensor.reshape,
+}
+
+_CONCAT_FUNCS = frozenset({torch.cat, torch.concat, torch.concatenate})
+_STACK_FUNCS = frozenset({torch.stack})
+
 
 def _snapshot_index(index):
     """Own constant indices without changing list-versus-tuple semantics."""
@@ -123,6 +139,154 @@ def _snapshot_index(index):
     ):
         raise UnsupportedReshard("only integer and slice indexing is supported")
     return index
+
+
+def _basic_index(index):
+    """Admit only indexing that yields a view: ints, slices, ``...`` and ``None``."""
+    keys = index if isinstance(index, tuple) else (index,)
+    for key in keys:
+        if isinstance(key, bool) or not isinstance(
+            key, (int, slice, type(Ellipsis), type(None))
+        ):
+            raise UnsupportedReshard(
+                "assignment through advanced indexing is not a view of the destination"
+            )
+    return index
+
+
+def _unmerge(shape, stride, root_shape):
+    """Split each view dim that spans several row-major root dims.
+
+    ``flatten`` over a stacked dim interleaves sources inside one view dim
+    (``stack((gate, up), -1).flatten(-2)``). Returns, per view dim, the sizes
+    that make every dim walk a single root dim, or None if it cannot.
+    """
+    root_strides = _row_major_strides(root_shape)
+    plan = []
+    for size, step in zip(shape, stride):
+        if size == 1:
+            plan.append((1,))
+            continue
+        dims = [
+            d for d in range(len(root_shape))
+            if root_strides[d] == step and root_shape[d] > 1
+        ]
+        if not dims:
+            return None
+        inner = dims[-1]
+        if size <= root_shape[inner]:
+            plan.append((size,))
+            continue
+        sizes, covered, dim = [root_shape[inner]], root_shape[inner], inner - 1
+        while covered < size:
+            if dim < 0 or size % covered:
+                return None
+            if root_shape[dim] == 1:
+                dim -= 1
+                continue
+            outer = min(size // covered, root_shape[dim])
+            sizes.insert(0, outer)
+            covered *= outer
+            dim -= 1
+        if covered != size:
+            return None
+        plan.append(tuple(sizes))
+    return plan
+
+
+@dataclass(frozen=True)
+class _Concat:
+    """Sources a conversion concatenated, kept apart until the loader picks one.
+
+    A trainer can publish pieces of one checkpoint tensor separately (gate and up
+    projections that the checkpoint fuses, say), so the conversion ``torch.cat``s
+    them. Every view the loader then takes is tracked against ``root``, a meta
+    tensor of the concatenated shape. Once a view falls inside one part it is
+    re-expressed as a view of that part, so each recorded copy still reads one
+    published source.
+    """
+
+    root: torch.Tensor
+    dim: int
+    parts: tuple  # ((LazyWeight, start, stop), ...) along ``dim``
+
+    def resolve(self, view: torch.Tensor):
+        """Return ``(part, ops, meta)`` for a view inside one part, else None."""
+        root = self.root
+        if view.dtype != root.dtype or (view is not root and view._base is not root):
+            return None
+        try:
+            box, perm = _view_to_box_perm(
+                view.storage_offset(), tuple(view.shape), tuple(view.stride()),
+                tuple(root.shape),
+            )
+        except UnsupportedReshard:
+            return None
+        low, high = box[self.dim]
+        for part, start, stop in self.parts:
+            if start <= low and high <= stop:
+                break
+        else:
+            return None
+        box[self.dim] = (low - start, high - start)
+        ops = [
+            ("narrow", (dim, lo, hi - lo), ())
+            for dim, (lo, hi) in enumerate(box)
+            if (lo, hi) != (0, part.shape[dim])
+        ]
+        kept = sorted(perm)
+        ops += [
+            ("select", (dim, 0), ())
+            for dim in reversed(range(len(box)))
+            if dim not in perm
+        ]
+        order = tuple(kept.index(dim) for dim in perm)
+        if order != tuple(range(len(order))):
+            ops.append(("permute", (order,), ()))
+        meta = part._meta()
+        with torch._C.DisableTorchFunctionSubclass():
+            for name, args, kwargs in ops:
+                meta = getattr(meta, name)(*args, **dict(kwargs))
+        if tuple(meta.shape) != tuple(view.shape):
+            return None
+        return part, tuple(ops), meta
+
+    def split(self, view: torch.Tensor, dest: torch.Tensor):
+        """Pair each part's share of ``view`` with the matching ``dest`` slice."""
+        root = self.root
+        if view.dtype != root.dtype or (view is not root and view._base is not root):
+            return None
+        if tuple(dest.shape) != tuple(view.shape):
+            return None
+        plan = _unmerge(tuple(view.shape), tuple(view.stride()), tuple(root.shape))
+        if plan is None:
+            return None
+        with torch._C.DisableTorchFunctionSubclass():
+            for axis in reversed(range(len(plan))):
+                if len(plan[axis]) > 1:
+                    view = view.unflatten(axis, plan[axis])
+                    dest = dest.unflatten(axis, plan[axis])
+        try:
+            box, perm = _view_to_box_perm(
+                view.storage_offset(), tuple(view.shape), tuple(view.stride()),
+                tuple(root.shape),
+            )
+        except UnsupportedReshard:
+            return None
+        if self.dim not in perm:
+            return None
+        axis = perm.index(self.dim)
+        low, high = box[self.dim]
+        pieces = []
+        with torch._C.DisableTorchFunctionSubclass():
+            for _, start, stop in self.parts:
+                lo, hi = max(low, start), min(high, stop)
+                if lo < hi:
+                    pieces.append((
+                        view.narrow(axis, lo - low, hi - lo),
+                        dest.narrow(axis, lo - low, hi - lo),
+                    ))
+        return pieces
 
 
 def _freeze_kwargs(kwargs: dict[str, Any]) -> tuple:
@@ -403,6 +567,7 @@ class LazyWeight(torch.Tensor):
     _name: str
     _ops: tuple
     _recorder: Any
+    _concat: _Concat | None = None
 
     @staticmethod
     def __new__(
@@ -433,53 +598,151 @@ class LazyWeight(torch.Tensor):
         return self._meta_tensor
 
     def _child(self, meta, *new_ops, device=None, aliases=True) -> LazyWeight:
-        return LazyWeight(
+        device = self.device if device is None else device
+        concat = self._concat
+        if concat is not None:
+            resolved = concat.resolve(meta)
+            if resolved is not None:
+                part, ops, part_meta = resolved
+                return part._child(part_meta, *ops, device=device)
+        child = LazyWeight(
             self._name,
             meta.shape,
             meta.dtype,
-            self.device if device is None else device,
+            device,
             self._ops + new_ops,
             self._recorder,
             self._aliases if aliases else None,
             meta,
         )
+        child._concat = concat
+        return child
+
+    @classmethod
+    def _concatenate(cls, tensors, dim=0, *, axis=None, out=None) -> LazyWeight:
+        if axis is not None:
+            dim = axis
+        parts = tuple(tensors) if isinstance(tensors, (list, tuple)) else ()
+        if out is not None or not parts:
+            raise UnsupportedReshard("concatenation needs a sequence of sources")
+        first = parts[0]
+        for part in parts:
+            if not isinstance(part, cls) or part._concat is not None:
+                raise UnsupportedReshard(
+                    "concatenation mixes a published source with another tensor"
+                )
+            if (
+                part._recorder is not first._recorder
+                or part.dtype != first.dtype
+                or part.device != first.device
+            ):
+                raise UnsupportedReshard(
+                    f"concatenation of differently typed sources on lazy {part._name!r}"
+                )
+        with torch._C.DisableTorchFunctionSubclass():
+            shape = torch.cat([part._meta() for part in parts], dim).shape
+        dim = dim % len(shape)
+        root = torch.empty(shape, dtype=first.dtype, device="meta")
+        spans, start = [], 0
+        for part in parts:
+            stop = start + part.shape[dim]
+            spans.append((part, start, stop))
+            start = stop
+        composite = cls(
+            "cat(" + ", ".join(part._name for part in parts) + ")",
+            shape, first.dtype, first.device, recorder=first._recorder, meta=root,
+        )
+        composite._concat = _Concat(root, dim, tuple(spans))
+        return composite
+
+    @classmethod
+    def _stack(cls, tensors, dim=0, *, out=None) -> LazyWeight:
+        parts = tuple(tensors) if isinstance(tensors, (list, tuple)) else ()
+        if out is not None or not parts or not all(isinstance(p, cls) for p in parts):
+            raise UnsupportedReshard(
+                "stacking mixes a published source with another tensor"
+            )
+        dim = dim % (parts[0].dim() + 1)
+        return cls._concatenate([part.unsqueeze(dim) for part in parts], dim)
+
+    @classmethod
+    def _record_copy(cls, dest, src):
+        """The recording sink: note where the slice lands; do NOT copy."""
+        pieces = ((src, dest),)
+        if src._concat is not None:
+            pieces = src._concat.split(src._meta(), dest)
+            if pieces is None:
+                raise UnsupportedReshard(
+                    f"copy of concatenated sources on lazy {src._name!r} "
+                    "is not a view of each source"
+                )
+            pieces = tuple((src._child(view), target) for view, target in pieces)
+            if any(lazy._concat is not None for lazy, _ in pieces):
+                raise UnsupportedReshard(
+                    f"copy of concatenated sources on lazy {src._name!r} "
+                    "is not a view of each source"
+                )
+        rec = src._recorder
+        for lazy, target in pieces:
+            destination = rec.resolve(target) if rec is not None else None
+            if destination is not None:
+                rec.copies.append(
+                    RecordedCopy(
+                        src_name=lazy._name,
+                        op_chain=lazy._ops,
+                        param_name=destination[0],
+                        dest_offset=destination[1],
+                        dest_shape=tuple(target.shape),
+                        dest_stride=destination[2],
+                        dest_dtype=target.dtype,
+                    )
+                )
+            elif rec is not None:
+                rec.unattributed += 1
+        # Record-only: the loader proceeds as if the copy happened, with no
+        # device/meta coupling (dest may be meta/cpu/cuda).
+        return dest
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
 
-        # copy_: the recording sink. Note where the slice lands; do NOT copy.
         if func is torch.Tensor.copy_:
             dest = args[0]
             src = args[1] if len(args) > 1 else kwargs.get("src")
-            if isinstance(src, cls):
-                rec = src._recorder
-                destination = rec.resolve(dest) if rec is not None else None
-                if destination is not None:
-                    rec.copies.append(
-                        RecordedCopy(
-                            src_name=src._name,
-                            op_chain=src._ops,
-                            param_name=destination[0],
-                            dest_offset=destination[1],
-                            dest_shape=tuple(dest.shape),
-                            dest_stride=destination[2],
-                            dest_dtype=dest.dtype,
-                        )
-                    )
-                elif rec is not None:
-                    rec.unattributed += 1
-                # Record-only: return dest so the loader proceeds as if the copy
-                # happened, with no device/meta coupling (dest may be meta/cpu/cuda).
-                return dest
+            if isinstance(src, cls) and not isinstance(dest, cls):
+                return cls._record_copy(dest, src)
 
-        # vLLM's mamba v2 sharded loader assigns ``param.data[a:b] = loaded[c:d].view_as(...)``:
-        # view_as(other) is view(other.shape), and the assignment is a copy_ into dest[a:b].
-        if func is torch.Tensor.view_as and args and isinstance(args[0], cls):
-            return cls._intercept(args[0], torch.Tensor.view, "view", (tuple(args[1].shape),), {})
-        if func is torch.Tensor.__setitem__ and len(args) == 3 and isinstance(args[2], cls):
-            cls.__torch_function__(torch.Tensor.copy_, types, (args[0][args[1]], args[2]))
-            return None
+        # `dest[index] = src` is `dest[index].copy_(src)` for view indexing.
+        if func is torch.Tensor.__setitem__ and len(args) == 3:
+            dest, index, src = args
+            if isinstance(src, cls) and not isinstance(dest, cls):
+                with torch._C.DisableTorchFunctionSubclass():
+                    target = dest[_basic_index(index)]
+                if tuple(target.shape) != tuple(src.shape):
+                    raise UnsupportedReshard(
+                        f"broadcasting assignment {tuple(src.shape)} -> "
+                        f"{tuple(target.shape)} on lazy {src._name!r}"
+                    )
+                cls._record_copy(target, src)
+                return None
+
+        # detach is the identity on values; a new placeholder mirrors the new
+        # tensor object (loaders set attributes on the detached weight).
+        if func is torch.Tensor.detach and args and isinstance(args[0], cls):
+            return args[0]._child(args[0]._meta())
+
+        if func in _CONCAT_FUNCS:
+            return cls._concatenate(*args, **kwargs)
+        if func in _STACK_FUNCS:
+            return cls._stack(*args, **kwargs)
+
+        if func in _SHAPE_AS_OPS and args and isinstance(args[0], cls):
+            other = args[1] if len(args) > 1 else kwargs["other"]
+            target = _SHAPE_AS_OPS[func]
+            return cls._intercept(
+                args[0], target, _SUPPORTED_OPS[target], (tuple(other.shape),), {}
+            )
 
         op_name = _SUPPORTED_OPS.get(func)
         if op_name is not None and args and isinstance(args[0], cls):
@@ -493,6 +756,23 @@ class LazyWeight(torch.Tensor):
 
     @classmethod
     def _intercept(cls, self_, func, op_name, args, kwargs):
+        if self_._concat is not None:
+            if op_name == "contiguous":
+                # Layout only: the loader reads the same values, which are
+                # still tracked as a view of the concatenation.
+                return self_
+            try:
+                return cls._intercept_view(self_, func, op_name, args, kwargs)
+            except RuntimeError as error:
+                if isinstance(error, UnsupportedReshard):
+                    raise
+                raise UnsupportedReshard(
+                    f"{op_name!r} on lazy {self_._name!r} is not a view: {error}"
+                ) from error
+        return cls._intercept_view(self_, func, op_name, args, kwargs)
+
+    @classmethod
+    def _intercept_view(cls, self_, func, op_name, args, kwargs):
         if op_name == "__getitem__":
             args = (_snapshot_index(args[0]), *args[1:])
         meta = self_._meta()
@@ -538,6 +818,10 @@ class LazyWeight(torch.Tensor):
         )
         base_op = (op_name, recorded_args, _freeze_kwargs(kwargs))
         if op_name == "zero_":
+            if self_._concat is not None:
+                raise UnsupportedReshard(
+                    f"zero_ of concatenated sources on lazy {self_._name!r}"
+                )
             if any(ref() is not None and ref() is not self_ for ref in self_._aliases):
                 raise UnsupportedReshard(
                     "source zero_ with live aliases cannot be replayed faithfully"
@@ -566,14 +850,17 @@ class LazyWeight(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        for a in list(args) + list(kwargs.values()):
-            if isinstance(a, cls):
-                raise UnsupportedReshard(
-                    f"unsupported op {func} on lazy {a._name!r} (chain={a._ops}); "
-                    f"supported: {sorted(_SUPPORTED_OPS.values())} + copy_."
-                )
-        return func(*args, **kwargs)
+        # Dispatch reaches a subclass only with one of its instances among the
+        # arguments, possibly nested in a list (aten.cat). Re-running ``func``
+        # here would dispatch back to this method forever.
+        lazy = next(
+            (a for a in tree_leaves((args, kwargs or {})) if isinstance(a, cls)), None
+        )
+        name, chain = (lazy._name, lazy._ops) if lazy is not None else ("?", ())
+        raise UnsupportedReshard(
+            f"unsupported op {func} on lazy {name!r} (chain={chain}); "
+            f"supported: {sorted(_SUPPORTED_OPS.values())} + copy_."
+        )
 
 
 def _install_stamps(
@@ -665,14 +952,231 @@ def _shared_recorder(weights: dict) -> _BakeRecorder:
     return next(iter(recorders.values()))
 
 
+def _byte_span(offset, shape, stride, element_size):
+    """``[start, stop)`` bytes a strided view addresses in its storage."""
+    if not math.prod(shape):
+        return offset * element_size, offset * element_size
+    extent = 1 + sum((size - 1) * step for size, step in zip(shape, stride))
+    return offset * element_size, (offset + extent) * element_size
+
+
+def _same_view(tensor, owner):
+    return (
+        tensor.untyped_storage()._cdata == owner.untyped_storage()._cdata
+        and tensor.storage_offset() == owner.storage_offset()
+        and tuple(tensor.shape) == tuple(owner.shape)
+        and tuple(tensor.stride()) == tuple(owner.stride())
+        and tensor.dtype == owner.dtype
+    )
+
+
+def _out_of_place(func):
+    """``aten.mul.Tensor`` for ``aten.mul_.Tensor``; None if there is none."""
+    namespace, _, op = func._schema.name.partition("::")
+    if namespace != "aten" or not op.endswith("_") or op == "copy_":
+        return None
+    packet = getattr(torch.ops.aten, op[:-1], None)
+    overload = getattr(packet, func._overloadname, None) if packet is not None else None
+    if overload is None or _writes(overload):
+        return None
+    return overload
+
+
+def _writes(func) -> bool:
+    return any(
+        argument.alias_info is not None and argument.alias_info.is_write
+        for argument in func._schema.arguments
+    )
+
+
 class _CaptureMutationGuard(TorchDispatchMode):
-    def __init__(self, destinations):
+    """Reject loader writes that a recorded copy cannot reproduce.
+
+    Any write to live destination storage would change served weights. A write
+    over bytes a source was already copied into computes the value the loader
+    leaves there, which replaying the recorded copy alone would miss. Writes
+    elsewhere in a destination, such as zeroing the padding past a copied
+    vocabulary, are left alone: replay starts every destination from zeros.
+
+    With ``trace_epilogues`` (ordered source replay), a loader that recomputes
+    a whole destination from itself after copying into it (vLLM's
+    ``composed_weight_loader``: Mamba2 stores ``A = -exp(A_log)``; or an in-place
+    ``param.data.copy_(w).mul_(scale)``) is recorded instead: the aten ops between
+    the copy and the rewrite become the copy's ``epilogue``, which replay runs on
+    the destination after the copy lands.
+    """
+
+    def __init__(self, destinations, recorder=None, *, trace_epilogues=False):
         super().__init__()
         self._storages = {
             tensor.untyped_storage()._cdata
             for _, tensor in destinations
             if not tensor.is_meta
         }
+        self._meta = {
+            name: tensor for name, tensor in destinations if tensor.is_meta
+        }
+        self._meta_storages = {
+            tensor.untyped_storage()._cdata for tensor in self._meta.values()
+        }
+        self._owners: dict[int, list] = {}
+        for name, tensor in self._meta.items():
+            self._owners.setdefault(tensor.untyped_storage()._cdata, []).append(
+                (name, tensor)
+            )
+        self._recorder = recorder
+        self._trace = trace_epilogues and recorder is not None
+        # id(tensor) -> (param, copies into param when the trace began, steps,
+        # index of this tensor's step); ``_alive`` keeps the ids stable.
+        self._derived: dict[int, tuple] = {}
+        self._alive: list = []
+        self._by_name: dict[str, list] = {}
+        self._indexed = 0
+        self._last = None
+
+    def _copies_by_name(self):
+        # Indexed incrementally: capture can record a copy per expert slice, and
+        # this runs for every op that reads or writes a destination.
+        copies = self._recorder.copies
+        indexed = self._indexed
+        if indexed > len(copies) or (indexed and copies[indexed - 1] is not self._last):
+            self._by_name.clear()
+            indexed = 0
+        for copy in copies[indexed:]:
+            self._by_name.setdefault(copy.param_name, []).append(copy)
+        self._indexed = len(copies)
+        self._last = copies[-1] if copies else None
+        return self._by_name
+
+    def _copies_into(self, name):
+        return len(self._copies_by_name().get(name, ()))
+
+    def _overwritten_copy(self, tensor):
+        storage = tensor.untyped_storage()._cdata
+        if self._recorder is None or storage not in self._meta_storages:
+            return None
+        start, stop = _byte_span(
+            tensor.storage_offset(), tensor.shape, tensor.stride(),
+            tensor.element_size(),
+        )
+        if start == stop:
+            return None
+        copies = self._copies_by_name()
+        for name, owner in self._owners[storage]:
+            for copy in copies.get(name, ()):
+                copy_start, copy_stop = _byte_span(
+                    owner.storage_offset() + copy.dest_offset, copy.dest_shape,
+                    copy.dest_stride, owner.element_size(),
+                )
+                if start < copy_stop and copy_start < stop:
+                    return name
+        return None
+
+    def _source_of(self, tensor):
+        """``(param, copies, steps, ref)`` if ``tensor`` is a traced value."""
+        derived = self._derived.get(id(tensor))
+        if derived is not None:
+            name, copies, steps, index = derived
+            return name, copies, steps, EpilogueRef(index)
+        if not tensor.is_meta:
+            return None
+        for name, owner in self._owners.get(tensor.untyped_storage()._cdata, ()):
+            if _same_view(tensor, owner):
+                copies = self._copies_into(name)
+                return (name, copies, (), EpilogueRef(-1)) if copies else None
+        return None
+
+    def _step(self, func, args, kwargs):
+        """Template ``func`` over traced values of one destination, or None.
+
+        Returns ``(param, copies, steps)`` with the step appended. Inputs must be
+        that destination, values computed from it, or zero-dim constants.
+        """
+        leaves = tree_leaves((args, kwargs))
+        if any(
+            isinstance(leaf, torch.device) and leaf.type == "meta" for leaf in leaves
+        ):
+            return None
+        tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
+        sources = [self._source_of(tensor) for tensor in tensors]
+        traced = [source for source in sources if source is not None]
+        if not traced:
+            return None
+        name, copies, steps, _ = max(traced, key=lambda source: len(source[2]))
+        if any(
+            (other[0], other[1]) != (name, copies)
+            or any(a is not b for a, b in zip(other[2], steps))
+            for other in traced
+        ):
+            return None
+        refs = {}
+        for tensor, source in zip(tensors, sources):
+            if source is not None:
+                refs[id(tensor)] = source[3]
+            elif not tensor.is_meta and tensor.dim() == 0:
+                refs[id(tensor)] = tensor.detach().clone()
+            else:
+                return None
+
+        def template(value):
+            return refs[id(value)] if isinstance(value, torch.Tensor) else value
+
+        step = (func, tree_map(template, tuple(args)), tree_map(template, dict(kwargs)))
+        return name, copies, (*steps, step)
+
+    def _trace_step(self, func, args, kwargs, out):
+        # Views of a destination are not followed; an epilogue computes a new
+        # value from the destination.
+        if (
+            not isinstance(out, torch.Tensor)
+            or out.untyped_storage()._cdata in self._meta_storages
+        ):
+            return
+        traced = self._step(func, args, kwargs)
+        if traced is not None:
+            name, copies, steps = traced
+            self._derived[id(out)] = (name, copies, steps, len(steps) - 1)
+            self._alive.append(out)
+
+    def _record_epilogue(self, func, args, kwargs, name):
+        """Record a whole-destination rewrite as the last copy's epilogue.
+
+        Either ``copy_`` of a value computed from the destination, or an
+        in-place op on it (``param.data.copy_(w).mul_(scale)``), replayed as the
+        op's out-of-place form.
+        """
+        if not self._trace or not _same_view(args[0], self._meta[name]):
+            return False
+        if func is torch.ops.aten.copy_.default:
+            derived = self._derived.get(id(args[1]))
+            if derived is None:
+                return False
+            traced_name, copies, steps, index = derived
+            steps = steps[: index + 1]
+        else:
+            out_of_place = _out_of_place(func)
+            traced = (
+                self._step(out_of_place, args, kwargs)
+                if out_of_place is not None
+                else None
+            )
+            if traced is None:
+                return False
+            traced_name, copies, steps = traced
+        if traced_name != name or copies != self._copies_into(name):
+            return False
+        recorded = self._recorder.copies
+        last = max(i for i, copy in enumerate(recorded) if copy.param_name == name)
+        if recorded[last].epilogue:
+            return False
+        recorded[last] = replace(
+            recorded[last],
+            epilogue=tuple(
+                (step, step_args, tuple(sorted(step_kwargs.items())))
+                for step, step_args, step_kwargs in steps
+            ),
+        )
+        return True
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -681,15 +1185,27 @@ class _CaptureMutationGuard(TorchDispatchMode):
                 continue
             value = args[index] if index < len(args) else kwargs.get(argument.name)
             for tensor in tree_leaves(value):
-                if (
-                    isinstance(tensor, torch.Tensor)
-                    and not isinstance(tensor, LazyWeight)
-                    and tensor.untyped_storage()._cdata in self._storages
+                if not isinstance(tensor, torch.Tensor) or isinstance(
+                    tensor, LazyWeight
                 ):
+                    continue
+                if tensor.untyped_storage()._cdata in self._storages:
                     raise UnsupportedReshard(
                         f"live destination mutation during capture: {func}"
                     )
-        return func(*args, **kwargs)
+                overwritten = self._overwritten_copy(tensor)
+                if overwritten is not None and not (
+                    index == 0
+                    and self._record_epilogue(func, args, kwargs, overwritten)
+                ):
+                    raise UnsupportedReshard(
+                        f"loader rewrites destination {overwritten!r} after "
+                        f"copying a source into it: {func}"
+                    )
+        out = func(*args, **kwargs)
+        if self._trace and not _writes(func):
+            self._trace_step(func, args, kwargs, out)
+        return out
 
 
 def capture_weights(
@@ -735,7 +1251,9 @@ def capture_weights(
     try:
         # Large MoE loaders rebuild model-wide parameter/expert maps on entry.
         # LazyWeights carry their own source identity across one bulk invocation.
-        with _CaptureMutationGuard(recorder.destinations):
+        with _CaptureMutationGuard(
+            recorder.destinations, recorder, trace_epilogues=source_replay
+        ):
             try:
                 with recorder.attempt():
                     model.load_weights(sorted(weights.items()))

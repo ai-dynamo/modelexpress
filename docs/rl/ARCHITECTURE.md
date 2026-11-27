@@ -863,6 +863,19 @@ can trip a loader that per-source order does not. Unexpected engine errors
 propagate, and parameter loader hooks are restored on every exit. This optimizes
 the first capture without caching layouts across model or source changes.
 
+Besides `copy_`, a loader may assign through view indexing
+(`param.data[a:b] = src`, recorded as a copy into that view; advanced indexing
+and broadcasting assignment are unsupported) and reshape a source like another
+tensor (`view_as`/`reshape_as`, recorded with the explicit shape). A conversion
+may `torch.cat` or `torch.stack` published sources, as when a trainer publishes
+the gate and up projections that a checkpoint fuses or interleaves. The
+concatenation is tracked as a view of the combined shape: once a loader's view
+falls inside one source it continues as a view of that source, and a copy that
+spans sources is split into one copy per source, unflattening a dim that a
+`flatten` merged across the stacked dim. Each recorded copy therefore still reads
+exactly one published source. An operation that takes a list of sources and is
+not one of these is reported as unsupported for that source.
+
 Trainer adapters encode registered shard geometry in stable worker manifests.
 The refit control plane owns worker registration, immutable version publication,
 and version leases; receivers resolve those manifests before planning transfers.
@@ -996,13 +1009,28 @@ metadata to separate load-time ties from runtime-only aliases such as WNA16's
 `w13_weight` and `w2_weight`. Capture and checkpoint loading reconnect only the
 load-time slots; native post-processing recreates runtime aliases. Missing
 load-time slots still fail restoration, and final runtime identity and storage
-validation remains required.
+validation remains required. A runtime-only slot that shares its tensor with a
+load-time slot (an MoE kernel's `e_score_correction_bias` holding the router's
+bias parameter) keeps the live tensor during reload and is written by the
+load-time slot's copy-back, so it is not a capture destination or a coverage
+requirement of its own.
 
 During geometry capture, writes to live registered parameter or buffer storage,
 including views and detached aliases, are rejected before execution and reported
 as unsupported sources. Lazy-source copies remain record-only, and independent
-scratch tensors may still be mutated. The guard ends when capture exits; it does
-not change installation or native post-load processing.
+scratch tensors may still be mutated. A loader write over destination bytes that
+a source was already copied into is also rejected: replaying the copy alone
+would install the value before that write. With ordered source replay, a write
+that recomputes the whole destination from itself (vLLM's
+`composed_weight_loader`, which stores Mamba2's `A = -exp(A_log)`, or an
+in-place scale such as `param.data.copy_(w).mul_(scale)`) is instead recorded as
+the copy's epilogue, the aten operations between the copy and the write, and
+installation runs it on the destination right after the copy lands. Writes that
+read other non-scalar tensors, cover part of the destination, or follow another
+copy into the same destination stay unsupported. Zeroing
+destination bytes that no copy wrote, such as vocabulary padding, is allowed
+because replay starts every destination from zeros. The guard ends when capture
+exits; it does not change native post-load processing.
 
 Load-layout capture caches a deep copy of the result and returns another deep
 copy on a cache hit, preserving shared references within each result while
