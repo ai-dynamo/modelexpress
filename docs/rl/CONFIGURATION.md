@@ -233,3 +233,38 @@ identity errors still fail preparation. Debug validation requires all published
 replicas to resolve and fails if any is unavailable.
 Replica equivalence compares canonical tensor coverage and geometry while
 ignoring physical addresses, which vary by replica.
+
+`MX_REFIT_PREFETCH` (default `false`) enables autonomous discovery in the shared
+stage process introduced in #1063. One worker per host cache holds the discovery
+lock; other workers can take over after it exits. This compatibility mode prepares
+the next registered version while serving even when vLLM has no `stage_weights`
+hook. Registered targets use the existing client staging path and version leases.
+Explicit requests are checked before another discovery poll; a preparation already
+in progress finishes before the request runs. Discovery stops while an explicit
+staged handle is held and does not advance past an unactivated cache head.
+
+The stage process remains enabled by default for foreground object-storage-only
+updates. `MX_REFIT_STAGE_PROCESS=false` disables that foreground offload, but
+`MX_REFIT_PREFETCH=true` still needs the shared worker for background preparation.
+With mixed sources the parent retains its configured fallback order and the child
+only prepares object-storage targets. Streamed full checkpoints remain on the
+explicit update path. S3 and Azure reuse their canonical readers.
+
+`MX_REFIT_PREFETCH_S3_WATCH` (default `false`) also discovers complete S3 deltas
+before registration when `MX_REFIT_PREFETCH` is enabled. Speculation is one delta
+deep; matching registered sources adopt it and other requests restore the untouched
+base. `MX_REFIT_PREFER_PREPARED` (default `false`) prioritizes an exact prepared
+object-storage target over generator peers without changing source availability.
+Neither flag enables discovery by itself.
+
+`MX_REFIT_PREFETCH_WORKERS` defaults to `min(8, CPU count)`, must be positive,
+and caps background delta workers together with `MX_REFIT_DELTA_WORKERS` and the
+CPU count. The foreground worker limit is restored after each poll.
+
+Background preparation preserves the previous checkpoint tree for recovery and
+requests on a different lineage. Files are reflinked where supported and fully
+copied otherwise: on a filesystem without reflink, each newly prepared background
+delta can require a full checkpoint copy. Budget disk capacity and serving I/O
+accordingly. This path does not enable in-place installation, surgical reload, or
+full-checkpoint streaming. An explicit staging integration should disable
+autonomous discovery when it needs sole control over staging schedules.

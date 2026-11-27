@@ -368,6 +368,31 @@ class S3Client:
         bucket, key = _parse_uri(uri)
         return int(self._client.head_object(Bucket=bucket, Key=key)["ContentLength"])
 
+    def exists(self, uri: str) -> bool:
+        """Return whether one S3 object exists."""
+        bucket, key = _parse_uri(uri)
+        try:
+            self._client.head_object(Bucket=bucket, Key=key)
+        except Exception as error:
+            if _error_code(error) in {"404", "NoSuchKey", "NotFound"}:
+                return False
+            raise
+        return True
+
+    def list_children(
+        self, prefix_uri: str, *, start_after: str | None = None
+    ) -> list[str]:
+        """Return the immediate child names under ``prefix_uri``, sorted."""
+        bucket, key = _parse_uri(prefix_uri.rstrip("/") + "/")
+        request = {"Bucket": bucket, "Prefix": key, "Delimiter": "/"}
+        if start_after is not None:
+            request["StartAfter"] = key + start_after
+        children = []
+        for page in self._client.get_paginator("list_objects_v2").paginate(**request):
+            for entry in page.get("CommonPrefixes", []):
+                children.append(entry["Prefix"][len(key) :].rstrip("/"))
+        return sorted(children)
+
     def close(self) -> None:
         """Close the underlying SDK client when supported."""
         self._upload_pool.shutdown()

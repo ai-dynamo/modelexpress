@@ -1758,3 +1758,7 @@ See the [shared experiment contract](rl/ARCHITECTURE.md#shared-rl-refit-experime
 ### Validation, timing, and cleanup
 
 See [validation, timing, and cleanup](rl/ARCHITECTURE.md#validation-timing-and-cleanup).
+
+RL background preparation and prepared-target priority retain their existing
+`MX_REFIT_PREFETCH`, `MX_REFIT_PREFETCH_S3_WATCH`, `MX_REFIT_PREFETCH_WORKERS`,
+and `MX_REFIT_PREFER_PREPARED` controls; see [RL configuration](rl/CONFIGURATION.md).

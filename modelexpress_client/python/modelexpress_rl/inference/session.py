@@ -89,7 +89,9 @@ class WeightUpdateSession:
         start_lease: Callable[[str], Any],
         resolve_replay_chain: Callable[[WeightVersion], tuple[WeightVersion, ...]]
         | None = None,
+        prefer_prepared: Callable[[WeightVersion], bool] | None = None,
     ) -> None:
+        self._prefer_prepared = prefer_prepared
         self._resolvers = resolvers
         self._methods = methods
         self._installer = installer
@@ -104,7 +106,12 @@ class WeightUpdateSession:
         """Prepare one target and retain its leases until apply or release."""
         if not self._resolvers:
             raise RuntimeError("no refit source is configured")
-        for index, resolver in enumerate(self._resolvers):
+        resolvers = self._resolvers
+        if self._prefer_prepared is not None and self._prefer_prepared(version):
+            resolvers = tuple(
+                r for r in resolvers if r.kind is WeightSource.OBJECT_STORAGE
+            ) + tuple(r for r in resolvers if r.kind is not WeightSource.OBJECT_STORAGE)
+        for index, resolver in enumerate(resolvers):
             try:
                 return self._stage_source(version, resolver=resolver)
             except StrategyRecoveryError:
@@ -114,7 +121,7 @@ class WeightUpdateSession:
                 RuntimeError,
                 ManifestMismatchError,
             ) as error:
-                if index == len(self._resolvers) - 1:
+                if index == len(resolvers) - 1:
                     raise
                 logger.info(
                     "ModelExpress active refit version=%s source=%s unavailable: %s",

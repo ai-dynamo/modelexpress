@@ -301,6 +301,7 @@ class ModelExpressGeneratorClient:
         self._worker_staged: _WorkerStaged | None = None
         # The version records the current staging step read from the MX server.
         self._fetched_versions: dict[str, WeightVersion] = {}
+        self._offload_staging = False
         self._closed = False
 
     @classmethod
@@ -346,7 +347,8 @@ class ModelExpressGeneratorClient:
         client._max_replay_chain_length = config.max_replay_chain_length
         if config.staging_buffer_bytes is not None:
             client._streaming = StreamingSettings(
-                max_staging_bytes=config.staging_buffer_bytes * config.staging_buffers_count,
+                max_staging_bytes=config.staging_buffer_bytes
+                * config.staging_buffers_count,
                 staging_device=config.staging_device,
                 staging_buffers=config.staging_buffers_count,
             )
@@ -416,7 +418,7 @@ class ModelExpressGeneratorClient:
                 if active.version_id == version.version_id:
                     return active
                 raise RuntimeError("another generator update is still active")
-            if self._stage_process is None:
+            if self._stage_process is None or not self._offload_staging:
                 return self._stage_weight(version)
             staged = self._stage_process.stage(
                 version.version_id,
@@ -606,23 +608,29 @@ class ModelExpressGeneratorClient:
         enabled = config.stage_process
         if enabled is None:
             enabled = rl_envs.MX_REFIT_STAGE_PROCESS
-        if not enabled:
+        from .engines.stage_only import StageOnlyGeneratorContext
+
+        if isinstance(config.engine_context, StageOnlyGeneratorContext):
             return
         runtime = self._require_runtime()
         source_order = runtime.session.source_order
         if (
-            source_order != (WeightSource.OBJECT_STORAGE,)
-            or config.object_storage is None
+            config.object_storage is None
+            or WeightSource.OBJECT_STORAGE not in source_order
         ):
-            # The other sources stage into this process's own memory.
-            logger.info(
-                "ModelExpress stage process not started: object storage is not "
-                "the only source (%s); staging in-process",
-                ", ".join(source.value for source in source_order),
-            )
             return
-        from .engines.stage_only import StageOnlyGeneratorContext
-
+        prefetch = rl_envs.MX_REFIT_PREFETCH and rl_envs.LOCAL_RANK in (None, 0)
+        self._offload_staging = enabled and source_order == (
+            WeightSource.OBJECT_STORAGE,
+        )
+        if not self._offload_staging and not prefetch:
+            if enabled:
+                logger.info(
+                    "ModelExpress stage process not started: object storage is not "
+                    "the only source (%s); staging in-process",
+                    ", ".join(source.value for source in source_order),
+                )
+            return
         # The worker is a generator client like this one, without the engine.
         worker_config = replace(
             config,
@@ -632,15 +640,14 @@ class ModelExpressGeneratorClient:
             ),
             # Leases are keyed by version and worker, so it has its own identity.
             worker_id=f"{self.worker_id}-stage",
-            source_order=source_order,
+            source_order=(WeightSource.OBJECT_STORAGE,),
             # It joins the checkpoint cache this client has just initialized
             # and does not reset it from the launch seed.
             object_storage=replace(config.object_storage, seed_checkpoint_path=None),
             stage_process=False,
         )
-        # From here on only the stage process stages. Initialization fails if
-        # it does not start.
-        self._stage_process = StageProcess(worker_config)
+        # The same supervised worker handles explicit staging and optional discovery.
+        self._stage_process = StageProcess(worker_config, prefetch=prefetch)
 
     def _register_worker(self) -> None:
         self._service.RegisterWorker(

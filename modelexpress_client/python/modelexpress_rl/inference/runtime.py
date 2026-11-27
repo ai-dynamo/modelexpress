@@ -302,7 +302,8 @@ def initialize_generator_runtime(
         WeightSource.TRAINER in resolved_source_order
         and LoadTimeTensorNixlUpdateMethod.capabilities_for(
             streaming is not None
-        ).artifact_type not in engine.installer.capabilities.artifact_types
+        ).artifact_type
+        not in engine.installer.capabilities.artifact_types
     ):
         mode = "bounded streaming" if streaming is not None else "full-copy"
         raise ValueError(f"engine does not support {mode} installation")
@@ -377,6 +378,9 @@ def initialize_generator_runtime(
                     rpc_timeout_seconds=rpc_timeout_seconds,
                     service=service,
                 ),
+                prefer_prepared=canonical_method.is_prepared
+                if canonical_method is not None and rl_envs.MX_REFIT_PREFER_PREPARED
+                else None,
                 methods=method_tuple,
                 installer=engine.installer,
                 max_transfer_attempts=max_transfer_attempts,

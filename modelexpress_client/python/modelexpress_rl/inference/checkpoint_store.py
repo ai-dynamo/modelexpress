@@ -236,6 +236,7 @@ class LocalCheckpointStore:
         self.delta_cache = self.cache / "deltas"
         self.chain_cache = self.cache / "chains"
         self.materialized_cache = self.cache / "materialized"
+        self.speculation_path = self.cache / "speculation.json"
         self.state_path = self.cache / "state.json"
         self.active_path = self.cache / "active.json"
         self.lock_path = self.cache / ".lock"
@@ -259,8 +260,7 @@ class LocalCheckpointStore:
             if self.max_size_bytes is None or self.max_size_bytes > disk_limit:
                 self.max_size_bytes = disk_limit
                 logger.info(
-                    "Refit checkpoint cache %s capped at %.2f GB "
-                    "(free=%.2f GB)",
+                    "Refit checkpoint cache %s capped at %.2f GB (free=%.2f GB)",
                     self.cache,
                     disk_limit / 1_000_000_000,
                     free_bytes / 1_000_000_000,
@@ -373,6 +373,59 @@ class LocalCheckpointStore:
     def materialized_path(self, version: str) -> Path:
         return self._version_path(self.materialized_cache, version)
 
+    def speculation(self) -> dict | None:
+        """Return the unregistered target prepared ahead of its registration."""
+        return self._read_json(self.speculation_path)
+
+    def write_speculation(
+        self,
+        *,
+        version: str,
+        uri: str,
+        base_version: str,
+        base_source: dict[str, str] | None,
+    ) -> None:
+        self._write_json(
+            self.speculation_path,
+            {
+                "version": version,
+                "uri": uri,
+                "base_version": base_version,
+                "base_source": base_source,
+            },
+        )
+
+    def clear_speculation(self) -> None:
+        self.speculation_path.unlink(missing_ok=True)
+
+    def rename_version(self, old: str, new: str) -> None:
+        """Move one version's artifacts and chain references to another ID.
+
+        Callers hold the exclusive cache lock and own the state transition.
+        """
+        for path_for in (self.full_path, self.delta_path, self.materialized_path):
+            source, target = path_for(old), path_for(new)
+            if source.exists():
+                shutil.rmtree(target, ignore_errors=True)
+                source.replace(target)
+        for chain_file in sorted(self.chain_cache.glob("*.json")):
+            chain = self._read_json(chain_file)
+            if chain is None:
+                continue
+            renamed = dict(chain)
+            for key in ("version", "full_version"):
+                if renamed.get(key) == old:
+                    renamed[key] = new
+            if isinstance(renamed.get("deltas"), list):
+                renamed["deltas"] = [
+                    new if delta == old else delta for delta in renamed["deltas"]
+                ]
+            if renamed != chain:
+                self._write_json(chain_file, renamed)
+        old_chain = self.chain_path(old)
+        if old_chain.exists():
+            old_chain.replace(self.chain_path(new))
+
     def chain_path(self, version: str) -> Path:
         return self.chain_cache / f"{_encode_cache_component(version)}.json"
 
@@ -479,9 +532,7 @@ class LocalCheckpointStore:
             > self.max_size_bytes
         ):
             return False
-        return (
-            shutil.disk_usage(self.cache).free + evictable_bytes >= additional_bytes
-        )
+        return shutil.disk_usage(self.cache).free + evictable_bytes >= additional_bytes
 
     def ensure_capacity(
         self,
@@ -671,9 +722,7 @@ class LocalCheckpointStore:
 
     def _verified_artifact_metadata(self, artifact: Path) -> dict:
         metadata = self._read_json(self._source_path(artifact))
-        if metadata is None or metadata.get("files") != _artifact_files_state(
-            artifact
-        ):
+        if metadata is None or metadata.get("files") != _artifact_files_state(artifact):
             raise ValueError("cached checkpoint artifact changed")
         return metadata
 

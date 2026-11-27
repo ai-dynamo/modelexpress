@@ -107,6 +107,7 @@ class StageProcess:
         self,
         config: ModelExpressGeneratorConfig,
         *,
+        prefetch: bool = False,
         timeout_seconds: float | None = None,
         start_timeout_seconds: float | None = None,
         close_grace_seconds: float | None = None,
@@ -124,6 +125,7 @@ class StageProcess:
         if close_grace_seconds is None:
             close_grace_seconds = rl_envs.MX_REFIT_STAGE_PROCESS_CLOSE_GRACE_SECONDS
         self._config = config
+        self._prefetch = prefetch
         self._timeout_seconds = timeout_seconds
         self._start_timeout_seconds = start_timeout_seconds
         self._close_grace_seconds = close_grace_seconds
@@ -233,6 +235,8 @@ class StageProcess:
         with self._lock:
             proc, conn, deadline = self._proc, self._conn, self._deadline
             self._proc = self._conn = None
+            if deadline is None and self._prefetch:
+                deadline = time.monotonic() + self._timeout_seconds
         if proc is None or conn is None:
             return
         try:
@@ -340,7 +344,11 @@ class StageProcess:
             # one that does not fit waits for the reader twice at most.
             _limit_writes(conn, self._start_timeout_seconds / 2)
             # As bytes: a write that is given up leaves no buffer half sent.
-            conn.send_bytes(pickle.dumps({"op": "init", "config": self._config}))
+            conn.send_bytes(
+                pickle.dumps(
+                    {"op": "init", "config": self._config, "prefetch": self._prefetch}
+                )
+            )
             _limit_writes(conn, 0)
         except BlockingIOError:
             # The worker is alive and does not read.

@@ -1757,3 +1757,11 @@ run ID, namespace, GitHub run ID/attempt and image/environment settings. Rerunni
 the whole GitHub workflow uses a new attempt and does not recover an older retained
 namespace. Never delete the shared model prefix or bucket. Every fresh run
 has isolated server/Redis state and empty worker volumes.
+
+`inference/prefetch.py` provides optional discovery for the shared stage worker;
+it has no separate subprocess or control-plane connection. Idle workers check
+explicit commands before polling, and the cache owner stages registered targets
+through the existing generator client. S3 speculation uses the same canonical
+checkpoint preparer before registration. Preparation, install and cache-head locks
+protect the served base; a background target never advances again before activation.
+The shared stage-process supervisor handles startup, replacement, and shutdown.

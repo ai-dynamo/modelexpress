@@ -59,6 +59,7 @@ def _serve(
     *,
     parent_pid: int,
     draining: threading.Event,
+    prefetcher=None,
 ) -> None:
     """Answer requests until the client shuts this worker down or is gone."""
     handle: StagedWeightHandle | None = None
@@ -74,6 +75,8 @@ def _serve(
                 return
             try:
                 if not conn.poll(_IDLE_TICK_SECONDS):
+                    if handle is None and prefetcher is not None:
+                        prefetcher.poll()
                     continue
                 request = conn.recv()
             except (EOFError, OSError):
@@ -139,6 +142,12 @@ def _serve(
         _release(handle)
 
 
+def _watch_prefetch_parent(parent_pid: int) -> None:
+    while os.getppid() == parent_pid:
+        time.sleep(0.1)
+    os._exit(0)
+
+
 def main() -> int:
     # Only the ModelExpress loggers log below WARNING. Object-storage and HTTP
     # libraries log every request below it, and at DEBUG its signed headers.
@@ -177,7 +186,15 @@ def main() -> int:
         logger.exception("stage worker failed to start")
         _send(conn, {"event": "fatal", "error": f"{type(error).__name__}: {error}"})
         return 1
+    prefetcher = None
     try:
+        if init.get("prefetch", False):
+            from .prefetch import RefitPrefetcher
+
+            prefetcher = RefitPrefetcher.for_client(client)
+            threading.Thread(
+                target=_watch_prefetch_parent, args=(parent_pid,), daemon=True
+            ).start()
         ready = {
             "event": "ready",
             "pid": os.getpid(),
@@ -185,8 +202,16 @@ def main() -> int:
             "package": os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         }
         if _send(conn, ready):
-            _serve(client, conn, parent_pid=parent_pid, draining=draining)
+            _serve(
+                client,
+                conn,
+                parent_pid=parent_pid,
+                draining=draining,
+                prefetcher=prefetcher,
+            )
     finally:
+        if prefetcher is not None:
+            prefetcher.close()
         client.close()
     return 0
 
