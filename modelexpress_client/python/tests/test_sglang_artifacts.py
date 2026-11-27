@@ -352,6 +352,7 @@ def test_sglang_health_url_honors_config(monkeypatch):
 
 def test_sglang_deep_gemm_cache_root_uses_sglang_config(monkeypatch, tmp_path):
     monkeypatch.setenv("SGLANG_DG_CACHE_DIR", str(tmp_path / "deep-gemm-cache"))
+    monkeypatch.setenv("SGLANG_CACHE_DIR", str(tmp_path / "sglang-cache"))
     monkeypatch.setenv("DG_JIT_CACHE_DIR", str(tmp_path / "overwritten-cache"))
 
     assert artifacts._deep_gemm_cache_root() == tmp_path / "deep-gemm-cache"
@@ -440,3 +441,19 @@ def test_http_readiness_precedes_cache_settling(
     assert ready()
     (tmp_path / "kernel.so").write_bytes(b"later compilation")
     assert not ready()
+def test_sglang_deep_gemm_cache_root_uses_sglang_cache_dir(monkeypatch, tmp_path):
+    monkeypatch.delenv("SGLANG_DG_CACHE_DIR", raising=False)
+    monkeypatch.setenv("SGLANG_CACHE_DIR", str(tmp_path / "sglang-cache"))
+
+    assert artifacts._deep_gemm_cache_root() == (
+        tmp_path / "sglang-cache" / "deep_gemm"
+    )
+
+
+def test_sglang_deep_gemm_cache_root_uses_default(monkeypatch):
+    monkeypatch.delenv("SGLANG_DG_CACHE_DIR", raising=False)
+    monkeypatch.delenv("SGLANG_CACHE_DIR", raising=False)
+
+    assert artifacts._deep_gemm_cache_root() == (
+        Path.home() / ".cache" / "sglang" / "deep_gemm"
+    )

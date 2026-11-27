@@ -183,7 +183,15 @@ def _torch_compile_cache_root() -> Path:
 
 def _deep_gemm_cache_root() -> Path:
     configured = envs.SGLANG_DG_CACHE_DIR
-    return Path(configured) if configured else Path.home() / ".cache" / "deep_gemm"
+    if configured:
+        return Path(configured)
+    sglang_cache_dir = envs.SGLANG_CACHE_DIR
+    base = (
+        Path(sglang_cache_dir).expanduser()
+        if sglang_cache_dir
+        else Path.home() / ".cache" / "sglang"
+    )
+    return base / "deep_gemm"
 
 
 def _flashinfer_autotune_cache_root() -> Path:
