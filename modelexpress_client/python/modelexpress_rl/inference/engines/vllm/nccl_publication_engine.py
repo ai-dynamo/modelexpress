@@ -94,8 +94,9 @@ class ModelExpressNCCLWeightTransferEngine(NCCLWeightTransferEngine):
     """vLLM's NCCL engine plus ModelExpress publication of the target model.
 
     Workers loaded through ModelExpress publish through their loader. Workers
-    started with ``--load-format dummy`` register their tensors here. Draft
-    model updates pass through to NCCL without touching publication.
+    started with ``--load-format dummy`` register their tensors here. When a
+    speculative draft is configured, publication stays withdrawn until both
+    target and draft updates finish successfully.
     """
 
     def __init__(self, config, vllm_config, device: torch.device, model) -> None:
@@ -109,28 +110,45 @@ class ModelExpressNCCLWeightTransferEngine(NCCLWeightTransferEngine):
         self._dummy_boot: _DummyBootPublication | None = None
         if vllm_config.load_config.load_format == "dummy":
             self._dummy_boot = _register_dummy_boot_tensors(vllm_config, model)
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        self._required_update_targets = {"target"}
+        if (
+            getattr(speculative_config, "draft_model_config", None) is not None
+            and not getattr(speculative_config, "prefill_context_kv_only", False)
+        ):
+            self._required_update_targets.add("draft")
+        self._completed_update_targets: set[str] = set()
+        self._publication_withdrawn = False
 
     def _publication(self) -> _RuntimePublication | None:
-        if self.model is not self._default_model:
-            return None
         loader = get_model_loader(self.device.index)
         if loader is not None:
             return loader
         return self._dummy_boot
 
+    def _update_target(self) -> str:
+        return "target" if self.model is self._default_model else "draft"
+
     def start_weight_update(self) -> None:
         publication = self._publication()
-        if publication is not None:
+        if publication is not None and not self._publication_withdrawn:
             # Raises if readers do not drain, so NCCL never mutates read tensors.
             publication.unpublish_runtime_tensors(
                 drain_timeout=runtime_tensor_drain_timeout_seconds()
             )
+            self._publication_withdrawn = True
+            self._completed_update_targets.clear()
         super().start_weight_update()
 
     def finish_weight_update(self) -> None:
         super().finish_weight_update()
         publication = self._publication()
         if publication is None:
+            return
+        self._completed_update_targets.add(self._update_target())
+        if not self._required_update_targets.issubset(
+            self._completed_update_targets
+        ):
             return
         try:
             publication.publish_runtime_tensors(self._revision)
@@ -140,3 +158,6 @@ class ModelExpressNCCLWeightTransferEngine(NCCLWeightTransferEngine):
                 "continuing without this worker as a P2P source",
                 self._revision,
             )
+        finally:
+            self._publication_withdrawn = False
+            self._completed_update_targets.clear()

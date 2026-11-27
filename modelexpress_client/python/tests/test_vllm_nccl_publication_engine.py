@@ -47,13 +47,22 @@ class _Publication:
             raise RuntimeError("server unavailable")
 
 
-def _engine(monkeypatch, *, loader=None, load_format="auto"):
+def _engine(monkeypatch, *, loader=None, load_format="auto", with_draft=False):
     monkeypatch.setenv("MX_RUNTIME_PUBLISH_REVISION", "fleet")
     monkeypatch.setattr(engine_mod, "get_model_loader", lambda device_id: loader)
+    speculative_config = (
+        SimpleNamespace(
+            draft_model_config=SimpleNamespace(model="test/draft"),
+            prefill_context_kv_only=False,
+        )
+        if with_draft
+        else None
+    )
     vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(),
         model_config=SimpleNamespace(model="test/model"),
         load_config=SimpleNamespace(load_format=load_format),
+        speculative_config=speculative_config,
     )
     return ModelExpressNCCLWeightTransferEngine(
         SimpleNamespace(),
@@ -102,14 +111,44 @@ def test_failed_publish_does_not_fail_installed_update(monkeypatch, events, capl
     assert "continuing without this worker as a P2P source" in caplog.text
 
 
-def test_draft_update_leaves_publication_alone(monkeypatch, events):
-    engine = _engine(monkeypatch, loader=_Publication(events))
-    engine.model = torch.nn.Linear(2, 2)
+def test_publication_waits_for_target_and_draft_updates(monkeypatch, events):
+    engine = _engine(monkeypatch, loader=_Publication(events), with_draft=True)
 
     engine.start_weight_update()
     engine.finish_weight_update()
 
-    assert events == ["nccl_start", "nccl_finish"]
+    engine.model = torch.nn.Linear(2, 2)
+    engine.start_weight_update()
+    engine.finish_weight_update()
+
+    assert events == [
+        ("unpublish", engine_mod.runtime_tensor_drain_timeout_seconds()),
+        "nccl_start",
+        "nccl_finish",
+        "nccl_start",
+        "nccl_finish",
+        ("publish", "fleet"),
+    ]
+
+
+def test_publication_waits_for_draft_and_target_in_either_order(monkeypatch, events):
+    engine = _engine(monkeypatch, loader=_Publication(events), with_draft=True)
+    engine.model = torch.nn.Linear(2, 2)
+
+    engine.start_weight_update()
+    engine.finish_weight_update()
+    engine.model = engine._default_model
+    engine.start_weight_update()
+    engine.finish_weight_update()
+
+    assert events == [
+        ("unpublish", engine_mod.runtime_tensor_drain_timeout_seconds()),
+        "nccl_start",
+        "nccl_finish",
+        "nccl_start",
+        "nccl_finish",
+        ("publish", "fleet"),
+    ]
 
 
 def test_worker_without_publication_is_plain_nccl(monkeypatch, events):

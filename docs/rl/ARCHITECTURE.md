@@ -841,8 +841,11 @@ republishes the tensors under `MX_RUNTIME_PUBLISH_REVISION`. A failed publish
 is logged and the update still succeeds, because the weights are already
 installed. Workers loaded through `MxModelLoader` publish through that loader.
 Workers started with `--load-format dummy` register their tensors with NIXL when
-the engine is built, before torch.compile and CUDA graph capture. Draft-model
-updates pass through to NCCL without touching publication.
+the engine is built, before torch.compile and CUDA graph capture. When a
+speculative draft is configured, the target and draft form one publication
+transaction: the first update withdraws and drains the publication, and it is
+republished only after both updates finish successfully. This prevents peers
+from observing a new target with an old or partially updated draft.
 
 The active vLLM refit installer lives in
 `modelexpress_rl.inference.engines.vllm.installer`. It captures canonical
