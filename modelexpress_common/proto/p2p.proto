@@ -373,6 +373,15 @@ message GetTensorManifestResponse {
   // Runtime generation of the process serving this manifest. New sources
   // always set it; absence identifies a legacy source during rolling upgrade.
   optional string worker_id = 7;
+  repeated WeightDigest weight_digests = 8;
+}
+
+// Digest of one static weight scope in this worker's tensor manifest.
+message WeightDigest {
+  string scope = 1;
+  uint32 format_version = 2;
+  bytes digest = 3;
+  string generation = 4;
 }
 
 message PrepareTensorReadRequest {

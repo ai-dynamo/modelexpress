@@ -110,6 +110,8 @@ class LoadContext:
     shared_nixl_manager: NixlTransferManager | None = None
     # Set only after the draft's descriptors have extended the main publication.
     draft_published: bool = False
+    weight_load_from_legacy: bool = False
+    verified_weight_digest: p2p_pb2.WeightDigest | None = None
     # RL cold start snapshots this once after distributed rank agreement.
     desired_version_uid: str | None = None
     # Optional engine-level gate checked before weight metadata is advertised.

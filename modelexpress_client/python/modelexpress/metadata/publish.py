@@ -96,6 +96,7 @@ def publish_metadata_and_ready(
     ready_fn: Callable[[], bool] | None = None,
     *,
     accelerator_backend: AcceleratorBackend | None = None,
+    weight_digest: p2p_pb2.WeightDigest | None = None,
 ) -> None:
     """Prepare tensor metadata publication and start the publisher thread.
 
@@ -149,6 +150,7 @@ def publish_metadata_and_ready(
             worker_rank=worker_rank,
             accelerator=accelerator,
             worker_id=worker_id,
+            weight_digests=(weight_digest,) if weight_digest is not None else (),
         )
         try:
             actual_port = grpc_server.start()
@@ -253,6 +255,7 @@ def extend_published_tensors(
     worker_rank: int,
     *,
     accelerator_backend: AcceleratorBackend,
+    weight_digest: p2p_pb2.WeightDigest | None = None,
 ) -> bool:
     """Add tensors to this device's existing publication.
 
@@ -272,7 +275,10 @@ def extend_published_tensors(
     if server is not None:
         # P2P mode: peers fetch the manifest and the NIXL metadata live, so
         # extending the served manifest is enough.
-        server.extend_tensors(tensor_protos)
+        if weight_digest is None:
+            server.extend_tensors(tensor_protos)
+        else:
+            server.extend_tensors(tensor_protos, (weight_digest,))
         return True
 
     manifest = _central_manifests.get(device_id)
