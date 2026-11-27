@@ -200,6 +200,21 @@ class TestReleaseOnTheLoadPath:
 
 
 class TestReleaseOnFailure:
+    def test_unreleased_read_keeps_peer_and_source_lease(self):
+        mgr = _manager()
+        mgr.receive_cleanup_pending = True
+        mgr.receive_from_source.side_effect = RuntimeError("READ release pending")
+        mgr._tensor_lease_release = MagicMock()
+
+        with pytest.raises(SourceTransferError, match="READ release pending"):
+            _receive(mgr, p2p=True)
+
+        mgr.remove_remote_agent.assert_not_called()
+        mgr._tensor_lease_release.assert_not_called()
+        release_source = mgr.receive_from_source.call_args.kwargs["release_source"]
+        release_source()
+        mgr._tensor_lease_release.assert_called_once_with()
+
     def test_a_failed_transfer_still_releases_the_source(self):
         """The wedged-source case. A reader that times out and moves to the next
         candidate must not leave connection state behind on the way out."""
@@ -315,11 +330,15 @@ def test_draft_preparation_uses_model_names_before_namespaced_registration():
     manager = _manager()
     ctx = _ctx(manager)
     ctx.p2p_role = "draft"
+    ctx.device_id = 0
     ctx.draft_tensor_namespace = "__draft__/test/"
     ctx.tensors = {}
     name = ctx.draft_tensor_namespace + "w0"
     desc = _descriptor(name)
-    with patch(__name__ + "._descriptor", return_value=desc):
+    with patch(__name__ + "._descriptor", return_value=desc), patch(
+        "modelexpress.load_strategy.rdma_strategy._init_nixl_manager",
+        return_value=manager,
+    ):
         _receive(manager, ctx=ctx,
                  register=lambda *args: ctx.tensors.update({name: object()}))
     args = ctx.adapter.prepare_rdma_target_from_manifest.call_args.args

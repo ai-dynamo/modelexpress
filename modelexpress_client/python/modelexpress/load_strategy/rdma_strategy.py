@@ -39,6 +39,7 @@ from .base import (
     LoadStrategy,
     SourceTransferError,
     _as_load_result,
+    _init_nixl_manager,
     clear_exception_tracebacks,
     register_tensors,
 )
@@ -164,11 +165,10 @@ class RdmaStrategy(LoadStrategy):
         """
 
     def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
-        """Nothing to do after load(); the received weights are finalized in
-        _load_as_target.
+        """Hand finalized draft tensors from the receiver to the shared agent.
 
-        Finalizing there keeps it inside the candidate loop, so a failure
-        retries the next source on a reinitialized model. A reload target
+        Post-processing in _load_as_target stays inside the candidate loop, so
+        a failure retries the next source on a reinitialized model. A reload target
         skips it: it has already been through post-processing and has served
         requests, so its derived host-side state (attention scale mirrors,
         FlashInfer's bmm1_scale/bmm2_scale cache) is populated and the
@@ -178,6 +178,10 @@ class RdmaStrategy(LoadStrategy):
         the transfer already registered, and on a reload leave a layerwise
         reload this strategy never entered.
         """
+        if _is_draft_pass(ctx):
+            self.rollback(ctx)
+            if result.model_for_publish is not None:
+                register_tensors(result, ctx)
 
     def abort(self, result: LoadResult, ctx: LoadContext) -> None:
         """Nothing to undo: prepare() starts no engine state, and rollback()
@@ -191,7 +195,14 @@ class RdmaStrategy(LoadStrategy):
                 # it. Release only the draft's own registrations.
                 ctx.nixl_manager.deregister_tensors(ctx.tensors)
             else:
-                ctx.nixl_manager.shutdown()
+                try:
+                    ctx.nixl_manager.shutdown(**({"strict": True} if _is_draft_pass(ctx) else {}))
+                except Exception as cleanup_error:
+                    if _is_draft_pass(ctx):
+                        raise StrategyRecoveryError(
+                            f"Failed to shut down draft receive manager: {cleanup_error}"
+                        ) from cleanup_error
+                    raise
         ctx.tensors = {}
         ctx.nixl_manager = None
 
@@ -348,6 +359,8 @@ class RdmaStrategy(LoadStrategy):
                 )
                 try:
                     self.rollback(ctx)
+                except StrategyRecoveryError:
+                    raise
                 except Exception as cleanup_error:
                     raise StrategyFailed(
                         f"Failed to clean up target after source worker "
@@ -356,9 +369,10 @@ class RdmaStrategy(LoadStrategy):
                     ) from cleanup_error
                 # A reload target is the engine's live model; the next
                 # candidate overwrites it in place, see execute_load_strategies.
+                if e.mutated:
+                    clear_exception_tracebacks(e)
                 if e.mutated and not ctx.is_reload:
                     try:
-                        clear_exception_tracebacks(e)
                         reinitialized = ctx.adapter.reinit_for_retry(result)
                         # LoadResult is the stable envelope shared with the
                         # outer strategy chain. Some adapters return a new
@@ -725,7 +739,7 @@ class RdmaStrategy(LoadStrategy):
                 if not ctx.is_reload:
                     result = ctx.adapter.after_rdma_receive(result)
                 return result
-        except StrategyFailed:
+        except (StrategyFailed, StrategyRecoveryError):
             raise
         except Exception as e:
             # The chain clears tracebacks on a mutated StrategyFailed before
@@ -802,6 +816,14 @@ class RdmaStrategy(LoadStrategy):
                     ]
                 ctx.adapter.prepare_rdma_target_from_manifest(result, adapter_tensors)
             with selection_metrics.time_source_attempt_phase(policy, "register"):
+                if _is_draft_pass(ctx):
+                    ctx.nixl_manager = _init_nixl_manager(
+                        ctx.global_rank,
+                        ctx.device_id,
+                        "draft-receive",
+                        listen_port=0,
+                        accelerator_backend=ctx.accelerator_backend,
+                    )
                 register_tensors(result, ctx)
             if _is_draft_pass(ctx):
                 # Registration refreshes ctx.tensors with newly prepared buffers.
@@ -898,11 +920,10 @@ class RdmaStrategy(LoadStrategy):
                             timeout_seconds=_transfer_timeout_seconds(),
                             remote_agent_name=remote_agent_name,
                             require_exact_match=require_exact_match,
-                            # The shared agent's catalog also holds the main
-                            # load's tensors; match only the draft's.
                             destination_tensors=(
                                 ctx.tensors if _is_draft_pass(ctx) else None
                             ),
+                            release_source=tensor_read.close if tensor_read is not None else None,
                         )
                 except Exception as e:
                     raise SourceTransferError(f"RDMA receive failed: {e}") from e
@@ -925,7 +946,8 @@ class RdmaStrategy(LoadStrategy):
                 # process exit: the engine process is torn down without running atexit
                 # hooks, and in P2P only the reader holds a record of the peer to
                 # invalidate. None means acquisition failed with nothing to release.
-                if remote_agent_name is not None and ctx.nixl_manager is not None:
+                pending = getattr(ctx.nixl_manager, "receive_cleanup_pending", False) is True
+                if remote_agent_name is not None and ctx.nixl_manager is not None and not pending:
                     # Release is best-effort. Raising from a finally: replaces the
                     # exception that is unwinding through it, so a failure here
                     # would report itself as the reason the transfer failed and
@@ -943,7 +965,8 @@ class RdmaStrategy(LoadStrategy):
                             exc_info=True,
                         )
         finally:
-            if tensor_read is not None:
+            pending = getattr(ctx.nixl_manager, "receive_cleanup_pending", False) is True
+            if tensor_read is not None and not pending:
                 tensor_read.close()
 
         total_time = time.perf_counter() - receive_start

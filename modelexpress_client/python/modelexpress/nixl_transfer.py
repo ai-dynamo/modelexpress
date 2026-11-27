@@ -147,6 +147,14 @@ class PostedRead:
     posted_at: float = field(default_factory=time.perf_counter)
 
 
+@dataclass
+class _PendingWeightRead:
+    handles: list[Any]
+    descriptors: list[Any]
+    tensors: dict[str, torch.Tensor]
+    release_source: Callable[[], None] | None
+
+
 def _has_memory_range(size: int, addr: int) -> bool:
     """True when a tensor owns allocated bytes that can be registered and read."""
     return size > 0 and addr != 0
@@ -225,6 +233,12 @@ class NixlTransferManager:
         # has been observed on a transfer this manager issued.
         self._data_plane_error: str | None = None
         self._atexit_registered = False
+        self._pending_weight_read: _PendingWeightRead | None = None
+
+    @property
+    def receive_cleanup_pending(self) -> bool:
+        """Whether a weight READ still owns destination and source resources."""
+        return self._pending_weight_read is not None
 
     @property
     def agent_name(self) -> str:
@@ -1194,6 +1208,7 @@ class NixlTransferManager:
         require_exact_match: bool = False,
         destination_tensors: dict[str, torch.Tensor] | None = None,
         on_transfer_start: Callable[[], None] | None = None,
+        release_source: Callable[[], None] | None = None,
     ) -> tuple[int, int, float]:
         """
         Receive weights from a remote source via NIXL RDMA.
@@ -1223,6 +1238,8 @@ class NixlTransferManager:
                 name matching. Defaults to the most recently registered catalog.
             on_transfer_start: Optional callback invoked immediately before the
                 NIXL transfer is submitted.
+            release_source: Retained source-lease cleanup if NIXL cannot release
+                a READ. Called only after a later shutdown confirms release.
 
         Returns:
             Tuple of (total_bytes, total_tensors, duration)
@@ -1238,6 +1255,8 @@ class NixlTransferManager:
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
+        if self.receive_cleanup_pending:
+            raise RuntimeError("Previous weight READ cleanup is still pending")
 
         start_time = time.perf_counter()
         self._accelerator_backend.set_device(self._device_id)
@@ -1396,6 +1415,8 @@ class NixlTransferManager:
         # failure leaves local memory untouched and on_transfer_start unfired.
         prep_start = time.perf_counter()
         handles = []
+        prepared = []
+        transfer_failed = False
         try:
             for (remote_mem_type, local_mem_type), (
                 remote_descs,
@@ -1413,6 +1434,7 @@ class NixlTransferManager:
                     mem_type=self._nixl_mem_type_name(local_mem_type),
                     backends=self._backends,
                 )
+                prepared.extend((src_prepped, dst_prepped))
                 indices = list(range(len(remote_descs)))
                 handles.append(
                     self._agent.make_prepped_xfer(
@@ -1434,9 +1456,27 @@ class NixlTransferManager:
             for handle in handles:
                 self._agent.transfer(handle)
             self._wait_for_xfers(handles, timeout_seconds, "Transfer")
+        except BaseException:
+            transfer_failed = True
+            raise
         finally:
+            failed = []
+            cleanup_error = None
             for handle in handles:
-                self._release_xfer_handle(handle)
+                try:
+                    self._agent.release_xfer_handle(handle)
+                except Exception as error:
+                    failed.append(handle)
+                    cleanup_error = error
+            if failed:
+                self._pending_weight_read = _PendingWeightRead(
+                    failed, prepared, local_tensors, release_source,
+                )
+                self._register_atexit()
+                self._data_plane_error = f"Weight READ cleanup failed: {cleanup_error}"
+                if not transfer_failed:
+                    raise RuntimeError(self._data_plane_error) from cleanup_error
+                logger.warning(self._data_plane_error)
 
         # CRITICAL: Synchronize the device to ensure RDMA writes are visible.
         # GPUDirect RDMA writes bypass torch streams, so we must sync.
@@ -1739,21 +1779,36 @@ class NixlTransferManager:
         """Last data-plane failure observed on a transfer, or None."""
         return self._data_plane_error
 
-    def shutdown(self) -> None:
-        """Disconnect remote agents before releasing local NIXL resources."""
-        if self._atexit_registered:
-            atexit.unregister(self.shutdown)
-            self._atexit_registered = False
+    def shutdown(self, *, strict: bool = False) -> None:
+        """Release READs before memory; strict deregistration failures retain ownership."""
+        pending = self._pending_weight_read
+        if pending is not None:
+            # NIXL release succeeds only after completion or accepted cancellation.
+            # A failed release keeps the handle, descriptors, buffers and lease.
+            while pending.handles:
+                self._agent.release_xfer_handle(pending.handles[-1])
+                pending.handles.pop()
+            if pending.release_source is not None:
+                pending.release_source()
+            self._pending_weight_read = None
         disconnected = self.disconnect_remote_agents()
         if self._agent is not None:
-            for registered in reversed(self._registered_memory):
+            while self._registered_memory:
+                registered = self._registered_memory[-1]
                 try:
                     self._agent.deregister_memory(registered)
                 except Exception:
+                    if strict:
+                        self._register_atexit()
+                        raise
                     logger.warning(
                         "Failed to deregister NIXL memory during shutdown",
                         exc_info=True,
                     )
+                self._registered_memory.pop()
+        if self._atexit_registered:
+            atexit.unregister(self.shutdown)
+            self._atexit_registered = False
         self._registered_memory = []
         self._base_registration_ranges = []
         self._appended_registrations = {}
