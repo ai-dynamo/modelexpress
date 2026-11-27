@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .. import p2p_pb2
-from ..topology import blocks_selection, resolve_policy
+from ..topology import (
+    adaptive_enabled,
+    blocks_selection,
+    resolve_policy,
+    validate_topology_config,
+)
 from .artifact_transfer import (
     ArtifactBundle,
     ArtifactTransfer,
@@ -105,6 +110,9 @@ class NixlArtifactTransport(ArtifactTransport):
         identity: p2p_pb2.SourceIdentity,
         context: ArtifactTransportContext,
     ) -> StagedArtifact:
+        validate_topology_config()
+        if adaptive_enabled():
+            raise ArtifactCacheMiss("adaptive artifact fetching is not yet supported")
         if self._mx_client is None or self._nixl_manager is None:
             raise ArtifactTransportUnavailable(
                 "NIXL artifact fetch requires ModelExpress client and NIXL manager"

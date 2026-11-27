@@ -161,7 +161,8 @@ class TestDisconnect:
         assert seen["agent_alive"] is True
         assert mgr._agent is None
 
-    def test_registered_memory_is_released_before_agent_is_dropped(self):
+    @pytest.mark.parametrize("fail_deregister", [False, True])
+    def test_registered_memory_is_released_before_agent_is_dropped(self, fail_deregister):
         agent = FakeAgent()
         mgr = _manager(agent=agent)
         first, second = object(), object()
@@ -172,9 +173,15 @@ class TestDisconnect:
         def spy(registered):
             seen.append((registered, mgr._agent is agent))
             real_deregister(registered)
+            if fail_deregister and registered is second:
+                raise RuntimeError("deregistration failed")
 
         agent.deregister_memory = spy
-        mgr.shutdown()
+        if fail_deregister:
+            with pytest.raises(RuntimeError, match="deregistration failed"):
+                mgr.shutdown()
+        else:
+            mgr.shutdown()
 
         assert seen == [(second, True), (first, True)]
         assert agent.deregistered == [second, first]

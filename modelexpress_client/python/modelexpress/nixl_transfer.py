@@ -19,6 +19,9 @@ import bisect
 import ipaddress
 import logging
 import os
+import threading
+from contextlib import contextmanager
+from typing import Literal
 import socket
 import time
 from collections.abc import Callable, Iterable
@@ -170,6 +173,9 @@ def _spanning_descriptors(
     return spanning
 
 
+_UCX_INIT_LOCK = threading.Lock()
+
+
 class NixlTransferManager:
     """Manage one NIXL agent, registered memory, and RDMA operations.
 
@@ -188,6 +194,8 @@ class NixlTransferManager:
         device_id: int,
         listen_port: int | None = None,
         accelerator_backend: AcceleratorBackend | None = None,
+        *,
+        ucx_mode: Literal["auto", "tcp"] = "auto",
     ):
         self._agent_name = agent_name
         self._device_id = device_id
@@ -196,6 +204,11 @@ class NixlTransferManager:
 
         self._backend = _resolve_nixl_backend()
         self._backends = [self._backend]
+        if ucx_mode not in ("auto", "tcp"):
+            raise ValueError(f"Unknown UCX mode: {ucx_mode!r}")
+        if ucx_mode == "tcp" and self._backend != "UCX":
+            raise ValueError("TCP receive contexts require the UCX backend")
+        self._ucx_mode = ucx_mode
 
         self._agent: Any = None
         self._metadata: bytes = b""
@@ -261,7 +274,40 @@ class NixlTransferManager:
         """Get tensor descriptors for registered tensors."""
         return self._tensor_descriptors
 
+    @property
+    def ucx_mode(self) -> str:
+        return self._ucx_mode
+
+    @contextmanager
+    def _ucx_environment(self):
+        keys = ("UCX_TLS", "UCX_NET_DEVICES") if self._ucx_mode == "tcp" else ("UCX_TLS",)
+        saved = {key: os.environ.get(key) for key in keys}
+        try:
+            if self._ucx_mode == "tcp":
+                os.environ["UCX_TLS"] = "tcp,cuda_copy"
+                os.environ["UCX_NET_DEVICES"] = "all"
+            else:
+                if envs.NIXL_UCX_TLS:
+                    os.environ["UCX_TLS"] = envs.NIXL_UCX_TLS
+                elif saved["UCX_TLS"] == "tcp":
+                    os.environ.pop("UCX_TLS", None)
+                ucx_utils.apply_nic_pin_for_device(self._device_id)
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def initialize(self) -> None:
+        """Create this agent without exposing temporary UCX settings to other MX creators."""
+        with _UCX_INIT_LOCK:
+            if self._agent is None:
+                with self._ucx_environment():
+                    self._initialize()
+
+    def _initialize(self) -> None:
         """Initialize the NIXL agent.
 
         Temporarily overrides UCX_TLS to allow NIXL's UCX context to
@@ -290,24 +336,6 @@ class NixlTransferManager:
 
         self._accelerator_backend.set_device(self._device_id)
 
-        # Let UCX auto-detect transports (RoCE, TCP, etc).
-        # OMPI_MCA_pml=ob1 keeps MPI on TCP independently.
-        # Only override UCX_TLS if explicitly set to "tcp" (legacy compat).
-        saved_ucx_tls = envs.UCX_TLS
-        nixl_ucx_tls = envs.NIXL_UCX_TLS
-        if nixl_ucx_tls:
-            os.environ["UCX_TLS"] = nixl_ucx_tls
-            logger.info(f"NIXL UCX_TLS override: {nixl_ucx_tls} (was: {saved_ucx_tls})")
-        elif saved_ucx_tls == "tcp":
-            os.environ.pop("UCX_TLS", None)
-            logger.info("NIXL: removed UCX_TLS=tcp for auto-detection")
-
-        # Optional per-rank NIC pinning, set permanently for the worker's
-        # lifetime so any subsequently-created UCP contexts also pin.
-        # No-op unless MX_RDMA_NIC_PIN is set. See ucx_utils for full env
-        # semantics and the topology probe.
-        ucx_utils.apply_nic_pin_for_device(self._device_id)
-
         # Opt-in UCX_MEM_EVENTS=n (MX_UCX_DISABLE_MEM_EVENTS): off by
         # default. This is process-wide, not scoped to this agent - UCX's
         # mem-hook / VM-unmap tracking backs registration-cache
@@ -331,29 +359,23 @@ class NixlTransferManager:
                 "invalidation)"
             )
 
-        try:
-            if self._listen_port is not None and nixl_agent_config:
-                config = nixl_agent_config(
-                    backends=self._backends,
-                    enable_listen_thread=True,
-                    listen_port=self._listen_port,
-                )
-                logger.info(f"NIXL listen thread enabled on port {self._listen_port}")
-            elif nixl_agent_config:
-                config = nixl_agent_config(backends=self._backends)
-            else:
-                config = None
-            self._agent = NixlAgent(self._agent_name, config)
-            self._register_atexit()
-            logger.info(
-                f"NIXL agent '{self._agent_name}' created on device "
-                f"{self._device_id} (backend={self._backend})"
+        if self._listen_port is not None and nixl_agent_config:
+            config = nixl_agent_config(
+                backends=self._backends,
+                enable_listen_thread=True,
+                listen_port=self._listen_port,
             )
-        finally:
-            if saved_ucx_tls is not None:
-                os.environ["UCX_TLS"] = saved_ucx_tls
-            elif envs.is_set("UCX_TLS"):
-                os.environ.pop("UCX_TLS")
+            logger.info(f"NIXL listen thread enabled on port {self._listen_port}")
+        elif nixl_agent_config:
+            config = nixl_agent_config(backends=self._backends)
+        else:
+            config = None
+        self._agent = NixlAgent(self._agent_name, config)
+        self._register_atexit()
+        logger.info(
+            f"NIXL agent '{self._agent_name}' created on device "
+            f"{self._device_id} (backend={self._backend})"
+        )
 
     def _register_atexit(self) -> None:
         """Register manager-owned process teardown once."""
@@ -824,6 +846,9 @@ class NixlTransferManager:
         """
         if self._agent is None:
             raise RuntimeError("NIXL agent not initialized")
+
+        if self._ucx_mode == "tcp":
+            return self.register_tensors(tensors, force_per_tensor=True)
 
         tensor_descriptors = self._build_tensor_descriptors(tensors)
 
@@ -1740,16 +1765,19 @@ class NixlTransferManager:
         return self._data_plane_error
 
     def shutdown(self) -> None:
-        """Disconnect remote agents before releasing local NIXL resources."""
+        """Disconnect and release local resources, propagating deregistration failures."""
         if self._atexit_registered:
             atexit.unregister(self.shutdown)
             self._atexit_registered = False
         disconnected = self.disconnect_remote_agents()
+        deregistration_error = None
         if self._agent is not None:
             for registered in reversed(self._registered_memory):
                 try:
                     self._agent.deregister_memory(registered)
-                except Exception:
+                except Exception as error:
+                    if deregistration_error is None:
+                        deregistration_error = error
                     logger.warning(
                         "Failed to deregister NIXL memory during shutdown",
                         exc_info=True,
@@ -1762,6 +1790,8 @@ class NixlTransferManager:
         self._tensor_descriptors = []
         self._tensors = {}
         self._remote_agents = {}
+        if deregistration_error is not None:
+            raise deregistration_error
         logger.info(
             "NixlTransferManager shutdown complete (%d remote agent(s) disconnected)",
             disconnected,
