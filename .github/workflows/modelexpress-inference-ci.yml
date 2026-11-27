@@ -7,9 +7,12 @@ on:
   workflow_call:
     inputs:
       runs_on:
-        description: Runner for control jobs; GPU jobs retain their dedicated runners.
+        description: Runner for control jobs; GPU jobs use their configured pools.
         type: string
         default: ''
+
+permissions:
+  contents: read
 
 env:
   MX_CI_MODEL: Qwen/Qwen3.5-0.8B
@@ -394,11 +397,21 @@ jobs:
   # ---------------------------------------------------------------------------
   model-streamer-vllm:
     name: Model Streamer ${{ matrix.mode }} test (vllm, S3)
-    runs-on: prod-modelexpress-tester-amd-gpu-v1
+    runs-on:
+      group: ai-dynamo-gpu
+      labels: ai-dynamo-gpu-1-amd64-v1
+    container:
+      image: nvcr.io/0980761089281446/mx-worker-vllm:${{ github.sha }}
+      credentials:
+        username: $oauthtoken
+        password: ${{ secrets.NGC_API_KEY }}
+      env:
+        HF_HOME: /scratch/huggingface
     timeout-minutes: 30
     needs: [build-client-vllm]
     permissions:
       contents: read
+      id-token: write
     env:
       FRAMEWORK: vllm
     strategy:
@@ -410,42 +423,46 @@ jobs:
           - mode: fallback
             test_model_streamer_fallback: 'true'
     steps: &streamer-steps
-      - name: Scope docker credentials to this job
-        run: |
-          echo "DOCKER_CONFIG=${RUNNER_TEMP}/docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-streamer-${{ env.FRAMEWORK }}-${{ strategy.job-index }}" >> "$GITHUB_ENV"
-
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - name: Log in to image registry
-        run: |
-          echo "${{ secrets.NGC_API_KEY }}" | \
-            docker login nvcr.io -u '$oauthtoken' --password-stdin
+      - name: Authenticate to ModelExpress S3 cache
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: arn:aws:iam::210086341041:role/modelexpress-ci-s3
+          aws-region: ${{ env.MX_CI_S3_REGION }}
+          role-session-name: mx-${{ env.FRAMEWORK }}-${{ github.run_id }}-${{ strategy.job-index }}
+          unset-current-credentials: true
 
       - name: Run model streamer test
-        uses: ./.github/actions/run-mx-streamer-test
-        with:
-          framework: ${{ env.FRAMEWORK }}
-          worker_image: ${{ env.MX_IMAGE_REPO }}/mx-worker-${{ env.FRAMEWORK }}:${{ github.sha }}
-          model: ${{ env.MX_CI_MODEL }}
-          s3_bucket: ${{ env.MX_CI_S3_BUCKET }}
-          s3_region: ${{ env.MX_CI_S3_REGION }}
-          hf_token: ${{ secrets.HF_TOKEN }}
-          test_model_streamer_fallback: ${{ matrix.test_model_streamer_fallback }}
-
-      - name: Cleanup credentials
-        if: always()
-        run: rm -f "${DOCKER_CONFIG:-/nonexistent}/config.json"
+        shell: bash
+        env:
+          MODEL: ${{ env.MX_CI_MODEL }}
+          S3_BUCKET: ${{ env.MX_CI_S3_BUCKET }}
+          S3_REGION: ${{ env.MX_CI_S3_REGION }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TEST_MODEL_STREAMER_FALLBACK: ${{ matrix.test_model_streamer_fallback }}
+        run: bash .github/scripts/run-mx-streamer-test.sh
 
   model-streamer-sglang:
     name: Model Streamer ${{ matrix.mode }} test (sglang, S3)
-    runs-on: prod-modelexpress-tester-amd-gpu-v1
+    runs-on:
+      group: ai-dynamo-gpu
+      labels: ai-dynamo-gpu-1-amd64-v1
+    container:
+      image: nvcr.io/0980761089281446/mx-worker-sglang:${{ github.sha }}
+      credentials:
+        username: $oauthtoken
+        password: ${{ secrets.NGC_API_KEY }}
+      env:
+        HF_HOME: /scratch/huggingface
     timeout-minutes: 30
     needs: [build-client-sglang]
     permissions:
       contents: read
+      id-token: write
     env:
       FRAMEWORK: sglang
     strategy:
