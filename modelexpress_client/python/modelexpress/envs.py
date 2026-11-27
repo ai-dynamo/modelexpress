@@ -88,7 +88,7 @@ if TYPE_CHECKING:
     MX_RDMA_NIC_PIN: str
     MX_RDMA_NIC_PIN_MIN_RATE_GBPS: Optional[str]
     # GPUDirect Storage
-    MX_GDS_MAX_CHUNK_KB: Optional[str]
+    MX_GDS_MAX_CHUNK_KB: int
     MX_GDS_THREADS: int
     MX_GDS_TIMEOUT: float
     # Model streamer
@@ -222,6 +222,20 @@ def _env_positive_float(name: str, default: float) -> float:
     return value
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    """As :func:`_env_int`, for a size or count that has to be at least 1."""
+    value = _env_int(name, default)
+    if value <= 0:
+        logger.warning(
+            "Invalid %s=%r; must be a positive integer, using default %d",
+            name,
+            os.environ.get(name),
+            default,
+        )
+        return default
+    return value
+
+
 def _cold_start_wait_timeout() -> float:
     name = "MX_P2P_COLD_START_WAIT_TIMEOUT_SECS"
     default = 600.0
@@ -336,9 +350,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MX_RDMA_NIC_PIN_MIN_RATE_GBPS"
     ),
     # ── GPUDirect Storage ──────────────────────────────────────────────────
-    "MX_GDS_MAX_CHUNK_KB": lambda: os.environ.get("MX_GDS_MAX_CHUNK_KB"),
-    "MX_GDS_THREADS": lambda: _env_int("MX_GDS_THREADS", 8),
-    "MX_GDS_TIMEOUT": lambda: _env_float("MX_GDS_TIMEOUT", 120.0),
+    "MX_GDS_MAX_CHUNK_KB": lambda: _env_positive_int("MX_GDS_MAX_CHUNK_KB", 131072),
+    "MX_GDS_THREADS": lambda: _env_positive_int("MX_GDS_THREADS", 8),
+    "MX_GDS_TIMEOUT": lambda: _env_positive_float("MX_GDS_TIMEOUT", 120.0),
     # ── Model streamer ─────────────────────────────────────────────────────
     "MX_MS_DISTRIBUTED": lambda: (
         os.environ.get("MX_MS_DISTRIBUTED", "1").lower() in ("1", "true")

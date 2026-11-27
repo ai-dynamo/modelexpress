@@ -116,6 +116,40 @@ class TestGdsTransferManager:
             with pytest.raises(RuntimeError, match="not initialized"):
                 mgr.batch_load_file(0, 100, [], torch.device("cpu"))
 
+    @pytest.mark.parametrize(
+        ("value", "expected"), [(None, 128 * 1024 * 1024), ("1", 1024)]
+    )
+    def test_max_chunk_size_from_env(self, monkeypatch, value, expected):
+        from modelexpress.gds_transfer import GdsTransferManager
+
+        if value is None:
+            monkeypatch.delenv("MX_GDS_MAX_CHUNK_KB", raising=False)
+        else:
+            monkeypatch.setenv("MX_GDS_MAX_CHUNK_KB", value)
+        mgr = GdsTransferManager(
+            agent_name="test", accelerator_backend=CudaAcceleratorBackend()
+        )
+        assert mgr._max_chunk_size == expected
+
+    @pytest.mark.parametrize("value", ["0", "-4", "128k"])
+    def test_invalid_max_chunk_falls_back_to_default(self, monkeypatch, value):
+        from modelexpress.gds_transfer import GdsTransferManager
+
+        monkeypatch.setenv("MX_GDS_MAX_CHUNK_KB", value)
+        mgr = GdsTransferManager(
+            agent_name="test", accelerator_backend=CudaAcceleratorBackend()
+        )
+        mgr._agent = MagicMock()
+        mgr._device_id = 0
+        mgr._agent.check_xfer_state.return_value = "DONE"
+
+        bufs = mgr.batch_load_file(3, 4096, [(0, 1024)], torch.device("cpu"))
+
+        assert mgr._max_chunk_size == 128 * 1024 * 1024
+        assert [b.numel() for b in bufs] == [1024]
+        file_regions = mgr._agent.register_memory.call_args_list[0].args[0]
+        assert file_regions == [(0, 1024, 3, "")]
+
 
 # ---------------------------------------------------------------------------
 # Safetensors header parsing
