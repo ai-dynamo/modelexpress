@@ -100,13 +100,11 @@ def test_nextn_draft_matches_sglang_prefix_and_unconditional_skips():
     assert not selector.covers("model.layers.61.shared_head.head.weight", "draft")
 
 
-def test_deepseek_v4_dspark_draft_pairs_with_main_and_reads_three_stages():
+@pytest.mark.parametrize("nested", [False, True])
+def test_deepseek_v4_dspark_draft_pairs_with_main_and_reads_three_stages(nested):
+    config = SimpleNamespace(num_hidden_layers=40, num_nextn_predict_layers=3)
     model = SimpleNamespace(
-        config=SimpleNamespace(
-            num_hidden_layers=43,
-            num_nextn_predict_layers=1,
-            dspark_target_layer_ids=[40, 41, 42],
-        )
+        config=SimpleNamespace(text_config=config) if nested else config
     )
     main = draft_weight_adapter_for("DeepseekV4ForCausalLM", role="main", model=model)
     draft = draft_weight_adapter_for(
@@ -122,9 +120,45 @@ def test_deepseek_v4_dspark_draft_pairs_with_main_and_reads_three_stages():
     assert not draft.covers("layers.0.ffn.experts.0.w1.weight", "draft")
 
 
+@pytest.mark.parametrize("stages", [None, True, False, 0, -1, "3", 3.0])
+@pytest.mark.parametrize("role", ["main", "draft"])
+def test_deepseek_v4_rejects_invalid_stage_counts(stages, role):
+    model = SimpleNamespace(
+        config=SimpleNamespace(num_hidden_layers=40, num_nextn_predict_layers=stages)
+    )
+    class_name = (
+        "DeepseekV4ForCausalLM" if role == "main" else "DeepseekV4ForCausalLMDSpark"
+    )
+    assert draft_weight_adapter_for(class_name, role=role, model=model) is None
+
+
+def test_deepseek_v4_dspark_stage_counts_must_match_and_scope_namespace():
+    identity = p2p_pb2.SourceIdentity(model_name="org/deepseek", revision="rev-a")
+    pairs = []
+    namespaces = []
+    for stages in (1, 3):
+        model = SimpleNamespace(
+            config=SimpleNamespace(num_hidden_layers=40, num_nextn_predict_layers=stages)
+        )
+        main = draft_weight_adapter_for("DeepseekV4ForCausalLM", role="main", model=model)
+        draft = draft_weight_adapter_for(
+            "DeepseekV4ForCausalLMDSpark", role="draft", model=model
+        )
+        assert main is not None and draft is not None
+        assert draft.compatible_main(main)
+        pairs.append((main, draft))
+        namespaces.append(draft_tensor_namespace(
+            identity, main, draft, "DeepseekV4ForCausalLMDSpark", "0.5.21", "model"
+        ))
+    assert not pairs[0][1].compatible_main(pairs[1][0])
+    assert not pairs[1][1].compatible_main(pairs[0][0])
+    assert namespaces[0] is not None and namespaces[1] is not None
+    assert namespaces[0] != namespaces[1]
+
+
 def test_deepseek_v4_dspark_draft_publishes_own_tensors_without_eagle_shared_hook():
     model = SimpleNamespace(
-        config=SimpleNamespace(num_hidden_layers=43, num_nextn_predict_layers=1),
+        config=SimpleNamespace(num_hidden_layers=40, num_nextn_predict_layers=3),
         embed_tokens=None,
         lm_head=None,
     )
@@ -361,7 +395,7 @@ def test_nextn_rejects_missing_or_unsupported_checkpoint_layout():
         is None
     )
     assert (
-        draft_weight_adapter_for("DeepseekV4ForCausalLM", role="main", model=multiple)
+        draft_weight_adapter_for("DeepseekV4ForCausalLMNextN", role="draft", model=multiple)
         is None
     )
 

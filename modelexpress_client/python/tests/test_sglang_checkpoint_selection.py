@@ -135,9 +135,9 @@ def test_deepseek_v4_dspark_selects_only_its_three_draft_shards(tmp_path):
     )]
     model = SimpleNamespace(
         config=SimpleNamespace(
-            num_hidden_layers=43,
-            num_nextn_predict_layers=1,
-            dspark_target_layer_ids=[40, 41, 42],
+            num_hidden_layers=40,
+            num_nextn_predict_layers=3,
+            dspark_target_layer_ids=[37, 38, 39],
         )
     )
     main = draft_weight_adapter_for("DeepseekV4ForCausalLM", role="main", model=model)
