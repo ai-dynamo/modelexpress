@@ -11,6 +11,7 @@ from torch import nn
 
 from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress.load_strategy.context import LoadResult
+from modelexpress import tensor_utils
 from modelexpress.tensor_utils import collect_module_tensors
 
 
@@ -154,3 +155,39 @@ def test_empty_local_tensor_does_not_hide_empty_weights(mock_accelerator_backend
     model.weight = nn.Parameter(torch.empty(0))
     catalog = collect_module_tensors(model, backend, preserve_local=[torch.empty(0)])
     assert list(catalog) == ["weight"]
+
+
+@pytest.mark.parametrize(
+    "backend_name",
+    ["FLASHINFER_MLA_SPARSE", "FLASHINFER_MLA_SPARSE_SM120"],
+)
+@pytest.mark.parametrize("registered", [False, True])
+def test_sparse_mla_restore_keeps_runtime_buffers_local(
+    backend_name, registered, mock_accelerator_backend_cls
+):
+    """Cold and restored catalogs match while target scratch stays intact."""
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    source, _ = _model(backend_name=backend_name, registered=registered)
+    target, _ = _model(backend_name=backend_name, registered=registered)
+    for model in (source, target):
+        del model.impl._multi_ctas_kv_counter_buffer
+        topk = torch.arange(16, dtype=torch.int32)
+        model.impl.topk_indices_buffer = topk
+        model.indexer = nn.Module()
+        model.indexer.topk_indices_buffer = topk
+    workspace = torch.full((32,), 7, dtype=torch.uint8)
+    target.impl._workspace_buffer = workspace
+    target.register_buffer("workspace_alias", workspace[4:8])
+    target.register_buffer("topk_alias", target.impl.topk_indices_buffer)
+    tensor_utils.adopt_bare_tensors(target, backend)
+    source_catalog = _discover(source, backend)
+    target_catalog = _discover(target, backend)
+    assert source_catalog.keys() == target_catalog.keys()
+    assert len(source_catalog) == 2
+    assert "weight" in target_catalog
+    assert any("scale_recip" in name for name in target_catalog)
+    with torch.no_grad():
+        for tensor in target_catalog.values():
+            tensor.fill_(9)
+    assert torch.equal(workspace, torch.full((32,), 7, dtype=torch.uint8))
+    assert torch.equal(target.impl.topk_indices_buffer, torch.arange(16, dtype=torch.int32))

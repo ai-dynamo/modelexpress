@@ -85,12 +85,22 @@ def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
     for module in model.modules():
         backend = getattr(module, "attn_backend", None)
         get_name = getattr(backend, "get_name", None)
-        if not callable(get_name) or get_name() != "FLASHINFER_MLA":
+        if not callable(get_name):
             continue
+        fields = {
+            "FLASHINFER_MLA": ("_multi_ctas_kv_counter_buffer",),
+            "FLASHINFER_MLA_SPARSE": (
+                "topk_indices_buffer", "_workspace_buffer",
+            ),
+            "FLASHINFER_MLA_SPARSE_SM120": (
+                "topk_indices_buffer", "_workspace_buffer",
+            ),
+        }.get(get_name(), ())
         impl = getattr(module, "impl", None)
-        counter = getattr(impl, "_multi_ctas_kv_counter_buffer", None)
-        if isinstance(counter, torch.Tensor):
-            tensors.append(counter)
+        for name in fields:
+            tensor = getattr(impl, name, None)
+            if isinstance(tensor, torch.Tensor):
+                tensors.append(tensor)
     return tensors
 
 
