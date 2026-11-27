@@ -10,6 +10,7 @@ from .client import (
     WeightSource,
 )
 from .engines.sglang import SglangGeneratorContext
+from .plan import RefitSourceUnavailable
 from .engines.vllm import VllmGeneratorContext
 from .receiver import ObjectStorageGeneratorConfig
 
@@ -17,6 +18,7 @@ __all__ = [
     "ModelExpressGeneratorClient",
     "ModelExpressGeneratorConfig",
     "ObjectStorageGeneratorConfig",
+    "RefitSourceUnavailable",
     "SglangGeneratorContext",
     "StagedWeightHandle",
     "VllmGeneratorContext",
