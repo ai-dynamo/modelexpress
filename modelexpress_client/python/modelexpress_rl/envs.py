@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     MX_REFIT_CHECKPOINT_MAX_SIZE_GB: int
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
+    MX_REFIT_CHECKPOINT_SOURCE_REPLAY: bool
     MX_REFIT_DELTA_SURGICAL: bool
     MX_REFIT_DEBUG_VALIDATE_PLAN: bool
     MX_REFIT_DEBUG_VALIDATE_GENERATOR_LAYOUT: bool
@@ -270,6 +271,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "MX_S3_TCP_KEEPALIVE",
     ),
     # Install a delta by reloading only the modules it changes.
+    "MX_REFIT_CHECKPOINT_SOURCE_REPLAY": lambda: parse_bool(
+        os.environ.get("MX_REFIT_CHECKPOINT_SOURCE_REPLAY", "false"),
+        "MX_REFIT_CHECKPOINT_SOURCE_REPLAY",
+    ),
     "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
         os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
         "MX_REFIT_DELTA_SURGICAL",
