@@ -157,14 +157,40 @@ class PublisherThread:
             f"publish_timeout={self._publish_timeout}s)"
         )
 
-    def stop(self) -> None:
-        """Signal the publisher thread to stop, mark STALE, and clean up."""
+    def quiesce(self, *, strict: bool = False) -> None:
+        """Stop publication callbacks without running source cleanup."""
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=self._interval + 5)
-        self._mark_stale()
+            if strict and self._thread.is_alive():
+                raise RuntimeError("Source publisher failed to stop")
+
+    def stop(self, *, strict: bool = False) -> None:
+        """Signal the publisher thread to stop, mark STALE, and clean up."""
+        self.quiesce(strict=strict)
+        self._mark_stale(strict=strict)
         self._cleanup()
+        if strict:
+            atexit.unregister(self._on_exit)
+            self._nixl_manager = None
+            self._publish_fn = None
+            self._ready_fn = None
+            self._source_load_provider = None
         logger.info(f"[Worker {self._worker_rank}] Publisher thread stopped")
+
+    def force_cleanup(self) -> None:
+        """Run ``cleanup_fn(force=True)`` once after the thread has stopped.
+
+        ``stop()`` runs the cleanup best-effort, and a cleanup may keep
+        resources it owns, such as the lease of a successful artifact publish.
+        An owner withdrawing the publication calls this to release them. Only
+        use it with a ``cleanup_fn`` that accepts ``force``.
+        """
+        cleanup_fn = self._cleanup_fn
+        if cleanup_fn is None:
+            return
+        cleanup_fn(force=True)
+        self._cleanup_fn = None
 
     def _on_exit(self) -> None:
         """Stop the publisher before marking it STALE."""
@@ -174,24 +200,26 @@ class PublisherThread:
         self._mark_stale()
         self._cleanup()
 
-    def _mark_stale(self) -> None:
-        """Best-effort UpdateStatus(STALE). Swallows all errors."""
+    def _mark_stale(self, *, strict: bool = False) -> None:
+        """Keep a rejected STALE update retryable; ordinary stops are best-effort."""
         with self._status_lock:
             if not self._started:
                 return
             try:
                 from .. import p2p_pb2
-                if self._update_status(p2p_pb2.SOURCE_STATUS_STALE):
-                    logger.info(
-                        f"[Worker {self._worker_rank}] Marked STALE on shutdown"
-                    )
+                if not self._update_status(p2p_pb2.SOURCE_STATUS_STALE):
+                    raise RuntimeError("Coordinator rejected STALE update")
+                logger.info(
+                    f"[Worker {self._worker_rank}] Marked STALE on shutdown"
+                )
                 self._started = False
             except Exception:
+                if strict:
+                    raise
                 logger.debug(
                     f"[Worker {self._worker_rank}] Failed to mark STALE on shutdown",
                     exc_info=True,
                 )
-                self._started = False
 
     def _mark_unhealthy(self) -> None:
         """Best-effort UpdateStatus(STALE) for a worker whose data plane is down.

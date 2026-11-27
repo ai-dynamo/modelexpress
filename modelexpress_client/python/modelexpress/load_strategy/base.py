@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch.nn as nn
 
 from .. import envs
-from ..adapter import EngineAdapter, StrategyFailed
+from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary, undiscovered_parameters
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
@@ -224,7 +224,16 @@ def _init_nixl_manager(
         listen_port=listen_port,
         accelerator_backend=accelerator_backend,
     )
-    manager.initialize()
+    try:
+        manager.initialize()
+    except Exception:
+        try:
+            manager.shutdown()
+        except Exception as cleanup_error:
+            raise StrategyRecoveryError(
+                f"Failed to shut down partially initialized NIXL manager: {cleanup_error}"
+            ) from cleanup_error
+        raise
     logger.debug(f"[Worker {global_rank}] NIXL manager initialized")
     return manager
 
@@ -492,7 +501,7 @@ def publish_source_if_supported(result: LoadResult, ctx: LoadContext) -> None:
     publish_metadata(ctx)
 
 
-def unpublish_metadata(ctx: LoadContext) -> None:
+def unpublish_metadata(ctx: LoadContext, *, strict: bool = False) -> None:
     """Stop heartbeat, stop worker gRPC server, and mark STALE on MX server.
 
     Call before memory becomes invalid (e.g., VMM unmap during sleep).
@@ -503,6 +512,7 @@ def unpublish_metadata(ctx: LoadContext) -> None:
     unpublish_metadata_for_worker(
         worker_rank=ctx.worker_rank,
         device_id=ctx.device_id,
+        **({"strict": True} if strict else {}),
     )
 
 
@@ -521,13 +531,29 @@ def drain_tensor_readers(ctx: LoadContext, *, timeout: float) -> None:
         )
 
 
-def unpublish_metadata_for_worker(*, worker_rank: int, device_id: int) -> None:
+def unpublish_metadata_for_worker(
+    *, worker_rank: int, device_id: int, strict: bool = False,
+) -> None:
     """Stop one worker's publication without requiring a boot-load context."""
     from ..metadata.publish import (
         _central_manifests,
         _heartbeat_threads,
         _worker_servers,
     )
+
+    if strict:
+        hb = _heartbeat_threads.get(worker_rank)
+        if hb is not None:
+            hb.quiesce(strict=True)
+        ws = _worker_servers.get(device_id)
+        if ws is not None:
+            ws.stop(strict=True)
+            _worker_servers.pop(device_id, None)
+        if hb is not None:
+            hb.stop(strict=True)
+            _heartbeat_threads.pop(worker_rank, None)
+        _central_manifests.pop(device_id, None)
+        return
 
     _central_manifests.pop(device_id, None)
     hb = _heartbeat_threads.pop(worker_rank, None)

@@ -753,22 +753,30 @@ class NixlArtifactChunkManager:
         self._release_slot(lease.slot_index)
         return lease.artifact_id, lease.chunk
 
-    def close(self) -> None:
+    def close(self, *, retain_buffers: bool = False, strict: bool = False) -> None:
+        """Keep failed registrations owned so a later close can retry them."""
         with self._lock:
-            slots = self._slots
-            self._slots = []
+            slots = list(self._slots)
             self._free_slots = []
             self._leases = {}
+        cleanup_error = None
         for slot in slots:
             if slot.registered is None:
                 continue
             try:
                 self._nixl_manager.deregister_memory(slot.registered)
-            except Exception:
+                slot.registered = None
+            except Exception as error:
+                cleanup_error = error
                 logger.warning(
                     "Failed to deregister source artifact buffer",
                     exc_info=True,
                 )
+        if not retain_buffers:
+            with self._lock:
+                self._slots = [slot for slot in self._slots if slot.registered is not None]
+        if strict and cleanup_error is not None:
+            raise cleanup_error
 
     def _reserve_slot(self, buffer_size: int) -> int:
         with self._lock:

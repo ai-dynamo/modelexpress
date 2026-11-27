@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -27,6 +28,7 @@ from ...metadata.artifact_transfer import (
     torch_compile_cache_artifact_transfer,
 )
 from ...metadata.artifact_transport import PublicationHandle
+from ...metadata.nixl_artifact_transport import NixlPublicationHandle
 from ...metadata.publisher import PublisherThread
 from .source_identity import _vllm_version
 
@@ -246,6 +248,44 @@ def schedule_vllm_cache_artifact_publish(ctx: LoadContext) -> None:
         scheduled_publishers=_scheduled_publishers,
         log=logger,
     )
+
+
+@contextmanager
+def pause_vllm_cache_artifact_publish(ctx: LoadContext):
+    """Retain source buffers until the caller has shut down the shared agent."""
+    for key, publisher in list(_scheduled_publishers.items()):
+        if key[0] != ctx.device_id:
+            continue
+        publisher.stop(strict=True)
+    for key, handle in list(_published_sources.items()):
+        if key[0] != ctx.device_id:
+            continue
+        if isinstance(handle, NixlPublicationHandle):
+            handle.source.heartbeat.stop(strict=True)
+    # No try/finally: if stopping the publication or the shared agent fails,
+    # the agent may still reference these buffers, so the buffers, handles and
+    # leases stay registered here until a retried stop succeeds.
+    yield
+    for key, handle in list(_published_sources.items()):
+        if key[0] == ctx.device_id:
+            if isinstance(handle, NixlPublicationHandle):
+                handle.source.artifact_chunk_manager.close()
+            _published_sources.pop(key, None)
+    for key, publisher in list(_scheduled_publishers.items()):
+        if key[0] == ctx.device_id:
+            publisher.force_cleanup()
+            _scheduled_publishers.pop(key, None)
+
+
+def release_vllm_cache_artifact_buffers(device_id: int) -> None:
+    """Drop registration handles while retaining buffers for agent teardown."""
+    for key, handle in _published_sources.items():
+        if key[0] != device_id:
+            continue
+        if isinstance(handle, NixlPublicationHandle):
+            handle.source.artifact_chunk_manager.close(retain_buffers=True, strict=True)
+        else:
+            handle.stop()
 
 
 def _install_vllm_cache_artifact_once(

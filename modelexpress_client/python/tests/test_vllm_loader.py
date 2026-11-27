@@ -1571,10 +1571,12 @@ class TestMtpDrafterSecondLoad:
         assert ctx.nixl_manager is None
         shared.shutdown.assert_not_called()
 
-    def test_draft_publish_extends_main_publication(self):
+    @pytest.mark.parametrize("is_reload", [False, True])
+    def test_draft_publish_extends_main_publication(self, is_reload):
         from modelexpress.load_strategy.base import publish_metadata
 
         ctx = self._draft_ctx(self._populated_manager(), device_id=2, worker_rank=5)
+        ctx.is_reload = is_reload
         ctx.nixl_manager = ctx.shared_nixl_manager
         ctx.tensors = {"mx_draft::w": MagicMock()}
         with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "localhost:8001"}), patch(
