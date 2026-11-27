@@ -7,6 +7,8 @@
 
 set -e
 
+CHART_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -164,10 +166,10 @@ deploy_chart() {
 
     if [ "$UPGRADE" = true ]; then
         print_status "Upgrading release: $RELEASE_NAME"
-        helm upgrade "${helm_args[@]}" "$RELEASE_NAME" .
+        helm upgrade "${helm_args[@]}" "$RELEASE_NAME" "$CHART_DIR"
     else
         print_status "Installing release: $RELEASE_NAME"
-        helm install "${helm_args[@]}" "$RELEASE_NAME" .
+        helm install "${helm_args[@]}" "$RELEASE_NAME" "$CHART_DIR"
     fi
 
     print_success "Deployment completed successfully"
