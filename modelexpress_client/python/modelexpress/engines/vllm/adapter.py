@@ -80,9 +80,21 @@ def cold_start_expected_workers(vllm_config) -> int:
     return expected
 
 def _local_runtime_tensors(model: torch.nn.Module) -> list[torch.Tensor]:
-    """Identify local state through the attention layer's declared backend."""
+    """Identify local attention and collective state by engine type."""
     tensors = []
     for module in model.modules():
+        local_fields = {
+            ("vllm.models.kimi_k3.nvidia.latent_moe_runner",
+             "LatentMoERunner"): "_zero_residual",
+            ("vllm.model_executor.models.kimi_k25_vit",
+             "Rope2DPosEmbRepeated"): "freqs_cis",
+        }
+        for cls in type(module).__mro__:
+            name = local_fields.get((cls.__module__, cls.__name__))
+            if name is not None:
+                tensor = getattr(module, name, None)
+                if isinstance(tensor, torch.Tensor):
+                    tensors.append(tensor)
         backend = getattr(module, "attn_backend", None)
         get_name = getattr(backend, "get_name", None)
         if not callable(get_name) or get_name() != "FLASHINFER_MLA":
@@ -499,10 +511,13 @@ class VllmAdapter(EngineAdapter):
     @staticmethod
     def _exclude_hidden_tensor_object(obj: object) -> bool:
         """Keep K3 peer pointers, barriers, and collective workspaces local."""
-        cls = type(obj)
-        return (
-            cls.__module__ == "vllm.models.kimi_k3.nvidia.ops.latent_moe_tail"
-            and cls.__name__ == "KimiK3LatentMoETailOp"
+        return any(
+            (cls.__module__, cls.__name__) in {
+                ("vllm.models.kimi_k3.nvidia.ops.latent_moe_tail",
+                 "KimiK3LatentMoETailOp"),
+                ("vllm.v1.attention.ops.cp_common", "DirectCPWorkspace"),
+            }
+            for cls in type(obj).__mro__
         )
 
     def discovers_host_parameters(self) -> bool:

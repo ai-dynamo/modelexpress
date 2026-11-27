@@ -9,6 +9,8 @@ import pytest
 import torch
 from torch import nn
 
+import modelexpress.tensor_utils as tensor_utils
+
 from modelexpress.engines.vllm.adapter import VllmAdapter
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.tensor_utils import collect_module_tensors
@@ -154,3 +156,145 @@ def test_empty_local_tensor_does_not_hide_empty_weights(mock_accelerator_backend
     model.weight = nn.Parameter(torch.empty(0))
     catalog = collect_module_tensors(model, backend, preserve_local=[torch.empty(0)])
     assert list(catalog) == ["weight"]
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+@pytest.mark.parametrize("registered", [False, True])
+def test_kimi_zero_residual_stays_local(
+    subclass: bool, registered: bool, mock_accelerator_backend_cls: type
+) -> None:
+    """Match cold and warmed catalogs without transferring the zero residual.
+
+    Args:
+        subclass: Whether the runner is an application subclass.
+        registered: Whether the scratch tensor has already been adopted.
+        mock_accelerator_backend_cls: CPU accelerator fixture.
+    """
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    cls = type("LatentMoERunner", (torch.nn.Module,), {
+        "__module__": "vllm.models.kimi_k3.nvidia.latent_moe_runner",
+    })
+    if subclass:
+        cls = type("ApplicationRunner", (cls,), {"__module__": "application"})
+    source, target = cls(), cls()
+    for model in (source, target):
+        model.weight = torch.nn.Parameter(torch.ones(8))
+        model.register_buffer("scale_recip", torch.tensor([0.5]))
+    target._zero_residual = torch.zeros(32)
+    if registered:
+        tensor_utils.adopt_bare_tensors(target, backend)
+    target.register_buffer("residual_alias", target._zero_residual[4:8])
+    source_catalog = _discover(source, backend)
+    for _ in range(2):
+        target_catalog = _discover(target, backend)
+        assert source_catalog.keys() == target_catalog.keys()
+        assert set(target_catalog) == {"weight", "scale_recip"}
+        with torch.no_grad():
+            for tensor in target_catalog.values():
+                tensor.fill_(9)
+        assert torch.count_nonzero(target._zero_residual) == 0
+
+
+def test_unrelated_zero_residual_is_transferred(
+    mock_accelerator_backend_cls: type,
+) -> None:
+    """Retain a same-named buffer on unrelated modules.
+
+    Args:
+        mock_accelerator_backend_cls: CPU accelerator fixture.
+    """
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    model = torch.nn.Module()
+    model.register_buffer("_zero_residual", torch.ones(8))
+    assert "_zero_residual" in _discover(model, backend)
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+@pytest.mark.parametrize("engine_module", [
+    "vllm.model_executor.models.kimi_k25_vit", "application.vision",
+])
+def test_kimi_vision_rope_cache_stays_local(
+    subclass: bool, engine_module: str,
+    mock_accelerator_backend_cls: type,
+) -> None:
+    """Preserve the deterministic vision cache only for its engine class.
+
+    Args:
+        subclass: Whether the encoder is an application subclass.
+        engine_module: Module identifying the real or unrelated encoder.
+        mock_accelerator_backend_cls: CPU accelerator fixture.
+    """
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    cls = type("Rope2DPosEmbRepeated", (torch.nn.Module,), {
+        "__module__": engine_module,
+    })
+    if subclass:
+        cls = type("ApplicationRope", (cls,), {"__module__": "application"})
+    source, target = cls(), cls()
+    for model in (source, target):
+        model.weight = torch.nn.Parameter(torch.ones(8))
+        model.register_buffer("scale_recip", torch.tensor([0.5]))
+    cache = torch.arange(32, dtype=torch.float32).to(torch.complex64)
+    target.register_buffer("freqs_cis", cache, persistent=False)
+    target.register_buffer("cache_alias", cache[4:8], persistent=False)
+    before = cache.clone()
+    for _ in range(2):
+        catalog = _discover(target, backend)
+        if engine_module == "application.vision":
+            assert "freqs_cis" in catalog
+        else:
+            assert catalog.keys() == _discover(source, backend).keys()
+            assert set(catalog) == {"weight", "scale_recip"}
+            with torch.no_grad():
+                for tensor in catalog.values():
+                    tensor.fill_(9)
+            assert torch.equal(cache, before)
+
+
+@pytest.mark.parametrize("subclass", [False, True])
+@pytest.mark.parametrize("engine_module", [
+    "vllm.v1.attention.ops.cp_common", "application.collective",
+])
+def test_dcp_peer_mappings_stay_local(
+    subclass: bool, engine_module: str,
+    mock_accelerator_backend_cls: type,
+) -> None:
+    """Exclude DCP peer mappings, pointers and synchronization state.
+
+    Args:
+        subclass: Whether the workspace subclasses the engine base class.
+        engine_module: Module identifying the real or unrelated workspace.
+        mock_accelerator_backend_cls: CPU accelerator fixture.
+    """
+    backend = mock_accelerator_backend_cls(torch_device_type="cpu")
+    cls = type("DirectCPWorkspace", (), {"__module__": engine_module})
+    if subclass:
+        cls = type("DirectDCPA2AWorkspace", (cls,), {
+            "__module__": "vllm.v1.attention.ops.dcp",
+        })
+    workspace = cls()
+    storage = torch.arange(32, dtype=torch.int32)
+    peer_mapping = torch.zeros(32, dtype=torch.int32)
+    pointers = torch.tensor([storage.data_ptr(), peer_mapping.data_ptr()])
+    workspace._allocations = [(storage, object(), [storage, peer_mapping])]
+    workspace.peer_signal_ptrs = pointers
+    workspace.epoch = torch.zeros(1, dtype=torch.int64)
+    workspace.cutedsl_counters = torch.zeros(9, dtype=torch.int32)
+    model, _ = _model()
+    model.impl.dcp_manager = SimpleNamespace(direct_a2a=workspace)
+    for _ in range(2):
+        catalog = _discover(model, backend)
+        if engine_module == "application.collective":
+            assert any(t.data_ptr() == peer_mapping.data_ptr()
+                       for t in catalog.values())
+        else:
+            assert len(catalog) == 2
+            assert "weight" in catalog
+            assert any("scale_recip" in name for name in catalog)
+            assert all("dcp_manager" not in name for name, _ in model.named_buffers())
+            with torch.no_grad():
+                for tensor in catalog.values():
+                    tensor.fill_(9)
+            assert torch.equal(storage, torch.arange(32, dtype=torch.int32))
+            assert torch.count_nonzero(peer_mapping) == 0
+            assert pointers.tolist() == [storage.data_ptr(), peer_mapping.data_ptr()]
