@@ -15,8 +15,7 @@ class RLMxModelLoader(MxModelLoader):
         super().__init__(load_config)
 
     def _validate_load_policy(self, *, is_speculative_draft: bool = False) -> None:
-        if is_speculative_draft:
-            raise ValueError("RL initial loading does not support speculative draft models")
+        """Skip the base chain's validation; the RL chain replaces that chain."""
 
     def _run_load_strategy_chain(self, model, ctx):
         return RLLoadStrategyChain.run(model, ctx)

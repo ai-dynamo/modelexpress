@@ -31,22 +31,21 @@ def test_rl_loader_defers_download():
     default.assert_not_called()
 
 
-def test_rl_drafter_is_rejected_before_initialization():
+def test_rl_drafter_loads_through_the_shared_draft_pass():
     loader = object.__new__(RLMxModelLoader)
+    vllm_config = MagicMock()
     model_config = MagicMock(dtype=MagicMock(), runner_type="draft")
 
-    with patch(
-        "modelexpress.engines.vllm.loader.build_vllm_load_context"
-    ) as build_context, patch(
-        "modelexpress.engines.vllm.loader.initialize_model"
-    ) as initialize, pytest.raises(
-        ValueError,
-        match="RL initial loading does not support speculative draft models",
-    ):
-        loader.load_model(MagicMock(), model_config)
+    class _Stop(Exception):
+        pass
 
-    build_context.assert_not_called()
-    initialize.assert_not_called()
+    with patch(
+        "modelexpress.engines.vllm.loader.build_vllm_load_context",
+        side_effect=_Stop,
+    ) as build_context, pytest.raises(_Stop):
+        loader.load_model(vllm_config, model_config)
+
+    build_context.assert_called_once_with(vllm_config, model_config)
 
 
 def test_rl_log_emits_once_when_vllm_handler_arrives_late(monkeypatch):

@@ -13,7 +13,7 @@ RL-specific settings are registered in `modelexpress_rl/envs.py` and imported th
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and object-storage replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. vLLM speculative draft models are rejected in `RL` mode. |
+| `MX_LOAD_STRATEGY_CHAIN` | `INFERENCE` | Select the engine-neutral initial-load policy. With `RL`, a configured desired UID permits only desired-version P2P and object-storage replay; without one, loading falls back through `MX_MODEL_URI` and then the engine default. A vLLM speculative draft that loads through ModelExpress copies the desired version from a generator that publishes it alongside its target, or fails; object-storage replay holds only the target. |
 | `MX_REFIT_DESIRED_VERSION_UID` | (unset) | Exact version required when `MX_LOAD_STRATEGY_CHAIN=RL`; startup fails rather than using a version-agnostic fallback when neither P2P nor object storage can load it |
 | `MX_GENERATOR_SOURCE_ORDER` | Auto-detected | Ordered RL weight sources. Desired-version cold start defaults to `GENERATOR,OBJECT_STORAGE`; `OBJECT_STORAGE` disables P2P for both cold start and active refit. `TRAINER` applies only to active refit and is rejected for desired-version cold start. |
 | `MX_MAX_REPLAY_CHAIN_LENGTH` | `64` | Positive cold-start object-storage replay limit, including the full checkpoint root; align with the running engine's `max_replay_chain_length` when accepting longer chains |
