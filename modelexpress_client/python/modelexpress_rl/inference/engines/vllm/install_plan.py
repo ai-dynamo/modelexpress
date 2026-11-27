@@ -352,11 +352,11 @@ class _InstallExecution:
             )
         torch.Tensor.copy_(destination, value)
         if recorded.epilogue:
+            # Capture admits only an epilogue whose value ``copy_`` broadcasts
+            # to the destination, as the loader's own ``copy_`` did.
             value = run_epilogue(whole, recorded.epilogue)
-            if type(value) is not torch.Tensor or value.shape != whole.shape:
-                raise IncompleteRefit(
-                    "recorded epilogue changed its destination's shape"
-                )
+            if type(value) is not torch.Tensor:
+                raise IncompleteRefit("recorded epilogue did not produce a tensor")
             torch.Tensor.copy_(whole, value)
 
     def _begin_source_owner(self, owner):

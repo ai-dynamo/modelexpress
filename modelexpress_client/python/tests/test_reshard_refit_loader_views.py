@@ -12,6 +12,8 @@ Every recorded copy is checked against real data, both through ``plan_pull`` and
 by replaying its op-chain on the source the way ordered source replay does.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from modelexpress_rl.refit.reshard.geometry import (
@@ -270,6 +272,23 @@ def test_concatenation_rejects_a_synthesized_part():
         torch.cat([lazies["gate"], torch.zeros(_E, _I, _H)], dim=1)
 
 
+def test_concatenation_skips_an_empty_rank_one_source():
+    """``torch.cat`` skips a ``(0,)`` operand whatever the dim, as PyTorch does."""
+    source = _source((14, 1, 3))
+    with torch.device("meta"):
+        model = ConvModel()
+    weights = convert_source_weights(
+        lambda sd: {"conv": torch.cat([sd["empty"], sd["conv"]], dim=2)},
+        [("empty", F32, (0,)), ("conv", F32, (14, 1, 3))],
+    )
+    result = capture_weights(model, weights)
+
+    assert not result.unsupported and not result.unattributed
+    assert {copy.src_name for copy in result.copies} == {"conv"}
+    for dest in _reconstruct(result.copies, {"conv": source}, {"conv": source}):
+        assert torch.equal(dest["conv"], source)
+
+
 def _composed(param, loaded):
     """vLLM's ``composed_weight_loader`` as Mamba2 uses it for ``A``."""
     param.data.copy_(loaded)
@@ -308,6 +327,35 @@ def test_post_copy_transform_is_recorded_as_an_epilogue_for_source_replay(dtype)
     assert torch.equal(destination, expected)
 
 
+@pytest.mark.parametrize(
+    "reduce", [lambda param: param.sum(), lambda param: param.amax(0)]
+)
+def test_post_copy_rewrite_broadcasts_like_copy(reduce):
+    """``copy_`` broadcasts a reduction over the destination; replay must too."""
+
+    def loader(param, loaded):
+        param.data.copy_(loaded)
+        param.data.copy_(reduce(param))
+
+    with torch.device("meta"):
+        model = ConvModel()
+    model.conv.weight_loader = loader
+    result = capture_weights(
+        model, build_lazy_weights([("conv", F32, (14, 1, 3))]), source_replay=True
+    )
+
+    assert not result.unsupported
+    (copy,) = result.copies
+    assert copy.epilogue
+    source = torch.randn(14, 1, 3)
+    destination = torch.zeros(14, 1, 3)
+    destination.copy_(source)
+    destination.copy_(run_epilogue(destination, copy.epilogue))
+    expected = torch.zeros(14, 1, 3)
+    loader(expected, source)
+    assert torch.equal(destination, expected)
+
+
 def test_in_place_post_copy_scale_is_recorded_as_an_epilogue():
     """A loader that scales its destination in place after the copy."""
 
@@ -341,6 +389,9 @@ def test_in_place_post_copy_scale_is_recorded_as_an_epilogue():
         lambda param: param.data.mul_(torch.full((14, 1, 3), 2.0)),
         # A second copy lands between the read and the rewrite.
         None,
+        # An in-place view op changes only the metadata of ``param.data``; its
+        # out-of-place form is a view of another shape.
+        lambda param: param.data.squeeze_(),
     ],
 )
 def test_post_copy_rewrites_that_are_not_a_function_of_the_destination_are_unsupported(rewrite):
@@ -387,6 +438,180 @@ def test_loader_may_zero_padding_past_the_copied_rows():
     for rows in (10, 14):
         result = capture_geometry(model, [("conv", F32, (rows, 1, 3))])
         assert not result.unsupported and len(result.copies) == 1
+
+
+@pytest.mark.parametrize("source_replay", [False, True])
+@pytest.mark.parametrize(
+    ("zeroed", "allowed"), [(slice(1, 3), True), (slice(0, 2), False)]
+)
+def test_zeroing_columns_beside_a_copied_column(source_replay, zeroed, allowed):
+    """A strided copy and a strided zero only collide if they share bytes."""
+
+    def loader(param, loaded):
+        param.data[..., 0].copy_(loaded)
+        param.data[..., zeroed].zero_()
+
+    with torch.device("meta"):
+        model = ConvModel()
+    model.conv.weight_loader = loader
+    result = capture_weights(
+        model, build_lazy_weights([("conv", F32, (14, 1))]), source_replay=source_replay
+    )
+    if allowed:
+        assert not result.unsupported and len(result.copies) == 1
+        source = _source((14, 1))
+        expected = torch.zeros(14, 1, 3)
+        expected[..., 0] = source
+        for dest in _reconstruct(result.copies, {"conv": source}, {"conv": expected}):
+            assert torch.equal(dest["conv"], expected)
+    else:
+        assert result.unsupported == ["conv"]
+        assert "rewrites destination 'conv'" in result.unsupported_reasons["conv"]
+
+
+def _replay_into(copies, sources, out):
+    """Install into ``out`` the way ordered source replay does, epilogues included."""
+    for copy in copies:
+        value = sources[copy.src_name]
+        for op, args, kwargs in copy.op_chain:
+            value = getattr(value, op)(*args, **dict(kwargs))
+        destination = out[copy.param_name]
+        destination.as_strided(
+            copy.dest_shape, copy.dest_stride,
+            destination.storage_offset() + copy.dest_offset,
+        ).copy_(value)
+        if copy.epilogue:
+            destination.copy_(run_epilogue(destination, copy.epilogue))
+    return out
+
+
+class SharedStorageModel(torch.nn.Module):
+    """Two registered views ``a = base[0:2]`` and ``b = base[at:at + 2]``."""
+
+    def __init__(self, loader, at):
+        super().__init__()
+        base = torch.empty(at + 2)
+        self.a = torch.nn.Parameter(base[0:2])
+        self.b = torch.nn.Parameter(base[at : at + 2])
+        self.loader = loader
+
+    def load_weights(self, weights):
+        for _, loaded in weights:
+            self.loader(self, loaded)
+
+
+@pytest.mark.parametrize("at", [1, 2])
+def test_post_copy_rewrite_after_a_later_copy_into_shared_bytes(at):
+    """Replay runs ``a``'s rewrite right after ``a``'s copy, before ``b``'s, so
+    a copy into ``b`` that the rewrite then overwrites must reject the rewrite."""
+
+    def loader(model, loaded):
+        model.a.data.copy_(loaded[0])
+        negated = -model.a
+        model.b.data.copy_(loaded[1])
+        model.a.data.copy_(negated)
+
+    with torch.device("meta"):
+        model = SharedStorageModel(loader, at)
+    result = capture_weights(
+        model, build_lazy_weights([("w", F32, (2, 2))]), source_replay=True
+    )
+    if at == 1:
+        assert result.unsupported == ["w"]
+        assert "replay would run the rewrite first" in result.unsupported_reasons["w"]
+        return
+    assert not result.unsupported
+    source = _source((2, 2), 1.0)
+    base = torch.zeros(at + 2)
+    _replay_into(result.copies, {"w": source}, {"a": base[0:2], "b": base[at:]})
+    expected = torch.zeros(at + 2)
+    loader(SimpleNamespace(a=expected[0:2], b=expected[at:]), source)
+    assert torch.equal(base, expected)
+
+
+@pytest.mark.parametrize(("fill", "allowed"), [(5.0, False), (0.0, True)])
+def test_post_copy_rewrite_that_reads_an_unrecorded_write(fill, allowed):
+    """Replay starts the destination from zeros, so the rewrite may read bytes
+    no copy wrote only if the loader left them zero."""
+
+    def loader(param, loaded):
+        param.data[1:].fill_(fill)
+        param.data[:1].copy_(loaded)
+        param.data.copy_(param + param.sum())
+
+    with torch.device("meta"):
+        model = ConvModel()
+    model.conv.weight_loader = loader
+    result = capture_weights(
+        model, build_lazy_weights([("conv", F32, (1, 1, 3))]), source_replay=True
+    )
+    if not allowed:
+        assert result.unsupported == ["conv"]
+        assert "unrecorded non-zero write" in result.unsupported_reasons["conv"]
+        return
+    assert not result.unsupported
+    source = _source((1, 1, 3), 1.0)
+    out = _replay_into(result.copies, {"conv": source}, {"conv": torch.zeros(14, 1, 3)})
+    expected = torch.zeros(14, 1, 3)
+    loader(expected, source)
+    assert torch.equal(out["conv"], expected)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda value: value.mul_(2),
+        lambda value: value.view(-1)[0:3].add_(1),
+        lambda value: value.data.neg_(),
+        lambda value: value.copy_(torch.ones(14, 1, 3, device="meta")),
+    ],
+    ids=["in_place", "through_a_view", "through_data", "copy_into"],
+)
+@pytest.mark.parametrize(
+    "compute", [lambda param: -param, torch.empty_like], ids=["neg", "empty_like"]
+)
+def test_post_copy_rewrite_from_a_value_written_after_its_trace_is_unsupported(
+    compute, mutate
+):
+    """A trace replays the ops that computed a value, which no longer describe
+    it once a write lands in its storage."""
+
+    def loader(param, loaded):
+        param.data.copy_(loaded)
+        value = compute(param)
+        mutate(value)
+        param.data.copy_(value)
+
+    with torch.device("meta"):
+        model = ConvModel()
+    model.conv.weight_loader = loader
+    result = capture_weights(
+        model, build_lazy_weights([("conv", F32, (14, 1, 3))]), source_replay=True
+    )
+    assert result.unsupported == ["conv"]
+    assert "rewrites destination 'conv'" in result.unsupported_reasons["conv"]
+
+
+def test_post_copy_rewrite_from_a_value_beside_a_written_scratch_tensor():
+    """A write to another tensor leaves the traced value replayable."""
+
+    def loader(param, loaded):
+        param.data.copy_(loaded)
+        value = -param
+        scratch = torch.zeros_like(value)
+        scratch.add_(1)
+        param.data.copy_(value * 2)
+
+    with torch.device("meta"):
+        model = ConvModel()
+    model.conv.weight_loader = loader
+    result = capture_weights(
+        model, build_lazy_weights([("conv", F32, (14, 1, 3))]), source_replay=True
+    )
+    assert not result.unsupported
+    source = torch.randn(14, 1, 3)
+    out = _replay_into(result.copies, {"conv": source}, {"conv": torch.zeros(14, 1, 3)})
+    assert torch.equal(out["conv"], -source * 2)
 
 
 def _replayed(copies, sources, params):

@@ -395,11 +395,8 @@ def _strided_spans(shape, strides, start, element_size=1):
     yield from runs(0, start)
 
 
-def _owners_overlap(left, right):
-    left_runs, right_runs = (
-        _strided_spans(tensor.shape, tensor.stride(), start, tensor.element_size())
-        for start, _, tensor, _ in (left, right)
-    )
+def _runs_intersect(left_runs, right_runs):
+    """Whether two byte-run iterators, each ordered by start, share a byte."""
     a, b = next(left_runs, None), next(right_runs, None)
     while a is not None and b is not None:
         if a[0] < b[1] and b[0] < a[1]:
@@ -409,6 +406,15 @@ def _owners_overlap(left, right):
         else:
             b = next(right_runs, None)
     return False
+
+
+def _owners_overlap(left, right):
+    return _runs_intersect(
+        *(
+            _strided_spans(tensor.shape, tensor.stride(), start, tensor.element_size())
+            for start, _, tensor, _ in (left, right)
+        )
+    )
 
 
 def _destination_overlap_pairs(destinations):
@@ -645,6 +651,9 @@ class LazyWeight(torch.Tensor):
         root = torch.empty(shape, dtype=first.dtype, device="meta")
         spans, start = [], 0
         for part in parts:
+            if part.dim() != len(shape):
+                # torch.cat skips a 1-D empty operand along any dim.
+                continue
             stop = start + part.shape[dim]
             spans.append((part, start, stop))
             start = stop
@@ -960,6 +969,40 @@ def _byte_span(offset, shape, stride, element_size):
     return offset * element_size, (offset + extent) * element_size
 
 
+def _views_overlap(left, right):
+    """Whether two ``(offset, shape, stride, element_size)`` views share a byte.
+
+    The bounding spans filter first; then the runs each view addresses are
+    compared, so interleaved views such as ``p[:, 0]`` and ``p[:, 1]`` stay
+    apart. A view whose own elements overlap is compared by its span.
+    """
+    spans = [_byte_span(*view) for view in (left, right)]
+    if any(start == stop for start, stop in spans) or not (
+        spans[0][0] < spans[1][1] and spans[1][0] < spans[0][1]
+    ):
+        return False
+
+    def runs(view, span):
+        offset, shape, stride, element_size = view
+        extent = 1
+        for step, size in sorted(
+            (step, size) for size, step in zip(shape, stride) if size > 1
+        ):
+            if step < extent:
+                return iter((span,))
+            extent += (size - 1) * step
+        return _strided_spans(shape, stride, offset * element_size, element_size)
+
+    return _runs_intersect(*(runs(view, span) for view, span in zip((left, right), spans)))
+
+
+def _view_of(tensor):
+    return (
+        tensor.storage_offset(), tuple(tensor.shape), tuple(tensor.stride()),
+        tensor.element_size(),
+    )
+
+
 def _same_view(tensor, owner):
     return (
         tensor.untyped_storage()._cdata == owner.untyped_storage()._cdata
@@ -977,9 +1020,27 @@ def _out_of_place(func):
         return None
     packet = getattr(torch.ops.aten, op[:-1], None)
     overload = getattr(packet, func._overloadname, None) if packet is not None else None
-    if overload is None or _writes(overload):
+    # An in-place view op (``t_``, ``squeeze_``) changes only the metadata of
+    # the tensor it is called on; its out-of-place form returns a view.
+    if (
+        overload is None
+        or _writes(overload)
+        or any(value.alias_info is not None for value in overload._schema.returns)
+    ):
         return None
     return overload
+
+
+def _zero_write(func, args) -> bool:
+    """Whether ``func`` writes only bitwise zeros: ``zero_`` or ``fill_(0)``."""
+    if func is torch.ops.aten.zero_.default:
+        return True
+    if func is not torch.ops.aten.fill_.Scalar or len(args) < 2:
+        return False
+    value = args[1]
+    if isinstance(value, int):
+        return value == 0
+    return isinstance(value, float) and value == 0 and math.copysign(1.0, value) > 0
 
 
 def _writes(func) -> bool:
@@ -1003,7 +1064,10 @@ class _CaptureMutationGuard(TorchDispatchMode):
     ``composed_weight_loader``: Mamba2 stores ``A = -exp(A_log)``; or an in-place
     ``param.data.copy_(w).mul_(scale)``) is recorded instead: the aten ops between
     the copy and the rewrite become the copy's ``epilogue``, which replay runs on
-    the destination after the copy lands.
+    the destination after the copy lands. A traced value stops being traced
+    once a write lands in its storage. The rewrite is rejected when a later copy
+    under any name shares its bytes, or when it reads bytes that an unrecorded
+    non-zero write set, since replay would not reproduce what it read.
     """
 
     def __init__(self, destinations, recorder=None, *, trace_epilogues=False):
@@ -1026,13 +1090,21 @@ class _CaptureMutationGuard(TorchDispatchMode):
             )
         self._recorder = recorder
         self._trace = trace_epilogues and recorder is not None
+        self._by_name: dict[str, list] = {}
+        self._indexed = 0
+        self._last = None
+        self.reset()
+
+    def reset(self):
+        """Forget loader state from an abandoned capture attempt."""
         # id(tensor) -> (param, copies into param when the trace began, steps,
         # index of this tensor's step); ``_alive`` keeps the ids stable.
         self._derived: dict[int, tuple] = {}
         self._alive: list = []
-        self._by_name: dict[str, list] = {}
-        self._indexed = 0
-        self._last = None
+        # storage -> ids of the traced values that live in it.
+        self._traced: dict[int, list] = {}
+        # Destination storage -> views that unrecorded non-zero writes set.
+        self._unrecorded: dict[int, list] = {}
 
     def _copies_by_name(self):
         # Indexed incrementally: capture can record a copy per expert slice, and
@@ -1051,24 +1123,26 @@ class _CaptureMutationGuard(TorchDispatchMode):
     def _copies_into(self, name):
         return len(self._copies_by_name().get(name, ()))
 
+    def _copy_view(self, copy):
+        """The recorded copy's destination as a storage view, if it is meta."""
+        owner = self._meta.get(copy.param_name)
+        if owner is None:
+            return None, None
+        view = (
+            owner.storage_offset() + copy.dest_offset, copy.dest_shape,
+            copy.dest_stride, owner.element_size(),
+        )
+        return owner.untyped_storage()._cdata, view
+
     def _overwritten_copy(self, tensor):
         storage = tensor.untyped_storage()._cdata
         if self._recorder is None or storage not in self._meta_storages:
             return None
-        start, stop = _byte_span(
-            tensor.storage_offset(), tensor.shape, tensor.stride(),
-            tensor.element_size(),
-        )
-        if start == stop:
-            return None
+        written = _view_of(tensor)
         copies = self._copies_by_name()
-        for name, owner in self._owners[storage]:
+        for name, _ in self._owners[storage]:
             for copy in copies.get(name, ()):
-                copy_start, copy_stop = _byte_span(
-                    owner.storage_offset() + copy.dest_offset, copy.dest_shape,
-                    copy.dest_stride, owner.element_size(),
-                )
-                if start < copy_stop and copy_start < stop:
+                if _views_overlap(written, self._copy_view(copy)[1]):
                     return name
         return None
 
@@ -1137,22 +1211,42 @@ class _CaptureMutationGuard(TorchDispatchMode):
             name, copies, steps = traced
             self._derived[id(out)] = (name, copies, steps, len(steps) - 1)
             self._alive.append(out)
+            self._traced.setdefault(out.untyped_storage()._cdata, []).append(id(out))
 
-    def _record_epilogue(self, func, args, kwargs, name):
+    def _forget_traces(self, tensor):
+        """Drop traced values a write changed, through any view of their storage.
+
+        A trace replays the ops that computed a value, so it no longer
+        describes the value once a write lands in its storage.
+        """
+        for key in self._traced.pop(tensor.untyped_storage()._cdata, ()):
+            self._derived.pop(key, None)
+
+    def _record_epilogue(self, func, args, kwargs):
         """Record a whole-destination rewrite as the last copy's epilogue.
 
         Either ``copy_`` of a value computed from the destination, or an
         in-place op on it (``param.data.copy_(w).mul_(scale)``), replayed as the
-        op's out-of-place form.
+        op's out-of-place form. Returns False when the write is not such a
+        rewrite, and raises when it is one that replay cannot reproduce.
         """
-        if not self._trace or not _same_view(args[0], self._meta[name]):
+        if not self._trace or not isinstance(args[0], torch.Tensor):
             return False
+        storage = args[0].untyped_storage()._cdata
+        names = [
+            name for name, owner in self._owners[storage] if _same_view(args[0], owner)
+        ]
+        if len(names) != 1:
+            return False
+        (name,) = names
+        destination = self._meta[name]
         if func is torch.ops.aten.copy_.default:
             derived = self._derived.get(id(args[1]))
             if derived is None:
                 return False
             traced_name, copies, steps, index = derived
             steps = steps[: index + 1]
+            value = args[1]
         else:
             out_of_place = _out_of_place(func)
             traced = (
@@ -1163,12 +1257,45 @@ class _CaptureMutationGuard(TorchDispatchMode):
             if traced is None:
                 return False
             traced_name, copies, steps = traced
+            value = out_of_place(*args, **kwargs)
         if traced_name != name or copies != self._copies_into(name):
             return False
         recorded = self._recorder.copies
         last = max(i for i, copy in enumerate(recorded) if copy.param_name == name)
         if recorded[last].epilogue:
             return False
+        # ``copy_`` broadcasts its source; an in-place op keeps its shape.
+        shape = tuple(destination.shape)
+        try:
+            fits = isinstance(value, torch.Tensor) and (
+                torch.broadcast_shapes(tuple(value.shape), shape) == shape
+                if func is torch.ops.aten.copy_.default
+                else tuple(value.shape) == shape
+            )
+        except RuntimeError:
+            fits = False
+        if not fits:
+            raise UnsupportedReshard(
+                f"loader rewrites destination {name!r} with a value that does not "
+                f"fill it: {func}"
+            )
+        # Replay runs the epilogue right after copy ``last`` on a destination
+        # that holds only recorded copies, so no later copy and no unrecorded
+        # write may touch the bytes the loader's rewrite read and wrote.
+        whole = _view_of(destination)
+        for copy in recorded[last + 1 :]:
+            other, view = self._copy_view(copy)
+            if other == storage and _views_overlap(whole, view):
+                raise UnsupportedReshard(
+                    f"loader rewrites destination {name!r} after copying "
+                    f"{copy.src_name!r} into {copy.param_name!r}, which shares its "
+                    "bytes; replay would run the rewrite first"
+                )
+        if any(_views_overlap(whole, view) for view in self._unrecorded.get(storage, ())):
+            raise UnsupportedReshard(
+                f"loader rewrites destination {name!r} from bytes that an "
+                "unrecorded non-zero write set"
+            )
         recorded[last] = replace(
             recorded[last],
             epilogue=tuple(
@@ -1189,15 +1316,21 @@ class _CaptureMutationGuard(TorchDispatchMode):
                     tensor, LazyWeight
                 ):
                     continue
-                if tensor.untyped_storage()._cdata in self._storages:
+                storage = tensor.untyped_storage()._cdata
+                if storage in self._storages:
                     raise UnsupportedReshard(
                         f"live destination mutation during capture: {func}"
                     )
+                self._forget_traces(tensor)
                 overwritten = self._overwritten_copy(tensor)
-                if overwritten is not None and not (
-                    index == 0
-                    and self._record_epilogue(func, args, kwargs, overwritten)
-                ):
+                if overwritten is None:
+                    # Replay starts every destination from zeros, so only a
+                    # non-zero write can leave bytes replay does not reproduce.
+                    if storage in self._meta_storages and not _zero_write(func, args):
+                        self._unrecorded.setdefault(storage, []).append(
+                            _view_of(tensor)
+                        )
+                elif not (index == 0 and self._record_epilogue(func, args, kwargs)):
                     raise UnsupportedReshard(
                         f"loader rewrites destination {overwritten!r} after "
                         f"copying a source into it: {func}"
@@ -1253,11 +1386,12 @@ def capture_weights(
         # LazyWeights carry their own source identity across one bulk invocation.
         with _CaptureMutationGuard(
             recorder.destinations, recorder, trace_epilogues=source_replay
-        ):
+        ) as guard:
             try:
                 with recorder.attempt():
                     model.load_weights(sorted(weights.items()))
             except UnsupportedReshard as bulk_error:
+                guard.reset()
                 # The per-source retry can succeed for every source even when bulk
                 # order trips a loader, which would otherwise leave `unsupported`
                 # empty and hide a bulk-only incompatibility entirely.

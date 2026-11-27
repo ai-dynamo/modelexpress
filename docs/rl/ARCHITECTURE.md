@@ -873,8 +873,9 @@ concatenation is tracked as a view of the combined shape: once a loader's view
 falls inside one source it continues as a view of that source, and a copy that
 spans sources is split into one copy per source, unflattening a dim that a
 `flatten` merged across the stacked dim. Each recorded copy therefore still reads
-exactly one published source. An operation that takes a list of sources and is
-not one of these is reported as unsupported for that source.
+exactly one published source. A 1-D empty source, which `torch.cat` skips along
+any dim, is skipped too. An operation that takes a list of sources and is not one
+of these is reported as unsupported for that source.
 
 Trainer adapters encode registered shard geometry in stable worker manifests.
 The refit control plane owns worker registration, immutable version publication,
@@ -1020,17 +1021,28 @@ including views and detached aliases, are rejected before execution and reported
 as unsupported sources. Lazy-source copies remain record-only, and independent
 scratch tensors may still be mutated. A loader write over destination bytes that
 a source was already copied into is also rejected: replaying the copy alone
-would install the value before that write. With ordered source replay, a write
-that recomputes the whole destination from itself (vLLM's
-`composed_weight_loader`, which stores Mamba2's `A = -exp(A_log)`, or an
-in-place scale such as `param.data.copy_(w).mul_(scale)`) is instead recorded as
-the copy's epilogue, the aten operations between the copy and the write, and
-installation runs it on the destination right after the copy lands. Writes that
-read other non-scalar tensors, cover part of the destination, or follow another
-copy into the same destination stay unsupported. Zeroing
-destination bytes that no copy wrote, such as vocabulary padding, is allowed
-because replay starts every destination from zeros. The guard ends when capture
-exits; it does not change native post-load processing.
+would install the value before that write. The check compares the byte runs
+each strided view addresses, so zeroing a column beside a copied column is
+allowed. With ordered source replay, a write that recomputes the whole
+destination from itself (vLLM's `composed_weight_loader`, which stores Mamba2's
+`A = -exp(A_log)`, or an in-place scale such as
+`param.data.copy_(w).mul_(scale)`) is instead recorded as the copy's epilogue,
+the aten operations between the copy and the write, and installation runs it on
+the destination right after the copy lands, assigning its value with `copy_`'s
+broadcasting as the loader did. Writes that read other non-scalar tensors, cover
+part of the destination, or follow another copy into the same destination stay
+unsupported. Capture also rejects an epilogue that replay could not reproduce:
+
+- its value does not broadcast to the destination, or the write is an in-place
+  view op such as `squeeze_`, which changes only metadata;
+- a later copy, under any name, lands in bytes the destination shares;
+- the destination holds bytes from a non-zero write that no copy recorded;
+- the value it writes was changed after it was computed, by a write to its
+  storage directly or through a view.
+
+Zeroing destination bytes that no copy wrote, such as vocabulary padding, is
+allowed because replay starts every destination from zeros. The guard ends when
+capture exits; it does not change native post-load processing.
 
 Load-layout capture caches a deep copy of the result and returns another deep
 copy on a cache hit, preserving shared references within each result while
