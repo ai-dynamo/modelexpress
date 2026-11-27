@@ -54,6 +54,10 @@ if TYPE_CHECKING:
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_MAX_REPLAY_CHAIN_LENGTH: int
+    MX_REFIT_PREFETCH_S3_WATCH: bool
+    MX_REFIT_PREFETCH_WORKERS: int
+    MX_REFIT_PREFER_PREPARED: bool
+    MX_REFIT_PREFETCH: bool
     MX_REFIT_FULL_STREAMING: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_STAGE_PROCESS: bool
@@ -273,6 +277,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
         os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
         "MX_REFIT_DELTA_SURGICAL",
+    ),
+    "MX_REFIT_PREFETCH_S3_WATCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH_S3_WATCH", "false"),
+        "MX_REFIT_PREFETCH_S3_WATCH",
+    ),
+    "MX_REFIT_PREFETCH_WORKERS": lambda: require_positive_int(
+        int(os.environ.get("MX_REFIT_PREFETCH_WORKERS", min(8, os.cpu_count() or 8))),
+        "MX_REFIT_PREFETCH_WORKERS",
+    ),
+    "MX_REFIT_PREFER_PREPARED": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFER_PREPARED", "false"), "MX_REFIT_PREFER_PREPARED"
+    ),
+    "MX_REFIT_PREFETCH": lambda: parse_bool(
+        os.environ.get("MX_REFIT_PREFETCH", "false"), "MX_REFIT_PREFETCH"
     ),
     "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
         os.environ.get("MX_REFIT_FULL_STREAMING", "false"),

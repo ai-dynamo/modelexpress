@@ -79,6 +79,14 @@ def _alive(pid: int) -> bool:
     try:
         with open(f"/proc/{pid}/stat") as stat:
             return stat.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        if Path("/proc").exists():
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
     except OSError:
         return False
 
@@ -94,6 +102,11 @@ class _RefitService(refit_pb2_grpc.RefitServiceServicer):
         self.leased: list[tuple[str, str]] = []
         self.calls: Counter = Counter()
         self._lock = threading.Lock()
+
+    def ListWeightVersions(self, request, context):
+        return refit_pb2.ListWeightVersionsResponse(
+            versions=list(self.versions.values())
+        )
 
     def GetWeightVersion(self, request, context):
         with self._lock:
@@ -202,6 +215,7 @@ class _Harness:
                 if base is None
                 else refit_pb2.WEIGHT_PAYLOAD_FORMAT_XOR_DELTA
             ),
+            created_at_unix_ms=int(version_id[1:]),
             layout_signature="layout-a",
             state=refit_pb2.WEIGHT_VERSION_STATE_READY,
             object_storage=refit_pb2.ObjectStorageSource(
@@ -293,6 +307,9 @@ def harness(tmp_path, monkeypatch):
         "MX_MODEL_NAME_OVERRIDE",
         "MX_GENERATOR_SOURCE_ORDER",
         "MX_REFIT_FULL_STREAMING",
+        "MX_REFIT_PREFETCH",
+        "MX_REFIT_PREFETCH_S3_WATCH",
+        "MX_REFIT_PREFER_PREPARED",
         "MX_REFIT_DELTA_WORKERS",
         "MX_REFIT_DOWNLOAD_WORKERS",
         "MX_S3_DOWNLOAD_WORKERS",
@@ -920,7 +937,8 @@ def test_mixed_source_order_gets_no_worker(harness, monkeypatch, caplog):
 def test_worker_is_configured_as_the_client_without_the_engine(harness, monkeypatch):
     worker_configs = []
 
-    def no_worker(config):
+    def no_worker(config, *, prefetch):
+        assert prefetch is False
         worker_configs.append(config)
         return SimpleNamespace(close=lambda: None)
 
@@ -969,3 +987,66 @@ def test_stage_process_knows_nothing_about_how_versions_are_staged():
     client_source = Path(client_module.__file__).read_text()
     assert "from .methods" not in client_source
     assert "CanonicalDelta" not in client_source
+
+
+@pytest.mark.parametrize("offload", [True, False])
+def test_idle_worker_prefetches_before_explicit_update(harness, monkeypatch, offload):
+    monkeypatch.setenv("MX_REFIT_PREFETCH", "true")
+    # Keep the discovery target on the delta lineage from the serving seed.
+    harness.service.versions.pop("v3")
+    harness.service.versions.pop("v4")
+    client, runner = harness.client(stage_process=offload)
+    process = client._stage_process
+    _wait_until(lambda: harness.head()[1] == "v1", "idle prefetch of v1")
+    _wait_until(lambda: not harness.service.leases, "background lease release")
+    assert runner.installed == []
+    assert harness.shard_reads(process.pid)
+    before = len(harness.shard_reads(process.pid))
+    _stage_apply(harness, client, runner, "v1")
+    assert len(harness.shard_reads(process.pid)) == before
+    _wait_until(lambda: harness.head()[1] == "v2", "prefetch after v1 activation")
+    _stage_apply(harness, client, runner, "v2")
+    assert len(harness.procs) == 1
+    assert process.pid == client._stage_process.pid
+
+
+def test_idle_prefetch_recovers_after_worker_death(harness, monkeypatch):
+    monkeypatch.setenv("MX_REFIT_PREFETCH", "true")
+    harness.service.versions.pop("v3")
+    harness.service.versions.pop("v4")
+    harness.hold()
+    client, runner = harness.client()
+    _wait_until(lambda: (harness.root / "holding").exists(), "background download")
+    old_pid = client._stage_process.pid
+    os.kill(old_pid, signal.SIGKILL)
+    harness.unhold()
+    _wait_until(
+        lambda: client._stage_process.pid not in (None, old_pid), "replacement worker"
+    )
+    _wait_until(lambda: harness.head()[1] == "v1", "replacement prefetch")
+    assert fakes.digest_checkpoint(harness.seed) == harness.digests["v0"]
+    _stage_apply(harness, client, runner, "v1")
+
+
+def test_mixed_sources_can_prefetch_without_offloading_peer_transfers(
+    harness, monkeypatch
+):
+    monkeypatch.setenv("MX_REFIT_PREFETCH", "true")
+    monkeypatch.setenv("MX_REFIT_PREFER_PREPARED", "true")
+    harness.service.versions.pop("v3")
+    harness.service.versions.pop("v4")
+    initialize_runtime = client_module.initialize_generator_runtime
+
+    def runtime_with_peer_first(**kwargs):
+        runtime = initialize_runtime(**kwargs)
+        runtime.session._resolvers = (_NoPeerResolver(), *runtime.session._resolvers)
+        return runtime
+
+    monkeypatch.setattr(
+        client_module, "initialize_generator_runtime", runtime_with_peer_first
+    )
+    client, runner = harness.client()
+    _wait_until(lambda: harness.head()[1] == "v1", "background object-storage target")
+    assert client._offload_staging is False
+    _stage_apply(harness, client, runner, "v1")
+    assert len(harness.procs) == 1

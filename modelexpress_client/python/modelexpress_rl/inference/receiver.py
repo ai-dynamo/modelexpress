@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import hashlib
 import logging
 import mmap
 import os
@@ -70,7 +71,9 @@ class ObjectStorageGeneratorConfig:
         if self.storage_type is ObjectStorageType.AZURE:
             for field in ("endpoint_url", "region_name"):
                 if getattr(self, field) is not None:
-                    raise ValueError(f"{field} is not supported for Azure object storage")
+                    raise ValueError(
+                        f"{field} is not supported for Azure object storage"
+                    )
         if not self.initial_base_version_id.strip():
             raise ValueError("initial_base_version_id is required")
         if (
@@ -85,6 +88,15 @@ class ObjectStorageGeneratorConfig:
             and self.refit_checkpoint_max_size_gb <= 0
         ):
             raise ValueError("refit_checkpoint_max_size_gb must be positive")
+
+
+def speculative_version_id(uri: str) -> str:
+    """Return the cache ID of a delta prepared before its version is registered."""
+    return "mx-speculative-" + hashlib.sha256(uri.encode()).hexdigest()[:24]
+
+
+class PreparationSuperseded(RuntimeError):
+    """The cache head changed while background preparation waited."""
 
 
 class ReceiverInstallError(RuntimeError):
@@ -223,9 +235,7 @@ def _parse_index_manifest(
                 )
         compression_format = metadata.get("compression_format")
         if compression_format not in _DECOMPRESSORS:
-            raise ValueError(
-                f"unsupported compression format {compression_format!r}"
-            )
+            raise ValueError(f"unsupported compression format {compression_format!r}")
     elif "checksum_format" in metadata:
         checksum_factory(metadata["checksum_format"])
     return metadata, weight_map
@@ -549,12 +559,14 @@ class _LocalCheckpoint:
         initial_checkpoint: Path,
         cached_seed: bool,
     ) -> str:
-        version = self.initial_version
         if (
-            cached_seed
-            and state is not None
-            and state.status is CheckpointState.READY
+            state is not None
+            and state.status is CheckpointState.UPDATING
+            and self._restore_prefetch_head()
         ):
+            state = self.store.state()
+        version = self.initial_version
+        if cached_seed and state is not None and state.status is CheckpointState.READY:
             # A co-located rank may already have reconstructed the desired
             # target. Reuse that verified cache head instead of rewinding it.
             version = state.version
@@ -632,6 +644,8 @@ class _LocalCheckpoint:
             state = self.store.state()
             if state is None or state.status is CheckpointState.READY:
                 return
+            if self._restore_prefetch_head():
+                return
             self.local_checkpoint = self.store.full_path(self.initial_version)
             self._restore_cached_initial_checkpoint()
             self.store.enforce_capacity(
@@ -670,11 +684,7 @@ class _LocalCheckpoint:
         )
         self.store.write_state(
             status=CheckpointState.UPDATING,
-            version=(
-                state.version
-                if state is not None
-                else self.initial_version
-            ),
+            version=(state.version if state is not None else self.initial_version),
             checkpoint_paths=self.checkpoint_paths,
         )
         # A working copy of the replaced initial checkpoint is stale.
@@ -789,6 +799,9 @@ class _LocalCheckpoint:
     def prepare_chain(
         self,
         versions: tuple[_ObjectStorageVersion, ...],
+        *,
+        expected_head: str | None = None,
+        speculative_uri: str | None = None,
     ) -> PreparedCheckpoint:
         """Prepare an ordered chain into one immutable target checkpoint."""
         if not versions:
@@ -800,10 +813,28 @@ class _LocalCheckpoint:
         with self.store.preparation_locked():
             # Includes another rank's preparation and a background working copy.
             lock_wait = time.perf_counter() - started
-            with self.store.installation_locked(shared=True), self.store.locked(
-                shared=True
+            if self.store.speculation() is not None or self._prefetched_sibling(
+                versions
+            ):
+                with self.store.installation_locked(), self.store.locked():
+                    self._resolve_speculation(versions)
+                    self._restore_prefetched_sibling(versions)
+
+            with (
+                self.store.installation_locked(shared=True),
+                self.store.locked(shared=True),
             ):
                 state, _active_version = self._load_ready_state()
+                if expected_head is not None and (
+                    state.version != target.version_id
+                    and (
+                        state.version != expected_head
+                        or self.store.active_version() != expected_head
+                    )
+                ):
+                    raise PreparationSuperseded(
+                        "cache head changed before background preparation"
+                    )
                 prepared = self._reuse_prepared_target(
                     state=state,
                     target=target,
@@ -813,6 +844,16 @@ class _LocalCheckpoint:
                     return prepared
             with self.store.installation_locked(), self.store.locked():
                 state, active_version = self._load_ready_state()
+                if expected_head is not None and (
+                    state.version != target.version_id
+                    and (
+                        state.version != expected_head
+                        or self.store.active_version() != expected_head
+                    )
+                ):
+                    raise PreparationSuperseded(
+                        "cache head changed before background preparation"
+                    )
                 prepared = self._reuse_prepared_target(
                     state=state,
                     target=target,
@@ -829,7 +870,9 @@ class _LocalCheckpoint:
                     if source is None:
                         break
                     if source != _source_identity(version):
-                        raise ValueError("prepared checkpoint has different source identity")
+                        raise ValueError(
+                            "prepared checkpoint has different source identity"
+                        )
                     versions = versions[position + 1 :]
                     break
                 manifests, index_download_time = self._download_replay_manifests(
@@ -837,13 +880,141 @@ class _LocalCheckpoint:
                     target=target,
                     base_version=state.version,
                 )
-                return self._reconstruct_target(
-                    manifests=manifests,
-                    target=target,
-                    active_version=active_version,
-                    index_download_time=index_download_time,
-                    lock_wait=lock_wait,
-                )
+                recovery = self.store.cache / "prefetch-recovery.json"
+                if expected_head is not None:
+                    self.store._write_json(recovery, state.to_dict())
+                    if speculative_uri is not None:
+                        self.store.write_speculation(
+                            version=target.version_id,
+                            uri=speculative_uri,
+                            base_version=state.version,
+                            base_source=state.source,
+                        )
+                        record = self.store.speculation()
+                        record["base_record"] = state.to_dict()
+                        self.store._write_json(self.store.speculation_path, record)
+                try:
+                    prepared = self._reconstruct_target(
+                        manifests=manifests,
+                        target=target,
+                        active_version=active_version,
+                        index_download_time=index_download_time,
+                        lock_wait=lock_wait,
+                        preserve_head=expected_head is not None,
+                    )
+                    if expected_head is not None:
+                        self.store._write_json(
+                            self.store.cache / "prefetched-base.json",
+                            {
+                                "prepared_version": prepared.target_version,
+                                "base_record": state.to_dict(),
+                            },
+                        )
+                    return prepared
+                finally:
+                    current = self.store.state()
+                    if (
+                        current is not None
+                        and current.status is not CheckpointState.UPDATING
+                    ):
+                        recovery.unlink(missing_ok=True)
+
+    def _prefetched_sibling(self, versions: tuple[_ObjectStorageVersion, ...]) -> bool:
+        """Whether this request diverges from an unactivated prefetched head."""
+        pending = self.store._read_json(self.store.cache / "prefetched-base.json")
+        state = self.store.state()
+        return bool(
+            pending
+            and state
+            and state.version == pending.get("prepared_version")
+            and self.store.active_version() != state.version
+            and state.version not in {v.version_id for v in versions}
+            and versions[0].base_version_id
+            == pending.get("base_record", {}).get("version")
+        )
+
+    def _restore_prefetched_sibling(
+        self, versions: tuple[_ObjectStorageVersion, ...]
+    ) -> None:
+        """Restore the COW base when the engine requests a sibling delta."""
+        if not self._prefetched_sibling(versions):
+            return
+        path = self.store.cache / "prefetched-base.json"
+        record = self.store._read_json(path)["base_record"]
+        self._set_local_checkpoint(
+            self.store.checkpoint_path(record.get("base", record["version"]))
+        )
+        if record["files"] != checkpoint_files_state(self.checkpoint_paths):
+            raise RuntimeError("prefetched sibling recovery checkpoint changed")
+        self.store._write_json(self.store.state_path, record)
+        path.unlink(missing_ok=True)
+
+    def _restore_prefetch_head(self) -> bool:
+        """Restore an interrupted background transaction whose base was never mutated."""
+        path = self.store.cache / "prefetch-recovery.json"
+        record = CheckpointRecord.from_dict(self.store._read_json(path))
+        if record is None:
+            return False
+        files_version = record.to_dict().get("base", record.version)
+        self._set_local_checkpoint(self.store.checkpoint_path(files_version))
+        if record.files != checkpoint_files_state(self.checkpoint_paths):
+            raise RuntimeError("background recovery checkpoint files changed")
+        self.store._write_json(self.store.state_path, record.to_dict())
+        path.unlink(missing_ok=True)
+        self.store.clear_speculation()
+        return True
+
+    def is_prepared(self, *, version_id: str, uri: str) -> bool:
+        """Match an exact durable head or a speculative target by immutable source."""
+        state = self.store.state()
+        if state is None or state.status is CheckpointState.UPDATING:
+            return False
+        if state.version == version_id:
+            return (state.source or {}).get("uri") == uri
+        speculation = self.store.speculation()
+        return (
+            speculation is not None
+            and speculation.get("version") == state.version
+            and speculation.get("uri") == uri
+        )
+
+    def _resolve_speculation(self, versions: tuple[_ObjectStorageVersion, ...]) -> None:
+        """Adopt a matching speculative target or restore its untouched base."""
+        spec = self.store.speculation()
+        state = self.store.state()
+        if spec is None or state is None or state.status is CheckpointState.UPDATING:
+            return
+        if state.version != spec.get("version"):
+            self.store.clear_speculation()
+            return
+        registered = next(
+            (
+                v
+                for v in versions
+                if v.uri == spec["uri"] and v.base_version_id == spec["base_version"]
+            ),
+            None,
+        )
+        if registered is not None:
+            self.store.rename_version(state.version, registered.version_id)
+            record = state.to_dict()
+            record.update(
+                version=registered.version_id, source=_source_identity(registered)
+            )
+        else:
+            record = dict(spec["base_record"])
+            current = state.to_dict()
+            if current.get("base") is not None:
+                if current["base"] == record["version"]:
+                    record["status"] = "READY"
+                    record.pop("base", None)
+                else:
+                    record.update(status="STAGED", base=current["base"])
+        files_version = record.get("base", record["version"])
+        self._set_local_checkpoint(self.store.checkpoint_path(files_version))
+        record["files"] = checkpoint_files_state(self.checkpoint_paths)
+        self.store._write_json(self.store.state_path, record)
+        self.store.clear_speculation()
 
     def _load_ready_state(self) -> tuple[CheckpointRecord, str]:
         state = self.store.state()
@@ -853,7 +1024,7 @@ class _LocalCheckpoint:
             raise RuntimeError("local checkpoint update is incomplete")
         active_version = _active_version(self.store) or state.version
         state_checkpoint = self.store.checkpoint_path(state.version)
-        if self.local_checkpoint != state_checkpoint:
+        if self.local_checkpoint != state_checkpoint or not self.checkpoint_paths:
             self._set_local_checkpoint(state_checkpoint)
         if state.files != checkpoint_files_state(self.checkpoint_paths):
             raise RuntimeError("local checkpoint files changed outside ModelExpress")
@@ -974,6 +1145,7 @@ class _LocalCheckpoint:
         active_version: str,
         index_download_time: float,
         lock_wait: float,
+        preserve_head: bool = False,
     ) -> PreparedCheckpoint:
         """Replay lineage while retaining the last completed state for quota recovery."""
         restore = self.store.state()
@@ -998,6 +1170,7 @@ class _LocalCheckpoint:
                         index_data,
                         metadata,
                         weight_map,
+                        **({"preserve_head": True} if preserve_head else {}),
                     )
                 else:
                     downloaded, applied = self._prepare_full(
@@ -1195,6 +1368,8 @@ class _LocalCheckpoint:
         index_data: bytes,
         metadata: dict[str, Any],
         weight_map: dict[str, str],
+        *,
+        preserve_head: bool = False,
     ) -> tuple[float, float]:
         """Verify and materialize a delta using an eligible working copy when available."""
         assert version.base_version_id is not None
@@ -1221,7 +1396,8 @@ class _LocalCheckpoint:
             )
             downloaded = self._download_deltas(weight_map, version.uri)
             self.store.ensure_capacity(
-                len(index_data) + sum(len(data) for data, _names in downloaded.values()),
+                len(index_data)
+                + sum(len(data) for data, _names in downloaded.values()),
                 protected_versions=protected_versions,
             )
             with self.store.replace_directory(artifact) as temporary:
@@ -1249,7 +1425,10 @@ class _LocalCheckpoint:
             base_checkpoint = (
                 self.store.working_copy(version.base_version_id) or base_checkpoint
             )
-        reuse_materialized = base_checkpoint.parent == self.store.materialized_cache
+        reuse_materialized = (
+            base_checkpoint.parent == self.store.materialized_cache
+            and not preserve_head
+        )
         self.store.ensure_capacity(
             0 if reuse_materialized else self.store.path_size_bytes(base_checkpoint),
             protected_versions=_protected_versions(
@@ -1264,7 +1443,9 @@ class _LocalCheckpoint:
             shutil.rmtree(target, ignore_errors=True)
             base_checkpoint.replace(target)
             self._set_local_checkpoint(target)
-            self._apply_delta_artifact(artifact, metadata, weight_map, shards=downloaded)
+            self._apply_delta_artifact(
+                artifact, metadata, weight_map, shards=downloaded
+            )
         else:
             # A full checkpoint without a working copy is copied once so
             # applying the delta cannot modify the canonical full artifact.
@@ -1273,7 +1454,9 @@ class _LocalCheckpoint:
                 copy_from=base_checkpoint,
             ) as temporary:
                 self._set_local_checkpoint(temporary)
-                self._apply_delta_artifact(artifact, metadata, weight_map, shards=downloaded)
+                self._apply_delta_artifact(
+                    artifact, metadata, weight_map, shards=downloaded
+                )
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)

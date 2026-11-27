@@ -1457,6 +1457,12 @@ is imposed on these small models, and this subset does not cover every MoE
 expert. See [the CI test plan](../ci/TEST_PLAN.md)
 for qualification limits.
 
+
+RL autonomous prefetch runs in the generator's shared stage process, reusing the
+client staging path rather than launching another worker. See the
+[RL configuration](rl/CONFIGURATION.md) for compatibility with engines without
+`stage_weights`, resource limits, and checkpoint-copy costs.
+
 ## RL refit CI harness
 
 The RL refit CI harness and its scenario lifecycle are described in the [RL refit architecture](rl/ARCHITECTURE.md#rl-refit-ci-harness).

@@ -75,6 +75,7 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         except Exception:
             self._reader.close()
             raise
+        self._background_head: str | None = None
         self._active: PreparedCheckpointArtifact | None = None
         self._stream_full_checkpoints = stream_full_checkpoints
         self._streams: list[StreamedCheckpoint] = []
@@ -109,6 +110,24 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
             self._seed_copy.join()
             self._seed_copy = None
 
+    @contextmanager
+    def background_preparation(self, head: str):
+        self._background_head = head
+        try:
+            yield
+        finally:
+            self._background_head = None
+
+    def is_prepared(self, version: WeightVersion) -> bool:
+        """Whether this target can attach to a verified host-local preparation."""
+        return (
+            self._initialized
+            and version.object_storage is not None
+            and self._checkpoint.is_prepared(
+                version_id=version.version_id, uri=version.object_storage.uri
+            )
+        )
+
     @property
     def requires_full_root(self) -> bool:
         return not self._initialized
@@ -140,7 +159,9 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
     ) -> PreparedArtifact:
         if self._active is not None:
             raise RuntimeError("release staged weight before staging another version")
-        self._streams = [stream for stream in self._streams if not stream.cache_succeeded]
+        self._streams = [
+            stream for stream in self._streams if not stream.cache_succeeded
+        ]
         versions = [self._version(version, source) for version, source in chain]
         if (
             versions
@@ -226,7 +247,14 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
                     checkpoint.initialize()
                     self._checkpoint = checkpoint
                     self._initialized = True
-                checkpoint = self._checkpoint.prepare_chain(tuple(versions))
+                checkpoint = self._checkpoint.prepare_chain(
+                    tuple(versions),
+                    **(
+                        {"expected_head": self._background_head}
+                        if self._background_head is not None
+                        else {}
+                    ),
+                )
         except ValueError as error:
             raise RuntimeError(str(error)) from error
         self._active = PreparedCheckpointArtifact(checkpoint=checkpoint)
