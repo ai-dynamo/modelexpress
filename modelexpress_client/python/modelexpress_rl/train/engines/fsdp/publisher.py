@@ -21,7 +21,6 @@ Extraction rules (per state_dict tensor, floating point only):
 
 from __future__ import annotations
 
-import logging
 import time
 from dataclasses import dataclass
 
@@ -37,7 +36,6 @@ from modelexpress_rl.refit.reshard.rendezvous import (
 )
 from modelexpress_rl.train.adapter import NixlMetadataProvider
 
-logger = logging.getLogger("modelexpress_rl.train.engines.fsdp.publisher")
 
 # Default transfer dtype; FSDPTrainerContext can override it per tensor.
 WIRE_DTYPE = torch.bfloat16
@@ -82,11 +80,7 @@ def capture_local_shards(
     the transfer planner (merge_shard_tables), not here.
     """
     shards: list[LocalTensorShard] = []
-    skipped: list[str] = []
     for name, value in state_dict.items():
-        if not value.is_floating_point():
-            skipped.append(name)
-            continue
         full_shape = tuple(value.shape)
         zero_offset = tuple(0 for _ in full_shape)
 
@@ -141,12 +135,6 @@ def capture_local_shards(
                     source_tensor=local,
                 )
             )
-    if skipped:
-        logger.debug(
-            "capture_local_shards: skipped %d non-floating-point entries: %s",
-            len(skipped),
-            sorted(skipped),
-        )
     return shards
 
 
