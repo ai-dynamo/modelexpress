@@ -58,6 +58,12 @@ modelexpress-cli [OPTIONS] <COMMAND>
 - `MODEL_EXPRESS_NO_SHARED_STORAGE`: Disable shared storage mode (set to 'true' to enable file transfers)
 - `MODEL_EXPRESS_TRANSFER_CHUNK_SIZE`: Set the chunk size in bytes for file transfers
 
+Python inference integrations also accept `MX_LOAD_STRATEGY_CHAIN=INFERENCE`
+(default) or `RDMA_ONLY`; the latter disables storage fallback and rejects
+`MX_LOAD_PLUGIN`. `RL` requires its engine integration plugin. These settings
+do not change the Rust CLI's download policy. See
+[RDMA-only loading](DEPLOYMENT.md#rdma-only-loading) for restore requirements.
+
 ### Commands
 
 #### Health Check
