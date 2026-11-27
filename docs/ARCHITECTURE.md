@@ -752,10 +752,10 @@ generator = get_modelexpress_generator(model_runner)
 
 The factory reads `model_runner.server_args.modelexpress_config` as JSON or a
 dictionary, resolves the local seed checkpoint when no seed path is supplied,
-and reuses the client cached on `model_runner.modelexpress_generator`. Connection
-settings use `object_storage_endpoint_url` and `object_storage_region_name`,
-matching the vLLM integration. SGLang owns update coordination and closes the
-cached client during scheduler shutdown.
+and returns a new client on every call. Connection settings use
+`object_storage_endpoint_url` and `object_storage_region_name`, matching the
+vLLM integration. SGLang owns the client: it keeps one per model runner,
+coordinates updates, and closes the client during scheduler shutdown.
 
 ### RL generator installation
 

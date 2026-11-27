@@ -410,10 +410,11 @@ generator = get_modelexpress_generator(model_runner)
 ```
 
 MX parses the configuration, resolves the seed, validates the READY base version,
-and caches the client on `model_runner.modelexpress_generator`. SGLang closes
-that client during scheduler shutdown. If `seed_checkpoint_path` is omitted or
-`null`, the factory resolves the launch checkpoint through the model runner's
-loader. Use an explicit local seed path to select a different checkpoint.
+and returns a new client on every call; nothing is stored on the model runner.
+SGLang keeps that client for later refits and closes it during scheduler
+shutdown. If `seed_checkpoint_path` is omitted or `null`, the factory resolves
+the launch checkpoint through the model runner's loader. Use an explicit local
+seed path to select a different checkpoint.
 
 The shared [seed requirements](#seed_checkpoint_path) and
 [cache settings](#refit_checkpoint_dir) apply. Speculative draft-model refits and

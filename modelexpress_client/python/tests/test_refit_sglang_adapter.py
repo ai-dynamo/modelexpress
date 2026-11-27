@@ -125,7 +125,7 @@ def test_sglang_engine_runtime_exposes_checkpoint_installer(tmp_path):
     "server_config",
     [{"url": "mx:8001"}, {"server_url": "mx:8001", "url": "unused:8001"}],
 )
-def test_generator_factory_reuses_client_and_shared_config(
+def test_generator_factory_uses_shared_config(
     tmp_path, monkeypatch, as_json, seed_checkpoint, server_config
 ):
     runner = _runner(tmp_path)
@@ -151,7 +151,6 @@ def test_generator_factory_reuses_client_and_shared_config(
     monkeypatch.setattr(ModelExpressGeneratorClient, "initialize", initialize)
 
     assert get_modelexpress_generator(runner) is generator
-    assert get_modelexpress_generator(runner) is generator
 
     initialize.assert_called_once()
     config = initialize.call_args.args[0]
@@ -173,7 +172,6 @@ def test_generator_factory_reuses_client_and_shared_config(
         "refit_checkpoint_max_size_gb": 200,
         "storage_type": ObjectStorageType.S3,
     }
-    assert runner.modelexpress_generator is generator
     if seed_checkpoint is None:
         runner.loader._prepare_weights.assert_called_once_with(
             runner.model_config.model_path, runner.model_config.revision, False
@@ -297,6 +295,18 @@ def test_generator_factory_can_retry_initialization(tmp_path, monkeypatch):
 
     assert get_modelexpress_generator(runner) is generator
     assert initialize.call_count == 2
+
+
+def test_generator_factory_does_not_cache_on_the_runner(tmp_path, monkeypatch):
+    runner = _runner(tmp_path)
+    first, second = object(), object()
+    initialize = Mock(side_effect=[first, second])
+    monkeypatch.setattr(ModelExpressGeneratorClient, "initialize", initialize)
+
+    assert get_modelexpress_generator(runner) is first
+    # After the caller closes its client, the next call must not return it.
+    assert get_modelexpress_generator(runner) is second
+    assert not hasattr(runner, "modelexpress_generator")
 
 
 def test_sglang_install_uses_the_prepared_checkpoint(tmp_path, monkeypatch):
