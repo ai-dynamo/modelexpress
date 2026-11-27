@@ -1873,21 +1873,22 @@ def test_sglang_draft_adopts_main_agent_and_extends_registry(
 
 
 @pytest.mark.parametrize(
-    ("main_class", "draft_class", "layer"),
+    ("main_class", "draft_class", "layer", "stages"),
     [
-        ("DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", 61),
-        ("Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN", 92),
-        ("GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN", 78),
+        ("DeepseekV32ForCausalLM", "DeepseekV3ForCausalLMNextN", 61, 1),
+        ("Glm4MoeForCausalLM", "Glm4MoeForCausalLMNextN", 92, 1),
+        ("GlmMoeDsaForCausalLM", "GlmMoeDsaForCausalLMNextN", 78, 1),
+        ("DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMDSpark", 40, 3),
     ],
 )
 def test_sglang_nextn_draft_reuses_main_nixl_agent(
-    _clean_sglang_registries, main_class, draft_class, layer
+    _clean_sglang_registries, main_class, draft_class, layer, stages
 ):
     def model_for(name):
         model_type = type(name, (nn.Module,), {})
         model = model_type()
         model.config = SimpleNamespace(
-            num_hidden_layers=layer, num_nextn_predict_layers=1
+            num_hidden_layers=layer, num_nextn_predict_layers=stages
         )
         return model
 

@@ -868,8 +868,10 @@ embedding. Qwen4-Exp conditional-generation mains also honor SGLang's
 while a shard mixed with text weights remains selected. DeepSeek/GLM NextN
 rules use the configured base-layer count to
 separate the appended prediction layer. DeepSeek V4's DSpark draft instead
-reads `mtp.<stage>.*` weights and pairs with the DeepSeek V4 main; it does
-not use the single-layer NextN rule. Compatible class pairs are explicit,
+reads `mtp.<stage>.*` weights and pairs with the DeepSeek V4 main; it accepts
+positive stage counts, including three-stage DSpark checkpoints, independently
+of the single-layer NextN rule. Both passes must agree on the stage count,
+which also scopes the draft tensor namespace. Compatible class pairs are explicit,
 and draft manifests are scoped by the class, engine version, checkpoint
 identity, and role-specific layout parameters. Rules are shared only where
 SGLang uses the same loading branch. These are pre-read file-selection rules,

@@ -569,8 +569,11 @@ class HYV3ForCausalLMNextNWeightRule(_NextNDraftSelection):
         )
 
 
+@dataclass(frozen=True)
 class DeepseekV4ForCausalLMWeightRule(_NextNMainSelection):
     """DeepseekV4ForCausalLM remaps raw layers.* and omits mtp.*."""
+
+    num_nextn_layers: int = 1
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         if name.startswith("mtp."):
@@ -591,14 +594,21 @@ class DeepseekV4ForCausalLMNextNWeightRule(_NextNDraftSelection):
         return self._draft_covers(normalized)
 
 
+@dataclass(frozen=True)
 class DeepseekV4ForCausalLMDSparkWeightRule(_NextNSelection):
     """DeepseekV4ForCausalLMDSpark reads the bundled mtp.* stages."""
 
+    num_nextn_layers: int = 1
     role = "draft"
     compatible_main_types = (DeepseekV4ForCausalLMWeightRule,)
 
     def should_read_checkpoint_tensor(self, name: str) -> bool:
         return name.startswith("mtp.") and len(name.split(".", 2)) == 3
+
+    def compatible_main(self, main: DraftSelection) -> bool:
+        return super().compatible_main(main) and (
+            self.num_nextn_layers == main.num_nextn_layers
+        )
 
     def publishable(
         self, model: torch.nn.Module, tensors: dict[str, torch.Tensor]
@@ -824,6 +834,23 @@ def draft_weight_adapter_for(
         )
         rule = rule_type(base, nextn_layers)
         return rule if rule.role == role else None
+    if class_name in {"DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMDSpark"}:
+        if (
+            isinstance(base, bool)
+            or not isinstance(base, int)
+            or base <= 1
+            or isinstance(nextn_layers, bool)
+            or not isinstance(nextn_layers, int)
+            or nextn_layers <= 0
+        ):
+            return None
+        rule_type = (
+            DeepseekV4ForCausalLMWeightRule
+            if class_name == "DeepseekV4ForCausalLM"
+            else DeepseekV4ForCausalLMDSparkWeightRule
+        )
+        rule = rule_type(base, nextn_layers)
+        return rule if rule.role == role else None
     if (
         isinstance(base, bool)
         or not isinstance(base, int)
@@ -841,8 +868,6 @@ def draft_weight_adapter_for(
         }.get(class_name)
         if bailing_main is not None:
             return bailing_main(base)
-        if class_name == "DeepseekV4ForCausalLM":
-            return DeepseekV4ForCausalLMWeightRule(base)
         if class_name == "Glm5NextForConditionalGeneration":
             return Glm5NextForConditionalGenerationWeightRule(base)
         if class_name == "GlmOcrForConditionalGeneration":
@@ -866,8 +891,6 @@ def draft_weight_adapter_for(
             return BailingMoeForCausalLMNextNWeightRule(base)
         if class_name == "DeepseekV4ForCausalLMNextN":
             return DeepseekV4ForCausalLMNextNWeightRule(base)
-        if class_name == "DeepseekV4ForCausalLMDSpark":
-            return DeepseekV4ForCausalLMDSparkWeightRule(base)
         if class_name == "Glm5NextForConditionalGenerationNextN":
             return Glm5NextForConditionalGenerationNextNWeightRule(base)
         if class_name == "GlmOcrForConditionalGenerationNextN":
