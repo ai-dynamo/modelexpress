@@ -51,6 +51,7 @@ def _ctx(manager):
     adapter = MagicMock()
     adapter.requires_exact_tensor_catalog.return_value = False
     return SimpleNamespace(
+        p2p_state=None,
         global_rank=0,
         worker_rank=0,
         worker_id="target-0",
@@ -102,13 +103,13 @@ def _receive(manager, p2p=True, ctx=None, leased=True, register=None):
             return None
 
     with (
-        patch("modelexpress.load_strategy.rdma_strategy.register_tensors", side_effect=register),
+        patch("modelexpress.load_strategy.nixl_p2p_strategy.register_tensors", side_effect=register),
         patch(
             "modelexpress.metadata.worker_server.prepare_tensor_read",
             return_value=(_Lease(), 0),
         ) as prepare_read,
         patch(
-            "modelexpress.load_strategy.rdma_strategy.worker_tensor_descriptors",
+            "modelexpress.load_strategy.nixl_p2p_strategy.worker_tensor_descriptors",
             return_value=[_descriptor()],
         ),
     ):
@@ -297,7 +298,7 @@ def test_donor_preparation_precedes_registration(p2p):
         lambda result, tensors: events.append(("prepare", [t.name for t in tensors]))
     )
     _receive(manager, p2p=p2p, ctx=ctx,
-             register=lambda *args: events.append(("register", None)))
+             register=lambda *args, **kwargs: events.append(("register", None)))
     assert events == [("prepare", ["w0"]), ("register", None)]
 
 
@@ -321,7 +322,7 @@ def test_draft_preparation_uses_model_names_before_namespaced_registration():
     desc = _descriptor(name)
     with patch(__name__ + "._descriptor", return_value=desc):
         _receive(manager, ctx=ctx,
-                 register=lambda *args: ctx.tensors.update({name: object()}))
+                 register=lambda *args, **kwargs: ctx.tensors.update({name: object()}))
     args = ctx.adapter.prepare_rdma_target_from_manifest.call_args.args
     assert [t.name for t in args[1]] == ["w0"]
     assert manager.receive_from_source.call_args.kwargs["source_tensors"][0].name == name

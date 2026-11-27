@@ -1,0 +1,1013 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared NIXL P2P loading lifecycle."""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import time
+from dataclasses import replace
+
+from .. import envs, p2p_pb2
+from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
+from ..metadata.payload import (
+    accelerators_compatible,
+    worker_tensor_count,
+    worker_tensor_descriptors,
+)
+from ..metadata.source_id import compute_mx_source_id
+from ..metrics import metrics as selection_metrics
+from ..nixl_transfer import is_nixl_available
+from ..source_selection import (
+    MAX_SOURCE_RETRIES,
+    configured_policy_label,
+    get_configured_selector,
+)
+from ..topology import (
+    adaptive_enabled,
+    in_domain,
+    apply_policy,
+    blocks_selection,
+    count_in_domain,
+    resolve_policy,
+    warn_if_no_domain_match,
+)
+from ..transfer_safety import check_transfer_allowed
+from ..types import ManifestMismatchError, TensorDescriptor
+from .base import (
+    _init_nixl_manager,
+    LoadContext,
+    LoadStrategy,
+    NixlRegistrationError,
+    SourceTransferError,
+    _as_load_result,
+    clear_exception_tracebacks,
+    register_tensors,
+)
+from .context import (
+    DRAFT_TENSOR_PREFIX,
+    LoadResult,
+    P2PFailure,
+    P2PState,
+    is_draft_tensor_name,
+)
+
+logger = logging.getLogger("modelexpress.strategy_rdma")
+
+MAX_DRAFT_SOURCE_METADATA_LOOKUPS = 10
+
+
+def _matches_draft_namespace(ctx: LoadContext, name: str) -> bool:
+    namespace = ctx.draft_tensor_namespace
+    if not name.startswith(namespace):
+        return False
+    return namespace != DRAFT_TENSOR_PREFIX or "::" not in name[len(namespace):]
+
+
+# Fallback when MX_TRANSFER_TIMEOUT is unset or unusable. Matches the value this
+# path used when the timeout was hard-coded, so behaviour is unchanged by default.
+DEFAULT_RDMA_TRANSFER_TIMEOUT_S = 300.0
+
+
+def _transfer_timeout_seconds() -> float:
+    """Per-source RDMA receive budget, in seconds.
+
+    Every candidate costs this long when a source is wedged, because a wedged QP
+    produces neither a completion nor an error status - the timeout is the only
+    thing that ends the wait. With MAX_SOURCE_RETRIES candidates the worst case is
+    that multiplied by three before the target falls back to disk, so operators
+    need to be able to size it against their model rather than accept a constant.
+
+    Honours MX_TRANSFER_TIMEOUT only when it is *explicitly set*, and reads
+    os.environ directly to tell that apart from the default. This is deliberate:
+    that variable defaults to 900, so simply adopting ``envs.MX_TRANSFER_TIMEOUT``
+    would triple this path's budget from 300s to 900s and make the stall being
+    fixed three times more expensive for anyone who never configured it.
+
+    A non-positive or unparseable value falls back rather than being honoured. In
+    particular 0 must not become "no timeout": ``receive_from_source`` treats None
+    as wait-forever, which is the failure mode this exists to bound.
+    """
+    raw = os.environ.get("MX_TRANSFER_TIMEOUT")
+    if raw is None:
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    try:
+        configured = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "MX_TRANSFER_TIMEOUT=%r is not a number; using %.1fs for the RDMA "
+            "receive budget",
+            raw,
+            DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
+        )
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    if not math.isfinite(configured) or configured <= 0:
+        logger.warning(
+            "MX_TRANSFER_TIMEOUT=%r is not finite and positive; using %.1fs for the RDMA "
+            "receive budget rather than waiting indefinitely",
+            raw,
+            DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
+        )
+        return DEFAULT_RDMA_TRANSFER_TIMEOUT_S
+    return configured
+
+
+def _is_draft_pass(ctx: LoadContext) -> bool:
+    # getattr: RL and test callers drive these paths with duck-typed contexts.
+    return getattr(ctx, "p2p_role", "main") == "draft"
+
+
+def _reload_restores_loaded_weights(ctx: LoadContext) -> bool:
+    """Whether a reload asks for the same weights the model already holds.
+
+    An RDMA reload skips the target-side post-processing and keeps derived
+    state from the original load, which is only valid for those same weights.
+    This compares identities, so it is as strong as the identity's revision:
+    an empty or branch revision only proves the same model name.
+    """
+    if ctx.loaded_identity is None:
+        return False
+    return compute_mx_source_id(ctx.loaded_identity) == compute_mx_source_id(
+        ctx.identity
+    )
+
+
+class NixlP2PStrategy(LoadStrategy):
+    """Shared source discovery, receive and recovery for NIXL P2P strategies."""
+
+    channel = "auto"
+    requires = (EngineAdapter.discover_tensors,)
+    requires_tensor_read_lease = False
+
+    def _state(self, ctx: LoadContext) -> P2PState:
+        if ctx.p2p_state is None:
+            ctx.p2p_state = P2PState(resolve_policy())
+        return ctx.p2p_state
+
+    def prepare(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Nothing to do before load(); the target is prepared in _load_as_target.
+
+        Preparing the target rewrites the model into the source's processed
+        layout, so it can only happen once a source has been selected: a miss
+        with no source would otherwise hand the next strategy a model it
+        cannot stream raw checkpoint weights into, while reporting itself as
+        not mutated. It also has to run again for every candidate, because a
+        failed candidate leaves a reinitialized model behind.
+
+        A reload target needs no preparation at all: it already has real
+        storage, in the processed layout it was post-processed into before the
+        checkpoint. Re-running that processing is not merely redundant, it is
+        destructive -- vLLM's post-load processing is not idempotent.
+        convert_moe_weights_to_flashinfer_trtllm_block_layout reshapes MoE
+        experts from [E, rows, cols] to [E, cols/block_k, rows, block_k], then
+        on a second pass tries to unpack two dims from its own 4-D output and
+        dies with "too many values to unpack (expected 2)", taking the whole
+        RDMA attempt with it.
+
+        Overridden rather than inherited so a reload never enters the engine's
+        layerwise reload: weights land zero-copy in the existing buffers
+        rather than passing through load_weights(), and deferring those
+        buffers to meta would leave the transfer nowhere the model executes
+        against.
+        """
+
+    def finalize(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Already finalized inside the candidate loop; do not process twice."""
+
+    def abort(self, result: LoadResult, ctx: LoadContext) -> None:
+        """Nothing to undo: prepare() starts no engine state, and rollback()
+        releases the NIXL state the transfer acquired."""
+
+    def rollback(self, ctx: LoadContext) -> None:
+        """Clean up NIXL state from a failed RDMA target attempt."""
+        try:
+            if ctx.nixl_manager is not None:
+                if _is_draft_pass(ctx) and ctx.nixl_manager is ctx.shared_nixl_manager:
+                    # The agent belongs to the main load, which keeps serving from
+                    # it. Release only the draft's own registrations.
+                    ctx.nixl_manager.deregister_tensors(ctx.tensors)
+                else:
+                    ctx.nixl_manager.shutdown()
+        except Exception as error:
+            raise StrategyRecoveryError(
+                f"Failed to release NIXL receiver: {error}"
+            ) from error
+        ctx.tensors = {}
+        ctx.nixl_manager = None
+
+    def is_available(self, ctx: LoadContext) -> bool:
+        if adaptive_enabled():
+            if (
+                ctx.p2p_role != "main"
+                or ctx.is_reload
+                or ctx.accelerator_backend.name != "cuda"
+                or getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
+            ):
+                return False
+        if not ctx.p2p_enabled or getattr(ctx, "skip_rdma", False) is True:
+            return False
+        if not super().is_available(ctx):
+            return False
+        if not is_nixl_available():
+            return False
+
+        if not ctx.accelerator_backend.supports_rdma_p2p():
+            logger.info(
+                f"[Worker {ctx.global_rank}] Backend "
+                f"{ctx.accelerator_backend.name} does not support RDMA P2P, skipping"
+            )
+            return False
+
+        # Decentralized backends (k8s-service) serve their own
+        # metadata; skip the central-server precondition for them.
+        # Strict `is True` check so MagicMock's auto-attribute doesn't
+        # masquerade as the flag in tests.
+        server_addr = (
+            ctx.mx_server_url or envs.MODEL_EXPRESS_URL or envs.MX_SERVER_ADDRESS
+        )
+        requires_p2p = getattr(ctx.mx_client, "REQUIRES_P2P_METADATA", False) is True
+        if not server_addr and not requires_p2p:
+            logger.info(
+                f"[Worker {ctx.global_rank}] No MX server configured, skipping RDMA"
+            )
+            return False
+
+        allowed, reason = check_transfer_allowed(ctx.model_config)
+        if not allowed:
+            logger.info(f"[Worker {ctx.global_rank}] RDMA transfer disabled: {reason}")
+            return False
+
+        if ctx.is_reload and not _reload_restores_loaded_weights(ctx):
+            logger.info(
+                f"[Worker {ctx.global_rank}] Reload targets weights other than "
+                "the loaded ones, skipping RDMA"
+            )
+            return False
+
+        return True
+
+    def load(self, result: LoadResult, ctx: LoadContext) -> LoadResult:
+        """Load from a READY source or raise StrategyFailed for fallback.
+
+        Source discovery and metadata misses do not mutate the target model.
+        A failed transfer retries the next candidate. If it may have mutated
+        the model, the adapter first replaces the model with a fresh instance.
+        """
+        result = _as_load_result(result)
+        if _is_draft_pass(ctx) and ctx.shared_nixl_manager is None:
+            logger.info(
+                f"[Worker {ctx.global_rank}] Speculative draft pass has no "
+                "main-load NIXL agent to share, skipping RDMA"
+            )
+            raise StrategyFailed(
+                "No main-load NIXL agent for the draft pass", mutated=False
+            )
+        candidates = self._find_source_instances(ctx)
+        if not candidates:
+            logger.info(
+                f"[Worker {ctx.global_rank}] No RDMA source available, skipping"
+            )
+            raise StrategyFailed("No RDMA source available", mutated=False)
+
+        state = self._state(ctx)
+        is_draft = _is_draft_pass(ctx)
+        max_lookups = MAX_DRAFT_SOURCE_METADATA_LOOKUPS if is_draft else MAX_SOURCE_RETRIES
+        attempts = candidates[:max_lookups]
+        transfer_attempts = 0
+        policy = configured_policy_label()
+        for attempt_index, instance in enumerate(attempts):
+            mx_source_id = instance.mx_source_id
+            worker_id = instance.worker_id
+            logger.info(
+                f"[Worker {ctx.global_rank}] Source attempt: "
+                f"channel={self.channel} "
+                f"source_attempt_index={attempt_index} "
+                f"source_worker_id={worker_id} mx_source_id={mx_source_id}"
+            )
+
+            try:
+                with selection_metrics.time_source_attempt_phase(policy, "metadata"):
+                    source_worker = self._fetch_worker_metadata(
+                        ctx,
+                        mx_source_id,
+                        worker_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] Failed to fetch metadata for worker {worker_id}: {e}. "
+                    f"Trying next candidate."
+                )
+                selection_metrics.record_metadata_failure(policy)
+                selection_metrics.record_attempt(policy, "metadata_miss")
+                continue
+
+            if source_worker is None:
+                selection_metrics.record_attempt(policy, "metadata_miss")
+                continue
+
+            if (
+                state.policy is not None
+                and state.policy.enforcement == "adaptive"
+                and self.channel == "auto"
+                and not in_domain(source_worker, state.policy)
+            ):
+                continue
+            if not self._accelerator_compatible(ctx, source_worker, worker_id):
+                continue
+
+            if is_draft and not self._may_serve_draft(ctx, source_worker):
+                logger.info(
+                    f"[Worker {ctx.global_rank}] Skipping source worker "
+                    f"{worker_id}: its manifest has no speculative draft tensors"
+                )
+                selection_metrics.record_attempt(policy, "metadata_miss")
+                continue
+
+            logger.info(
+                f"[Worker {ctx.global_rank}] Trying source worker {worker_id} "
+                f"({worker_tensor_count(source_worker)} tensors)"
+            )
+
+            # The peer id is always passed; the collector drops it unless
+            # MX_METRICS_SOURCE_ID_LABEL=1, so the cardinality decision lives in
+            # one place rather than being duplicated at every call site.
+            selection_metrics.record_selection(policy, worker_id)
+            transfer_attempts += 1
+            transfer_start = time.perf_counter()
+            try:
+                out = self._load_as_target(
+                    result,
+                    ctx,
+                    source_worker,
+                    mx_source_id,
+                    worker_id,
+                )
+            except StrategyFailed as e:
+                has_next_candidate = (
+                    (not adaptive_enabled() or state.last_failure is P2PFailure.SOURCE)
+                    and transfer_attempts < MAX_SOURCE_RETRIES
+                    and attempt_index + 1 < len(attempts)
+                )
+                selection_metrics.observe_transfer_seconds(
+                    policy,
+                    "retry" if has_next_candidate else "fallback",
+                    time.perf_counter() - transfer_start,
+                )
+                selection_metrics.record_attempt(
+                    policy,
+                    "transfer_retry" if has_next_candidate else "transfer_fallback",
+                )
+                if not has_next_candidate:
+                    raise
+
+                logger.warning(
+                    f"[Worker {ctx.global_rank}] RDMA source worker {worker_id} "
+                    f"failed: {e}. Trying next candidate."
+                )
+                try:
+                    self.rollback(ctx)
+                except Exception as cleanup_error:
+                    raise StrategyRecoveryError(
+                        f"Failed to clean up target after source worker "
+                        f"{worker_id} failed: {cleanup_error}",
+                    ) from cleanup_error
+                # A reload target is the engine's live model; the next
+                # candidate overwrites it in place, see execute_load_strategies.
+                if e.mutated and not ctx.is_reload:
+                    try:
+                        clear_exception_tracebacks(e)
+                        reinitialized = ctx.adapter.reinit_for_retry(result)
+                        # LoadResult is the stable envelope shared with the
+                        # outer strategy chain. Some adapters return a new
+                        # envelope, so copy its restored state back rather than
+                        # leaving the outer owner with the cleared pre-retry
+                        # object if all later candidates miss.
+                        if reinitialized is not result:
+                            vars(result).update(vars(reinitialized))
+                    except Exception as reinit_error:
+                        raise StrategyRecoveryError(
+                            f"Failed to reinitialize target after source worker "
+                            f"{worker_id} failed: {reinit_error}",
+                        ) from reinit_error
+                continue
+            except BaseException:
+                selection_metrics.observe_transfer_seconds(
+                    policy, "fallback", time.perf_counter() - transfer_start
+                )
+                selection_metrics.record_attempt(policy, "transfer_fallback")
+                raise
+            selection_metrics.observe_transfer_seconds(
+                policy, "success", time.perf_counter() - transfer_start
+            )
+            selection_metrics.record_attempt(policy, "success")
+            return out
+
+        logger.warning(
+            f"[Worker {ctx.global_rank}] Checked {len(attempts)} of {len(candidates)} "
+            f"source workers and attempted {transfer_attempts} transfers "
+            f"(max transfers={MAX_SOURCE_RETRIES}), falling through"
+        )
+        raise StrategyFailed(
+            "No RDMA source succeeded",
+            mutated=False,
+        )
+
+    def _find_source_instances(
+        self,
+        ctx: LoadContext,
+    ) -> list[p2p_pb2.SourceInstanceRef]:
+        """Return READY source instances ranked by the configured selector.
+
+        Filters listed instances to the target's worker_rank, then delegates
+        ordering to the policy named by MX_P2P_SOURCE_SELECTOR (default
+        ``random``). The caller in load() applies the lookup and transfer
+        limits, so the selector controls ordering only.
+        """
+        policy = configured_policy_label()
+        state = self._state(ctx)
+        topology_policy = state.policy
+        if state.sources is not None:
+            return apply_policy(
+                list(state.sources), topology_policy, channel=self.channel
+            )
+        state.sources = ()
+        if blocks_selection(topology_policy):
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Topology domain "
+                f"{topology_policy.domain!r} is required but unknown for this "
+                f"node, skipping RDMA"
+            )
+            return []
+        try:
+            list_resp = ctx.mx_client.list_sources(
+                identity=ctx.p2p_source_identity or ctx.identity,
+                status_filter=p2p_pb2.SOURCE_STATUS_READY,
+            )
+            if not list_resp.instances:
+                logger.debug(
+                    f"[Worker {ctx.global_rank}] No ready source instances found"
+                )
+                # Record the empty funnel before returning. Without this,
+                # ``stage="listed"`` could never observe zero -- the one bucket
+                # that distinguishes "no peers published" from "peers listed but
+                # every one filtered out" was unreachable, so the two looked
+                # identical on a dashboard.
+                selection_metrics.record_list_sources(policy, "empty")
+                stages = ["listed", "rank_matched", "accelerator_matched"]
+                if topology_policy is not None:
+                    stages.append("topology_matched")
+                for stage in stages:
+                    selection_metrics.observe_candidates(policy, stage, 0)
+                return []
+
+            rank_matched = [
+                inst
+                for inst in list_resp.instances
+                if inst.worker_rank == ctx.worker_rank
+            ]
+
+            # Drop accelerator-incompatible sources before ordering and the
+            # retry-cap slice, so the selector only ranks eligible peers and a
+            # compatible source can never be pushed past MAX_SOURCE_RETRIES by
+            # incompatible ones. The post-GetMetadata check in load() stays as
+            # defense-in-depth (empty refs, stale records, metadata drift).
+            target_accelerator = ctx.accelerator_backend.name
+            candidates = [
+                inst
+                for inst in rank_matched
+                if accelerators_compatible(
+                    target_accelerator,
+                    inst.accelerator,
+                    mx_source_type=ctx.identity.mx_source_type,
+                    quantization=ctx.identity.quantization,
+                    dtype=ctx.identity.dtype,
+                )
+            ]
+
+            selector = get_configured_selector()
+            select_start = time.perf_counter()
+            ordered = selector.order(candidates, ctx)
+            if adaptive_enabled():
+                unique = {}
+                for source in ordered:
+                    unique.setdefault((source.mx_source_id, source.worker_id), source)
+                ordered = list(unique.values())
+            state.sources = tuple(ordered)
+            ordered = apply_policy(ordered, topology_policy, channel=self.channel)
+            select_seconds = time.perf_counter() - select_start
+
+            selection_metrics.record_list_sources(selector.name, "ok")
+            selection_metrics.observe_candidates(
+                selector.name, "listed", len(list_resp.instances)
+            )
+            selection_metrics.observe_candidates(
+                selector.name, "rank_matched", len(rank_matched)
+            )
+            selection_metrics.observe_candidates(
+                selector.name, "accelerator_matched", len(candidates)
+            )
+            topology_field = ""
+            if topology_policy is not None:
+                topology_matched = count_in_domain(ordered, topology_policy)
+                selection_metrics.observe_candidates(
+                    selector.name, "topology_matched", topology_matched
+                )
+                topology_field = f" source_candidates_topology_matched={topology_matched}"
+                warn_if_no_domain_match(candidates, topology_policy, ctx.global_rank)
+            selection_metrics.observe_selection_seconds(selector.name, select_seconds)
+
+            # Surface the source-published load the client saw, so a dashboard can
+            # compare how load_aware steers vs random/rendezvous. The collector
+            # decides what one series means when the per-peer label is off.
+            selection_metrics.observe_candidate_loads(ordered)
+
+            logger.info(
+                f"[Worker {ctx.global_rank}] Source selection: "
+                f"source_selector={selector.name} "
+                f"source_candidates_total={len(list_resp.instances)} "
+                f"source_candidates_rank_matched={len(rank_matched)} "
+                f"source_candidates_accelerator_matched={len(candidates)}"
+                f"{topology_field}"
+            )
+            if ordered:
+                logger.debug(
+                    f"[Worker {ctx.global_rank}] Ranked source workers: "
+                    f"{[inst.worker_id for inst in ordered]}"
+                )
+            return ordered
+
+        except Exception as e:
+            logger.warning(
+                f"[Worker {ctx.global_rank}] Error listing sources, falling through: {e}"
+            )
+            # A ListSources RPC failure used to record nothing at all, so a
+            # complete backend outage was indistinguishable from a cluster with
+            # no peers -- both showed up as an absence. This counter is what
+            # separates them.
+            selection_metrics.record_list_sources(policy, "error")
+            return []
+
+    def _accelerator_compatible(
+        self,
+        ctx: LoadContext,
+        source_worker: p2p_pb2.WorkerMetadata,
+        worker_id: str,
+    ) -> bool:
+        """Return whether source and target accelerator metadata are compatible.
+
+        Defense-in-depth re-check on the authoritative ``WorkerMetadata`` after
+        GetMetadata: the pre-slice filter in ``_find_source_instances`` uses the
+        lightweight ``SourceInstanceRef.accelerator``, which may be empty on old
+        servers or drift between list and fetch.
+        """
+        target_accelerator = ctx.accelerator_backend.name
+        source_accelerator = source_worker.accelerator
+        if accelerators_compatible(
+            target_accelerator,
+            source_accelerator,
+            mx_source_type=ctx.identity.mx_source_type,
+            quantization=ctx.identity.quantization,
+            dtype=ctx.identity.dtype,
+            defer_unknown=False,
+        ):
+            return True
+
+        logger.info(
+            f"[Worker {ctx.global_rank}] Skipping source worker {worker_id}: "
+            f"accelerator mismatch source={source_accelerator!r}, "
+            f"target={target_accelerator!r}"
+        )
+        return False
+
+    @staticmethod
+    def _may_serve_draft(
+        ctx: LoadContext, source_worker: p2p_pb2.WorkerMetadata
+    ) -> bool:
+        """False only when a known manifest carries no draft tensors.
+
+        A source that served the target but not a draft (no speculative
+        config, or its draft pass fell back) must not be tried: the draft
+        would receive nothing. An unknown manifest (P2P metadata that was not
+        prefetched) is left to the receive-time coverage check.
+        """
+        descriptors = worker_tensor_descriptors(source_worker)
+        if not descriptors:
+            return True
+        return any(_matches_draft_namespace(ctx, t.name) for t in descriptors)
+
+    @staticmethod
+    def _scope_source_tensors(
+        ctx: LoadContext,
+        source_tensors: list[TensorDescriptor],
+    ) -> list[TensorDescriptor]:
+        """Restrict a source manifest to this load's namespace.
+
+        One publication carries the main load's tensors and, namespaced
+        under DRAFT_TENSOR_PREFIX, the speculative draft's. The main pass
+        must not see draft entries (they would break exact-match on
+        heterogeneous transfers) and the draft pass takes only its own.
+        """
+        if not _is_draft_pass(ctx):
+            return [t for t in source_tensors if not is_draft_tensor_name(t.name)]
+        scoped = [
+            t for t in source_tensors
+            if _matches_draft_namespace(ctx, t.name)
+        ]
+        missing = set(ctx.tensors) - {t.name for t in scoped}
+        if missing:
+            # Receiving a partial draft would leave the rest at dummy values;
+            # fail so the chain falls back to storage for the draft.
+            raise RuntimeError(
+                f"source manifest lacks {len(missing)} of {len(ctx.tensors)} "
+                f"draft tensors (first: {sorted(missing)[:5]})"
+            )
+        return scoped
+
+    def _fetch_worker_metadata(
+        self,
+        ctx: LoadContext,
+        mx_source_id: str,
+        worker_id: str,
+    ) -> p2p_pb2.WorkerMetadata | None:
+        """Fetch tensor metadata for one worker."""
+        fetch_start = time.perf_counter()
+        metadata_resp = ctx.mx_client.get_metadata(
+            mx_source_id=mx_source_id,
+            worker_id=worker_id,
+        )
+        if not metadata_resp.found:
+            logger.debug(
+                f"[Worker {ctx.global_rank}] Metadata not found for worker {worker_id}, skipping"
+            )
+            return None
+        worker = metadata_resp.worker
+        if worker.status != p2p_pb2.SOURCE_STATUS_READY:
+            return None
+        has_tensor_descriptors = bool(worker_tensor_descriptors(worker))
+        if not has_tensor_descriptors and not worker.worker_grpc_endpoint:
+            logger.debug(
+                f"[Worker {ctx.global_rank}] Worker {worker_id} has no tensors "
+                f"and no P2P endpoint, skipping"
+            )
+            return None
+        # A worker ID requires endpoint validation. Without one, fetch only
+        # when the metadata response did not already include the manifest.
+        needs_manifest_prefetch = worker_id != "" or not has_tensor_descriptors
+        if worker.worker_grpc_endpoint and needs_manifest_prefetch:
+            self._prefetch_tensor_manifest(ctx, worker, mx_source_id, worker_id)
+        fetch_time = time.perf_counter() - fetch_start
+        mode = "P2P (lightweight)" if worker.worker_grpc_endpoint else "centralized"
+        tensor_count = worker_tensor_count(worker)
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] GetMetadata ({mode}): "
+            f"{fetch_time:.3f}s, {tensor_count} tensors"
+        )
+        return worker
+
+    def _prefetch_tensor_manifest(
+        self,
+        ctx: LoadContext,
+        source_worker: p2p_pb2.WorkerMetadata,
+        mx_source_id: str,
+        worker_id: str,
+    ) -> None:
+        """Fetch once before target preparation and retain it for the transfer."""
+        from ..metadata.worker_server import fetch_tensor_manifest
+
+        manifest_start = time.perf_counter()
+        manifest = fetch_tensor_manifest(
+            endpoint=source_worker.worker_grpc_endpoint,
+            mx_source_id=mx_source_id,
+            worker_id=worker_id,
+        )
+        for field in ("agent_name", "metadata_endpoint"):
+            if getattr(manifest, field) != getattr(source_worker, field):
+                raise RuntimeError(f"Tensor manifest {field} mismatch")
+        # Store the validated descriptors on the metadata object so the
+        # transfer can reuse them without a second manifest RPC.
+        source_worker.tensor_source.ClearField("tensors")
+        source_worker.tensor_source.tensors.extend(manifest.tensors)
+        manifest_time = time.perf_counter() - manifest_start
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] P2P tensor manifest: "
+            f"{manifest_time:.3f}s ({len(manifest.tensors)} tensors, "
+            f"{manifest.ByteSize()} bytes)"
+        )
+
+    @staticmethod
+    def _use_prefetched_manifest(source_worker):
+        return (
+            None,
+            worker_tensor_descriptors(source_worker),
+            source_worker.metadata_endpoint,
+            source_worker.agent_name,
+        )
+
+    def _prepare_leased_manifest(
+        self,
+        ctx: LoadContext,
+        source_worker,
+        mx_source_id: str,
+        source_worker_id: str,
+    ):
+        from ..metadata.worker_server import prepare_tensor_read
+
+        max_retries, retry_backoff = ctx.mx_client.worker_rpc_retry_policy()
+        tensor_read, _ = prepare_tensor_read(
+            source_worker.worker_grpc_endpoint,
+            mx_source_id,
+            worker_id=source_worker_id,
+            timeout=_transfer_timeout_seconds(),
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff,
+        )
+        manifest = tensor_read.manifest
+        return (
+            tensor_read,
+            manifest.tensors,
+            manifest.metadata_endpoint,
+            manifest.agent_name,
+        )
+
+    def _load_as_target(
+        self,
+        result: LoadResult,
+        ctx: LoadContext,
+        source_worker,
+        mx_source_id: str,
+        source_worker_id: str,
+    ) -> LoadResult:
+        """Receive fully-processed weights through this strategy's NIXL context."""
+        # The source-selection policy (random, rendezvous_hash, load_aware, ...)
+        # that chose this candidate. Every P2P client family carries it, so a
+        # phase duration can be read against the policy that picked the peer.
+        policy = configured_policy_label()
+        state = self._state(ctx)
+        state.last_failure = P2PFailure.MODEL
+        try:
+            with selection_metrics.time_source_attempt_phase(policy, "prepare"):
+                # A reload target is already prepared; see prepare().
+                if not ctx.is_reload:
+                    result = ctx.adapter.prepare_rdma_target(result)
+                    result = ctx.adapter.before_rdma_receive(result)
+            self._receive_from_peer(
+                result,
+                ctx,
+                source_worker,
+                mx_source_id,
+                source_worker_id,
+            )
+            state.last_failure = P2PFailure.MODEL
+            with selection_metrics.time_source_attempt_phase(policy, "finalize"):
+                # A reload target is already finalized; see finalize().
+                if not ctx.is_reload:
+                    result = ctx.adapter.after_rdma_receive(result)
+                # A peer rank may still fail this strategy. Allow this
+                # rank to join TCP after the chain recovers the model.
+                state.last_failure = P2PFailure.SOURCE
+                return result
+        except (StrategyFailed, StrategyRecoveryError):
+            raise
+        except Exception as e:
+            if isinstance(e, ManifestMismatchError):
+                state.last_failure = P2PFailure.SOURCE
+            # The chain clears tracebacks on a mutated StrategyFailed before
+            # falling back (see clear_exception_tracebacks), so by the time this
+            # surfaces in the logs only the message survives -- "too many values
+            # to unpack (expected 2)" with no frame is not actionable. Record
+            # the frames here, while they still exist.
+            logger.exception(
+                f"[Worker {ctx.global_rank}] P2P target load failed "
+                f"(channel={self.channel}) "
+                f"(source_worker_id={source_worker_id}, mx_source_id={mx_source_id})"
+            )
+            raise StrategyFailed(str(e), mutated=True) from e
+
+    def _receive_from_peer(
+        self,
+        result: LoadResult,
+        ctx: LoadContext,
+        source_worker,
+        mx_source_id: str,
+        source_worker_id: str,
+    ) -> None:
+        """Receive fully-processed tensors from the selected source."""
+        receive_start = time.perf_counter()
+        policy = configured_policy_label()
+        is_p2p = bool(source_worker.worker_grpc_endpoint)
+        remote_agent_name = None
+
+        tensor_read = None
+        try:
+            if is_p2p:
+                if self.requires_tensor_read_lease:
+                    tensor_read, tensor_protos, ep, agent_name = (
+                        self._prepare_leased_manifest(
+                            ctx,
+                            source_worker,
+                            mx_source_id,
+                            source_worker_id,
+                        )
+                    )
+                else:
+                    tensor_read, tensor_protos, ep, agent_name = (
+                        self._use_prefetched_manifest(source_worker)
+                    )
+            else:
+                tensor_protos = worker_tensor_descriptors(source_worker)
+            source_tensors = [
+                TensorDescriptor(
+                    name=t.name,
+                    addr=t.addr,
+                    size=t.size,
+                    device_id=t.device_id,
+                    dtype=t.dtype,
+                    mem_type=t.mem_type,
+                )
+                for t in tensor_protos
+            ]
+            source_tensors = self._scope_source_tensors(ctx, source_tensors)
+            if not ctx.is_reload:
+                adapter_tensors = source_tensors
+                if _is_draft_pass(ctx):
+                    adapter_tensors = [
+                        replace(t, name=t.name.removeprefix(ctx.draft_tensor_namespace))
+                        for t in source_tensors
+                    ]
+                ctx.adapter.prepare_rdma_target_from_manifest(result, adapter_tensors)
+            state = self._state(ctx)
+            if adaptive_enabled() and ctx.nixl_manager is None:
+                state.last_failure = P2PFailure.CHANNEL
+                ctx.nixl_manager = _init_nixl_manager(
+                    ctx.global_rank,
+                    ctx.device_id,
+                    self.channel,
+                    listen_port=(
+                        0 if self.channel == "tcp"
+                        else envs.MX_METADATA_PORT + ctx.device_id
+                    ),
+                    accelerator_backend=ctx.accelerator_backend,
+                    ucx_mode=self.channel,
+                )
+            state.last_failure = P2PFailure.MODEL
+            with selection_metrics.time_source_attempt_phase(policy, "register"):
+                try:
+                    register_tensors(result, ctx, required=True)
+                except StrategyRecoveryError:
+                    raise
+                except Exception as error:
+                    if isinstance(error, NixlRegistrationError):
+                        state.last_failure = P2PFailure.CHANNEL
+                    raise StrategyFailed(
+                        f"NIXL registration failed: {error}", mutated=True
+                    ) from error
+            if _is_draft_pass(ctx):
+                # Registration refreshes ctx.tensors with newly prepared buffers.
+                source_tensors = self._scope_source_tensors(ctx, source_tensors)
+
+            # Registration can be skipped when the model or metadata path is absent.
+            if ctx.nixl_manager is None:
+                raise StrategyFailed(
+                    "NIXL registration unavailable, cannot receive weights",
+                    mutated=True,
+                )
+
+            state.last_failure = P2PFailure.SOURCE
+
+            if is_p2p:
+                host, port_str = ep.rsplit(":", 1)
+                # Claimed before the dial so a fetch that fails part-way, leaving
+                # metadata that lands later, is still released.
+                remote_agent_name = agent_name
+                # One handshake phase, two transports: here the peer's NIXL
+                # metadata is fetched from the peer itself; the centralized
+                # branch below loads the copy the MX server holds. Exactly one
+                # of the two runs per attempt.
+                try:
+                    with selection_metrics.time_source_attempt_phase(
+                        policy, "handshake"
+                    ) as handshake:
+                        ctx.nixl_manager.fetch_remote_and_wait(
+                            remote_agent_name=agent_name,
+                            ip=host,
+                            port=int(port_str),
+                            timeout_seconds=envs.MX_NIXL_METADATA_TIMEOUT,
+                        )
+                except BaseException:
+                    ctx.nixl_manager.remove_remote_agent(remote_agent_name)
+                    remote_agent_name = None
+                    raise
+                logger.info(
+                    f"[Worker {ctx.global_rank}] [TIMING] P2P NIXL metadata fetch: "
+                    f"{handshake.seconds:.3f}s"
+                )
+            else:
+                # Loaded here rather than inside receive_from_source so this method
+                # holds the name it is responsible for releasing.
+                with selection_metrics.time_source_attempt_phase(
+                    policy, "handshake"
+                ) as handshake:
+                    remote_agent_name = ctx.nixl_manager.add_remote_agent(
+                        source_worker.nixl_metadata
+                    )
+                logger.info(
+                    f"[Worker {ctx.global_rank}] [TIMING] add_remote_agent: "
+                    f"{handshake.seconds:.3f}s (agent={remote_agent_name})"
+                )
+
+            try:
+                logger.info(
+                    f"[Worker {ctx.global_rank}] Receiving "
+                    f"{len(source_tensors)} tensors from source"
+                    f"{' (P2P)' if is_p2p else ''}"
+                )
+
+                # Cross-family (heterogeneous) transfers must name the exact same tensor
+                # set on both sides: a name diff can mean vendor-specific hidden/derived
+                # tensors, which would leave part of the target at dummy values while
+                # RDMA reports success. Same-family transfers tolerate subset transfers
+                # unless the context asks for an exact catalog.
+                target_accelerator = ctx.accelerator_backend.name
+                source_accelerator = source_worker.accelerator
+                require_exact_match = (
+                    ctx.require_exact_tensor_catalog
+                    or ctx.adapter.requires_exact_tensor_catalog()
+                    or bool(
+                        target_accelerator
+                        and source_accelerator
+                        and target_accelerator != source_accelerator
+                    )
+                )
+
+                try:
+                    with selection_metrics.time_source_attempt_phase(
+                        policy, "receive"
+                    ) as received:
+                        (
+                            bytes_transferred,
+                            tensor_count,
+                            _,
+                        ) = ctx.nixl_manager.receive_from_source(
+                            source_metadata=source_worker.nixl_metadata,
+                            source_tensors=source_tensors,
+                            timeout_seconds=_transfer_timeout_seconds(),
+                            remote_agent_name=remote_agent_name,
+                            require_exact_match=require_exact_match,
+                            # The shared agent's catalog also holds the main
+                            # load's tensors; match only the draft's.
+                            destination_tensors=(
+                                ctx.tensors if _is_draft_pass(ctx) else None
+                            ),
+                        )
+                except Exception as e:
+                    raise SourceTransferError(
+                        f"P2P receive failed (channel={self.channel}): {e}"
+                    ) from e
+                transfer_time = received.seconds
+
+                bandwidth_gbps = (
+                    (bytes_transferred * 8) / (transfer_time * 1e9)
+                    if transfer_time > 0
+                    else 0
+                )
+                logger.info(
+                    f"[Worker {ctx.global_rank}] [TIMING] P2P transfer complete "
+                    f"(channel={self.channel}): "
+                    f"{tensor_count} tensors, {bytes_transferred / 1e9:.2f} GB, "
+                    f"{transfer_time:.3f}s, {bandwidth_gbps:.1f} Gbps"
+                )
+
+                ctx.accelerator_backend.synchronize()
+            finally:
+                # A weight load is one-shot, so release the source here instead of at
+                # process exit: the engine process is torn down without running atexit
+                # hooks, and in P2P only the reader holds a record of the peer to
+                # invalidate. None means acquisition failed with nothing to release.
+                if remote_agent_name is not None and ctx.nixl_manager is not None:
+                    # Release is best-effort. Raising from a finally: replaces the
+                    # exception that is unwinding through it, so a failure here
+                    # would report itself as the reason the transfer failed and
+                    # bury the real one.
+                    try:
+                        with selection_metrics.time_source_attempt_phase(
+                            policy, "release"
+                        ):
+                            ctx.nixl_manager.remove_remote_agent(remote_agent_name)
+                    except Exception:
+                        logger.warning(
+                            f"[Worker {ctx.global_rank}] Failed to release source "
+                            f"agent '{remote_agent_name}'; it may stay connected "
+                            "until the process exits",
+                            exc_info=True,
+                        )
+        finally:
+            if tensor_read is not None:
+                tensor_read.close()
+
+        total_time = time.perf_counter() - receive_start
+        logger.info(
+            f"[Worker {ctx.global_rank}] [TIMING] Total receive time: {total_time:.2f}s"
+        )

@@ -151,7 +151,7 @@ def local_topology(raw: Optional[str] = None) -> dict[str, str]:
     return {k: v for k, v in parsed.items() if _domain_value(v) is not None}
 
 
-TOPOLOGY_ENFORCEMENTS = ("required", "preferred")
+TOPOLOGY_ENFORCEMENTS = ("required", "preferred", "adaptive")
 _DEFAULT_ENFORCEMENT = "required"
 DOMAIN_WAIT_TIMEOUT_S = 30.0
 _DOMAIN_WAIT_POLL_S = 1.0
@@ -211,6 +211,12 @@ def wait_for_domain(
     return topology
 
 
+def adaptive_enabled() -> bool:
+    from . import envs
+
+    return (envs.MX_P2P_TOPOLOGY_ENFORCEMENT or "").strip().lower() == "adaptive"
+
+
 def resolve_policy(timeout: Optional[float] = None) -> Optional[TopologyPolicy]:
     """The configured transfer-domain policy, or None when none is configured."""
     from . import envs
@@ -233,7 +239,7 @@ def resolve_policy(timeout: Optional[float] = None) -> Optional[TopologyPolicy]:
         enforcement = _DEFAULT_ENFORCEMENT
     # Under preferred an unknown value only keeps the selector's order, which is
     # not worth delaying the load for.
-    if enforcement != "required":
+    if enforcement == "preferred":
         timeout = 0.0
     start = time.monotonic()
     local_value = _domain_value(wait_for_domain(domain, timeout=timeout).get(domain))
@@ -313,16 +319,19 @@ def warn_if_no_domain_match(
     )
 
 
-def apply_policy(candidates: list, policy: Optional[TopologyPolicy]) -> list:
-    """Filter (required) or stably partition (preferred) ordered candidates.
+def apply_policy(
+    candidates: list, policy: Optional[TopologyPolicy], *, channel: str = "auto"
+) -> list:
+    """Apply the domain constraint to candidates for the requested channel.
 
     Order within each group is preserved, so this composes with any selector.
     Under ``required`` a source that published no value for the domain is
     ineligible, and so is every source when this node's own value is unknown.
+    Adaptive uses that constraint for auto and same-domain-first ordering for TCP.
     """
     if policy is None:
         return list(candidates)
     matched = [c for c in candidates if in_domain(c, policy)]
-    if policy.required:
+    if policy.required or (policy.enforcement == "adaptive" and channel == "auto"):
         return matched
     return matched + [c for c in candidates if not in_domain(c, policy)]

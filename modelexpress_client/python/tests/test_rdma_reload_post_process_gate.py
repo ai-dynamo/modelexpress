@@ -39,6 +39,7 @@ from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
 def _ctx(*, is_reload: bool):
     return SimpleNamespace(
+        p2p_state=None,
         global_rank=0,
         is_reload=is_reload,
         adapter=MagicMock(),

@@ -32,6 +32,7 @@ from ..nixl_transfer import is_nixl_available
 from .artifact_transfer import (
     ArtifactCacheRoot,
     ArtifactTransfer,
+    ArtifactTransferCleanupError,
 )
 from .artifact_transport import (
     ArtifactCacheMiss,
@@ -68,6 +69,10 @@ def install_artifacts(
     log: logging.Logger = logger,
 ) -> None:
     """Best-effort install of compatible artifacts before model loading."""
+    from ..topology import adaptive_enabled
+
+    if adaptive_enabled() and _artifact_backend() != "nixl":
+        return
     if not _artifact_transfer_enabled():
         return
     backend = _artifact_backend()
@@ -107,6 +112,8 @@ def install_artifacts(
                 header.total_size / (1024 * 1024),
                 elapsed,
             )
+        except ArtifactTransferCleanupError:
+            raise
         except ArtifactCacheStale as exc:
             log.warning(
                 "[Worker %s] Remote %s artifact is stale for %s "

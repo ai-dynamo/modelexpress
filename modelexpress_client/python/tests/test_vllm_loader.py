@@ -191,6 +191,8 @@ class _FakeAdapter(EngineAdapter):
 
 def _make_metadata_resp(found=True, rank=0, mx_source_id="abc123def456abcd", worker_id="inst-1"):
     worker = _make_worker(rank=rank) if found else None
+    if worker is not None:
+        worker.status = p2p_pb2.SOURCE_STATUS_READY
     return p2p_pb2.GetMetadataResponse(
         found=found,
         worker=worker,
@@ -798,10 +800,10 @@ class TestRdmaReloadIdentityGate:
         ctx.accelerator_backend = MagicMock()
         ctx.accelerator_backend.supports_rdma_p2p.return_value = True
         with patch.dict(os.environ, {"MX_SERVER_ADDRESS": "server:8001"}), patch(
-            "modelexpress.load_strategy.rdma_strategy.is_nixl_available",
+            "modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available",
             return_value=True,
         ), patch(
-            "modelexpress.load_strategy.rdma_strategy.check_transfer_allowed",
+            "modelexpress.load_strategy.nixl_p2p_strategy.check_transfer_allowed",
             return_value=(True, ""),
         ):
             return RdmaStrategy().is_available(ctx)
@@ -1497,7 +1499,7 @@ class TestMtpDrafterSecondLoad:
         ctx.adapter.discover_tensors.assert_not_called()
         assert ctx.nixl_manager is None
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True)
     def test_rdma_unavailable_when_p2p_disabled(self, _mock):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
@@ -1608,7 +1610,7 @@ class TestMtpDrafterSecondLoad:
 
         assert ctx.draft_published is False
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True)
     def test_rdma_available_for_draft(self, _mock):
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
@@ -1616,7 +1618,7 @@ class TestMtpDrafterSecondLoad:
         ctx.accelerator_backend = MagicMock()
         ctx.accelerator_backend.supports_rdma_p2p.return_value = True
         with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}), patch(
-            "modelexpress.load_strategy.rdma_strategy.check_transfer_allowed",
+            "modelexpress.load_strategy.nixl_p2p_strategy.check_transfer_allowed",
             return_value=(True, ""),
         ):
             assert RdmaStrategy().is_available(ctx) is True
@@ -1726,7 +1728,7 @@ class TestMtpDrafterSecondLoad:
         model = MagicMock()
 
         with patch.dict(os.environ, {"MX_MODEL_URI": "s3://bucket/model"}), patch(
-            "modelexpress.load_strategy.rdma_strategy.get_configured_selector",
+            "modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector",
             return_value=_IdentitySelector(),
         ), patch.object(RdmaStrategy, "is_available", return_value=True), patch.object(
             ModelStreamerStrategy, "is_available", return_value=True
@@ -2565,34 +2567,34 @@ class TestRdmaStrategyAvailability:
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
         return RdmaStrategy()
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True)
     def test_unavailable_when_no_server_address(self, _mock):
         strategy = self._make_strategy()
         ctx = _make_load_context()
         with patch.dict("os.environ", {}, clear=True):
             assert strategy.is_available(ctx) is False
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True)
     def test_available_when_mx_server_address_set(self, _mock):
         strategy = self._make_strategy()
         ctx = _make_load_context()
         with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
             assert strategy.is_available(ctx) is True
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True)
     def test_available_when_model_express_url_set(self, _mock):
         strategy = self._make_strategy()
         ctx = _make_load_context()
         with patch.dict("os.environ", {"MODEL_EXPRESS_URL": "server:8001"}):
             assert strategy.is_available(ctx) is True
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=False)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=False)
     def test_unavailable_when_nixl_not_available(self, _mock):
         strategy = self._make_strategy()
         ctx = _make_load_context()
         assert strategy.is_available(ctx) is False
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True)
     def test_unavailable_when_backend_lacks_rdma_p2p(
         self, _mock, mock_accelerator_backend_cls
     ):
@@ -2603,7 +2605,7 @@ class TestRdmaStrategyAvailability:
         with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
             assert strategy.is_available(ctx) is False
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True)
     def test_available_when_backend_supports_rdma_p2p(
         self, _mock, mock_accelerator_backend_cls
     ):
@@ -2614,7 +2616,7 @@ class TestRdmaStrategyAvailability:
         with patch.dict("os.environ", {"MX_SERVER_ADDRESS": "server:8001"}):
             assert strategy.is_available(ctx) is True
 
-    @patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True)
+    @patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True)
     def test_available_when_decentralized_backend_and_no_server_address(self, _mock):
         # Decentralized backends (REQUIRES_P2P_METADATA=True) don't need
         # a central server, so the "no server configured" gate shouldn't
@@ -2641,7 +2643,7 @@ class TestFindSourceInstances:
     def test_returns_empty_when_nixl_unavailable(self):
         strategy = self._make_strategy()
         ctx = _make_load_context()
-        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=False):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=False):
             assert strategy.is_available(ctx) is False
 
     def test_returns_empty_when_no_instances(self):
@@ -2687,7 +2689,7 @@ class TestFindSourceInstances:
             _make_instance_ref(worker_id="w-2", worker_rank=0),
         ]
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=insts)
-        with patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy._find_source_instances(ctx)
         assert len(result) == 2
         assert all(r.worker_rank == 0 for r in result)
@@ -2697,7 +2699,7 @@ class TestFindSourceInstances:
         ctx = _make_load_context()
         inst = _make_instance_ref()
         ctx.mx_client.list_sources.return_value = p2p_pb2.ListSourcesResponse(instances=[inst])
-        with patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy._find_source_instances(ctx)
         assert len(result) == 1
         assert result[0].mx_source_id == inst.mx_source_id
@@ -2732,7 +2734,9 @@ class TestFetchWorkerMetadata:
     def test_returns_none_when_worker_has_no_tensors(self):
         strategy = self._make_strategy()
         ctx = _make_load_context()
-        empty_worker = p2p_pb2.WorkerMetadata(worker_rank=0, tensors=[])
+        empty_worker = p2p_pb2.WorkerMetadata(
+            status=p2p_pb2.SOURCE_STATUS_READY, worker_rank=0, tensors=[]
+        )
         ctx.mx_client.get_metadata.return_value = p2p_pb2.GetMetadataResponse(
             found=True, worker=empty_worker,
         )
@@ -2770,8 +2774,8 @@ class TestRdmaStrategyLoad:
         candidates = [_make_instance_ref(worker_id="w-1")]
         strategy, attempts = self._setup(ctx, candidates, [_make_metadata_resp(rank=0, worker_id="w-1")])
 
-        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy.load(MagicMock(), ctx)
 
         assert isinstance(result, LoadResult)
@@ -2791,8 +2795,8 @@ class TestRdmaStrategyLoad:
             load_raises_for={"w-1"},
         )
 
-        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy.load(MagicMock(), ctx)
 
         assert isinstance(result, LoadResult)
@@ -2805,7 +2809,7 @@ class TestRdmaStrategyLoad:
         from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
         strategy = RdmaStrategy()
 
-        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True):
             with pytest.raises(StrategyFailed, match="No RDMA source available") as exc:
                 strategy.load(MagicMock(), ctx)
         assert exc.value.mutated is False
@@ -2821,8 +2825,8 @@ class TestRdmaStrategyLoad:
             ],
         )
 
-        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector", return_value=_IdentitySelector()):
             with pytest.raises(StrategyFailed, match="No RDMA source succeeded") as exc:
                 strategy.load(MagicMock(), ctx)
 
@@ -2843,8 +2847,8 @@ class TestRdmaStrategyLoad:
         candidates = [_make_instance_ref(worker_id="w-1")]
         strategy, attempts = self._setup(ctx, candidates, [source_resp])
 
-        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector", return_value=_IdentitySelector()):
             with pytest.raises(StrategyFailed, match="No RDMA source succeeded") as exc:
                 strategy.load(MagicMock(), ctx)
 
@@ -2863,8 +2867,8 @@ class TestRdmaStrategyLoad:
         candidates = [_make_instance_ref(worker_id="w-1")]
         strategy, attempts = self._setup(ctx, candidates, [source_resp])
 
-        with patch("modelexpress.load_strategy.rdma_strategy.is_nixl_available", return_value=True), \
-             patch("modelexpress.load_strategy.rdma_strategy.get_configured_selector", return_value=_IdentitySelector()):
+        with patch("modelexpress.load_strategy.nixl_p2p_strategy.is_nixl_available", return_value=True), \
+             patch("modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector", return_value=_IdentitySelector()):
             result = strategy.load(MagicMock(), ctx)
 
         assert isinstance(result, LoadResult)
@@ -2944,7 +2948,7 @@ class TestRdmaStrategyLoad:
         )
 
         with patch(
-            "modelexpress.load_strategy.rdma_strategy.get_configured_selector",
+            "modelexpress.load_strategy.nixl_p2p_strategy.get_configured_selector",
             return_value=_IdentitySelector(),
         ):
             strategy.load(LoadResult(value=MagicMock(), model=MagicMock()), ctx)
