@@ -86,5 +86,99 @@ class RewriteVersionsTests(unittest.TestCase):
             self.assertIn('version = "0.8.0-nightly.20261013.gabcdef0"', (root / "Cargo.toml").read_text())
 
 
+class RegistryModeTests(unittest.TestCase):
+    INDEX = "sparse+https://host.example/artifactory/api/cargo/mx-cargo/index/"
+
+    def test_index_prefers_explicit_value_then_derives_from_url_and_repo(self):
+        env = {"ARTIFACTORY_CARGO_INDEX": self.INDEX, "ARTIFACTORY_URL": "https://other", "ARTIFACTORY_CARGO_REPO_NAME": "x"}
+        with patch.dict(stage_crates.os.environ, env, clear=True):
+            self.assertEqual(stage_crates.registry_index(), self.INDEX)
+        for url in ("https://host.example", "https://host.example/", "https://host.example/artifactory"):
+            env = {"ARTIFACTORY_URL": url, "ARTIFACTORY_CARGO_REPO_NAME": "mx-cargo"}
+            with patch.dict(stage_crates.os.environ, env, clear=True):
+                self.assertEqual(stage_crates.registry_index(), self.INDEX, url)
+        with patch.dict(stage_crates.os.environ, {"ARTIFACTORY_URL": "https://host.example"}, clear=True):
+            self.assertEqual(stage_crates.registry_index(), "")
+
+    def test_inject_registry_adds_registry_to_internal_path_deps_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "Cargo.toml"
+            manifest.write_text(
+                'modelexpress-common = { path = "c", version = "=0.8.0-rc.1", default-features = false }\n'
+                'modelexpress-client = { workspace = true }\n'
+                'serde = { version = "1.0" }\n'
+            )
+            stage_crates.inject_registry([manifest], ["modelexpress-common", "modelexpress-client"], "artifactory", {})
+            text = manifest.read_text()
+            self.assertIn('default-features = false, registry = "artifactory" }', text)
+            self.assertIn("modelexpress-client = { workspace = true }", text)
+            self.assertIn('serde = { version = "1.0" }', text)
+
+    def test_cargo_config_preserves_settings_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".cargo").mkdir()
+            (root / ".cargo" / "config.toml").write_text("[build]\nrustflags = [\"-C\", \"x\"]\n")
+            for _ in range(2):
+                stage_crates.write_cargo_config(root, "artifactory", self.INDEX)
+            text = (root / ".cargo" / "config.toml").read_text()
+            self.assertIn("rustflags", text)
+            self.assertEqual(text.count("[registries]"), 1)
+            (root / ".cargo" / "config.toml").write_text('[registries.other]\nindex = "x"\n')
+            with self.assertRaises(RuntimeError):
+                stage_crates.write_cargo_config(root, "artifactory", self.INDEX)
+
+    def test_crates_io_alias_is_refused(self):
+        arguments = ["stage_crates.py", "--registry", "crates-io"]
+        with patch("sys.argv", arguments):
+            self.assertEqual(stage_crates.main(), 1)
+
+    def test_registry_mode_requires_credentials(self):
+        with patch.dict(stage_crates.os.environ, {}, clear=True), \
+                patch("sys.argv", ["stage_crates.py", "--registry", "artifactory"]):
+            self.assertEqual(stage_crates.main(), 1)
+
+    def test_publish_is_fail_soft_and_skips_dependents_of_a_failure(self):
+        pkgs = {
+            "a": {"version": "1", "manifest_path": "/m/a/Cargo.toml", "dependencies": []},
+            "b": {"version": "1", "manifest_path": "/m/b/Cargo.toml", "dependencies": [{"name": "a"}]},
+            "c": {"version": "1", "manifest_path": "/m/c/Cargo.toml", "dependencies": []},
+        }
+        def publish(manifest, alias, env):
+            if "/a/" in manifest:
+                raise RuntimeError("boom")
+            return "published"
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(stage_crates, "write_cargo_config"), \
+                patch.object(stage_crates, "inject_registry"), \
+                patch.object(stage_crates, "crate_exists", return_value=False), \
+                patch.object(stage_crates, "publish", side_effect=publish), \
+                patch.object(stage_crates.subprocess, "run") as run, \
+                patch("builtins.print") as out:
+            run.return_value.returncode = 0
+            rc = stage_crates.publish_to_registry(Path(tmp), pkgs, ["a", "b", "c"], "artifactory", self.INDEX, "t")
+        printed = "\n".join(str(c.args[0]) for c in out.call_args_list if c.args)
+        self.assertEqual(rc, 1)
+        self.assertIn("STAGED_CRATE=c", printed)
+        self.assertIn("FAILED_CRATE=a boom", printed)
+        self.assertIn("FAILED_CRATE=b dependency a failed", printed)
+        self.assertNotIn("STAGED_CRATE=b", printed)
+
+    def test_existing_crate_is_staged_without_publishing(self):
+        pkgs = {"a": {"version": "1", "manifest_path": "/m/a/Cargo.toml", "dependencies": []}}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(stage_crates, "write_cargo_config"), \
+                patch.object(stage_crates, "inject_registry"), \
+                patch.object(stage_crates, "crate_exists", return_value=True), \
+                patch.object(stage_crates, "publish") as publish, \
+                patch.object(stage_crates.subprocess, "run") as run, \
+                patch("builtins.print") as out:
+            run.return_value.returncode = 0
+            rc = stage_crates.publish_to_registry(Path(tmp), pkgs, ["a"], "artifactory", self.INDEX, "t")
+        self.assertEqual(rc, 0)
+        publish.assert_not_called()
+        self.assertIn("STAGED_CRATE=a", "\n".join(str(c.args[0]) for c in out.call_args_list if c.args))
+
+
 if __name__ == "__main__":
     unittest.main()
