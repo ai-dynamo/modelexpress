@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+from contextlib import nullcontext
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,7 @@ import pytest
 import yaml
 
 import launch_dynamo
+import test_p2p_k8s
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -227,6 +229,22 @@ def test_sglang_mtp_revision_and_loaders():
     assert args[args.index("--speculative-draft-model-path") + 1] == env["MX_MODEL_URI"]
     for flag in ("--load-format", "--speculative-draft-load-format"):
         assert args[args.index(flag) + 1] == "remote_instance"
+
+
+@pytest.mark.parametrize("agents,tp_size,dp_size,sessions,error", [
+    (["0-a", "0-a"], 1, 1, 1, None),
+    (["0-acf77248", "0-285f2b12"], 1, 1, 2, None),
+    (["0-a", "0-a"], 1, 1, 2, "Rank 0"),
+    (["0-a", "0-b", "0-c"], 1, 1, 2, "Rank 0"),
+    (["0-a", "1-b"], 1, 1, 2, "Expected source ranks"),
+    (["0-a", "0-b", "1-c"], 2, 2, 1, None),
+    (["0-a", "0-b", "0-c", "1-d"], 2, 2, 1, "Rank 0"),
+])
+def test_nixl_agents_per_rank(monkeypatch, agents, tp_size, dp_size, sessions, error):
+    logs = "\n".join(f"Using pre-loaded remote agent mx-auto-worker{agent}" for agent in agents)
+    monkeypatch.setattr(test_p2p_k8s, "_all_pod_logs", lambda *_: logs)
+    with pytest.raises(AssertionError, match=error) if error else nullcontext():
+        test_p2p_k8s.test_per_rank_source_agents("test", tp_size, dp_size, "nixl", sessions)
 
 
 @pytest.mark.skip(reason="a100b matrix cases temporarily disabled after hardware failure")

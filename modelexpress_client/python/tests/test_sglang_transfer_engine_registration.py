@@ -372,7 +372,10 @@ def test_single_block_retry_allows_transfer_engine_load(
     adapter.after_rdma_receive.return_value = result
     adapter.discover_tensors.return_value = {"weight": _tensor(1024, 64)}
     ctx = SimpleNamespace(
-        global_rank=0, identity=SimpleNamespace(model_name="model"), adapter=adapter
+        global_rank=0,
+        identity=SimpleNamespace(model_name="model"),
+        adapter=adapter,
+        p2p_enabled=True,
     )
     source = p2p_pb2.WorkerMetadata(
         transfer_engine_session_id="peer",

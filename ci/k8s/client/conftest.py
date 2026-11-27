@@ -56,12 +56,13 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--dp-size",
         default=_positive_int(os.environ.get("DP_SIZE", "1")),
         type=_positive_int,
-        help=(
-            "Data-parallel size — DP replicas are interchangeable full copies "
-            "at the same worker_rank, so the per-rank transfer test accepts a "
-            "distinct-agent count anywhere in [tp_size, tp_size * dp_size] "
-            "instead of exactly tp_size. Defaults to 1 (pure TP / single copy)."
-        ),
+        help="Number of interchangeable source replicas per rank.",
+    )
+    parser.addoption(
+        "--nixl-sessions-per-rank",
+        default=1,
+        type=_positive_int,
+        help="Number of independent NIXL sessions per rank in one source replica.",
     )
     parser.addoption(
         "--transport",
@@ -190,6 +191,11 @@ def tp_size(request: pytest.FixtureRequest) -> int:
 @pytest.fixture(scope="session")
 def dp_size(request: pytest.FixtureRequest) -> int:
     return request.config.getoption("--dp-size")
+
+
+@pytest.fixture(scope="session")
+def nixl_sessions_per_rank(request: pytest.FixtureRequest) -> int:
+    return request.config.getoption("--nixl-sessions-per-rank")
 
 
 @pytest.fixture(scope="session")

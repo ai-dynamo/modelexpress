@@ -6,10 +6,8 @@
 Runs after the workflow has applied the source and target Jobs and both pods
 have reached Running state.  Asserts:
   1. Target pod logs contain the framework-specific P2P transfer marker (--p2p-marker).
-  2. Target connected to source NIXL agents covering ranks 0..tp_size-1, with a
-     distinct-agent count in [tp_size, tp_size * dp_size] (catches TP collapse
-     and source-rank-pairing regressions; the range accommodates interchangeable
-     DP replicas that share a rank — see --dp-size).
+  2. Target connected to source NIXL agents covering ranks 0..tp_size-1.
+     Per rank, S independent sessions allow S to S * dp_size distinct agents.
   3. AIPerf MMLU scores do not significantly regress from the source baseline
      captured before target deployment. Raw output differences are diagnostic.
   4. When enabled by the workflow, target peak and final VRAM do not materially
@@ -26,6 +24,7 @@ Invoked by the workflow as:
       --worker-port $WORKER_PORT \
       --tp-size $TP_SIZE \
       [--dp-size $DP_SIZE] \
+      [--nixl-sessions-per-rank N] \
       [--p2p-marker "framework-specific transfer complete string"] \
       [--expected-max-total-tokens N] \
       [--expect-mtp]
@@ -33,13 +32,7 @@ Invoked by the workflow as:
 --p2p-marker defaults:
   vLLM: "RDMA transfer complete" (emitted by vLLM's RdmaStrategy)
 
---tp-size default is 1 — every existing TP=1 P2P test still asserts exactly
-one source agent, which is the correct expectation and adds a free safety net.
-
---dp-size default is 1 — with a single copy per rank the accepted range
-collapses to exactly tp_size, so TP-only jobs are unaffected. Set it to the
-target's data-parallel size (e.g. 2 for the DP=2 job) so the range widens to
-[tp_size, tp_size * dp_size] for the interchangeable replicas DP publishes.
+S defaults to 1. SGLang MTP uses 2 for its independent main and draft sessions.
 """
 
 import json
@@ -245,7 +238,7 @@ def test_mtp_load_phases(namespace: str, expect_mtp: bool, tp_size: int) -> None
 
 
 def test_per_rank_source_agents(
-    namespace: str, tp_size: int, dp_size: int, transport: str
+    namespace: str, tp_size: int, dp_size: int, transport: str, nixl_sessions_per_rank: int
 ) -> None:
     """Target's source NIXL agents must cover every rank without mis-pairing.
 
@@ -254,7 +247,7 @@ def test_per_rank_source_agents(
     (transport=transfer_engine) transfers via batch_transfer_sync_read and
     never registers NIXL agents, so there is nothing to count — skip it there.
 
-    Each source rank publishes exactly one NIXL agent. The shared
+    Each independent session publishes one NIXL agent per source rank and replica. The shared
     NixlTransferManager.receive_from_source (in modelexpress.nixl_transfer)
     logs either `add_remote_agent: ... (agent=b'<name>')` for central metadata
     or `Using pre-loaded remote agent <name>` for P2P metadata.
@@ -270,16 +263,8 @@ def test_per_rank_source_agents(
          shards share a shape per rank, so a wrong-rank load succeeds with
          garbage values and still produces plausible text.
 
-      2. tp_size <= distinct_agents <= tp_size * dp_size. Distinct-agent count
-         is NOT deterministic under DP: DP replicas are interchangeable full
-         copies at the SAME worker_rank, so a rank can expose up to dp_size
-         agents and each target core of that rank picks one at random (default
-         `random` selector). The dp_size cores at a rank therefore land on
-         1..dp_size distinct replicas → the total is anywhere in
-         [tp_size, tp_size * dp_size]. Asserting == tp_size is only correct
-         when dp_size == 1 (pure TP, one candidate per rank); it is a coin-flip
-         flake under DP > 1. The lower bound still catches full collapse; the
-         upper bound catches agents outside the expected rank set.
+      2. Each rank must use at least one agent per independent session.
+         Each session can select up to dp_size distinct source replicas.
     """
     if transport != "nixl":
         pytest.skip(
@@ -288,29 +273,25 @@ def test_per_rank_source_agents(
     # Same multi-pod concat as test_rdma_transfer_logged — under multi-node
     # TP each rank's remote-agent line lives in its own pod's logs.
     logs = _all_pod_logs(namespace, "mx-target", "mx-target")
-    matches = []
+    agents_by_rank: dict[int, set[str]] = {}
     for pattern in (
         r"agent=b?'?((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)'?",
         r"Using pre-loaded remote agent ((?:mx-\w+-worker|trtllm-live-source-rank)(\d+)[-\w]*)",
     ):
-        matches.extend(re.findall(pattern, logs))
+        for name, rank in re.findall(pattern, logs):
+            agents_by_rank.setdefault(int(rank), set()).add(name)
 
-    distinct_pairs = set(matches)
-    distinct_agents = {name for name, _ in distinct_pairs}
-    source_ranks = sorted({int(r) for _, r in distinct_pairs})
-    print(f"[mx-target] distinct source agents: {distinct_agents}  source_ranks={source_ranks}")
-
-    lo, hi = tp_size, tp_size * dp_size
-    assert lo <= len(distinct_agents) <= hi, (
-        f"Expected between {lo} and {hi} distinct source agent(s) "
-        f"(tp_size={tp_size}, dp_size={dp_size}), got {len(distinct_agents)}: "
-        f"{distinct_agents}. Below {lo} means TP collapse (a target rank didn't "
-        f"run) or source-rank collapse (a rank's target cores all pulled from a "
-        f"single source); above {hi} means agents outside the expected rank set."
-    )
+    source_ranks = sorted(agents_by_rank)
+    print(f"[mx-target] distinct source agents by rank: {agents_by_rank}")
     assert source_ranks == list(range(tp_size)), (
         f"Expected source ranks {list(range(tp_size))}, got {source_ranks}."
     )
+    max_agents = nixl_sessions_per_rank * dp_size
+    for rank, agents in agents_by_rank.items():
+        assert nixl_sessions_per_rank <= len(agents) <= max_agents, (
+            f"Rank {rank}: expected {nixl_sessions_per_rank}..{max_agents} distinct "
+            f"source agents, got {len(agents)}: {sorted(agents)}"
+        )
 
 
 EFFECTIVENESS_TIMEOUT_SECS = 180

@@ -144,7 +144,7 @@ MX_P2P_METADATA=0 only changes the central-coordinator metadata representation; 
 | MX_K8S_SOURCE_RETRIES | 5 | Fresh-channel retries for k8s-service revision mismatches |
 | MX_K8S_SOURCE_BACKOFF_SECONDS | 0.5 | Backoff between k8s-service retries |
 
-MX_METADATA_PORT and MX_WORKER_GRPC_PORT each reserve base..base+num_local_devices-1 (5555-5562 for the default NIXL port on an 8-GPU node). Keep both ranges clear of ports used by other services in the pod.
+For the main model, MX_METADATA_PORT and MX_WORKER_GRPC_PORT each reserve base..base+num_local_devices-1 (5555-5562 for the default NIXL port on an 8-GPU node). Each SGLang NIXL draft shifts both ranges by `(draft_model_idx + 1) * MX_DRAFT_PORT_OFFSET`. Keep all ranges clear of each other and of other services in the pod.
 
 Use a central backend for mixed revisions, live updates, or per-worker addressability. Use k8s-service only for stable, interchangeable source pods; see [Kubernetes Service backend](K8S_SERVICE_BACKEND.md).
 

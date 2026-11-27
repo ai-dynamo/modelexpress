@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""A model with parameters outside accelerator memory must not serve P2P.
+"""A model with undiscoverable parameters must not serve P2P.
 
 Tensor discovery only collects accelerator tensors, so host-resident
 parameters (DeepSeek V4.1 Engram tables in pinned host memory) were never
@@ -18,18 +18,27 @@ import pytest
 import torch
 import torch.nn as nn
 
+from modelexpress import p2p_pb2
 from modelexpress.adapter import StrategyFailed
 from modelexpress.load_strategy import base, rdma_strategy
-from modelexpress.load_strategy.context import LoadResult
+from modelexpress.load_strategy.context import LoadContext, LoadResult
 from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
 
-def _ctx(backend, *, discovers_host_parameters=False):
+def _ctx(backend, *, draft=False, discovers_host_parameters=False):
     adapter = MagicMock()
     adapter.discovers_host_parameters.return_value = discovers_host_parameters
-    return SimpleNamespace(
+    return LoadContext(
+        model_config=SimpleNamespace(),
+        load_config=SimpleNamespace(),
+        target_device=torch.device("meta"),
+        identity=p2p_pb2.SourceIdentity(model_name="test/model"),
+        worker_id="test-worker",
+        local_rank=0,
         p2p_enabled=True,
-        p2p_role="main",
+        p2p_role="draft" if draft else "main",
+        publication_namespace="draft-0" if draft else "",
+        port_offset=10000 if draft else 0,
         shared_nixl_manager=None,
         global_rank=0,
         worker_rank=0,
@@ -63,8 +72,9 @@ def patched(monkeypatch):
     monkeypatch.setattr(base, "_metadata_publication_configured", lambda ctx: True)
 
 
-def test_source_with_host_parameters_does_not_register_or_publish(patched, backend):
-    ctx = _ctx(backend)
+@pytest.mark.parametrize("draft", [False, True])
+def test_source_with_host_parameters_does_not_register_or_publish(patched, backend, draft):
+    ctx = _ctx(backend, draft=draft)
     model = _model(host_table=True)
 
     with patch.object(base, "_init_nixl_manager") as init:
@@ -160,11 +170,12 @@ def test_source_with_undiscovered_device_parameter_does_not_register(
     assert ctx.nixl_manager is None
 
 
+@pytest.mark.parametrize("draft", [False, True])
 def test_target_with_host_parameters_falls_back_before_receiving(
-    patched, backend, monkeypatch
+    patched, backend, monkeypatch, draft
 ):
     """A source that still advertises such a model must not be received from."""
-    ctx = _ctx(backend)
+    ctx = _ctx(backend, draft=draft)
     ctx.is_reload = False
     model = _model(host_table=True)
     monkeypatch.setattr(rdma_strategy, "worker_tensor_descriptors", lambda _w: [])

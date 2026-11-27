@@ -57,11 +57,14 @@ if TYPE_CHECKING:
     MX_METADATA_BACKEND: str
     MX_METADATA_PORT: int
     MX_WORKER_GRPC_PORT: int
+    MX_DRAFT_PORT_OFFSET: int
     MX_WORKER_HOST: str
     MX_HEARTBEAT_INTERVAL_SECS: int
     MX_PUBLISH_TIMEOUT_SECS: int
     MX_MODEL_REVISION: str
+    MX_DRAFT_MODEL_REVISION: str
     MX_MODEL_URI: Optional[str]
+    MX_DRAFT_MODEL_URI: Optional[str]
     MX_COLD_START_FORMAT: str
     MX_PLUGIN_DIR: str
     MX_LOAD_PLUGIN: Optional[str]
@@ -284,13 +287,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_METADATA_PORT": lambda: _env_int("MX_METADATA_PORT", 5555),
     "MX_WORKER_GRPC_PORT": lambda: _env_int("MX_WORKER_GRPC_PORT", 6555),
+    "MX_DRAFT_PORT_OFFSET": lambda: _env_int("MX_DRAFT_PORT_OFFSET", 10000),
     "MX_WORKER_HOST": lambda: os.environ.get("MX_WORKER_HOST", ""),
     "MX_HEARTBEAT_INTERVAL_SECS": lambda: _env_int("MX_HEARTBEAT_INTERVAL_SECS", 30),
     "MX_P2P_COLD_START": lambda: _env_bool("MX_P2P_COLD_START", False),
     "MX_P2P_COLD_START_WAIT_TIMEOUT_SECS": _cold_start_wait_timeout,
     "MX_PUBLISH_TIMEOUT_SECS": lambda: _env_int("MX_PUBLISH_TIMEOUT_SECS", 30 * 60),
     "MX_MODEL_REVISION": lambda: os.environ.get("MX_MODEL_REVISION", ""),
+    "MX_DRAFT_MODEL_REVISION": lambda: os.environ.get("MX_DRAFT_MODEL_REVISION", ""),
     "MX_MODEL_URI": lambda: os.environ.get("MX_MODEL_URI"),
+    "MX_DRAFT_MODEL_URI": lambda: os.environ.get("MX_DRAFT_MODEL_URI"),
     "MX_COLD_START_FORMAT": lambda: (
         os.environ.get("MX_COLD_START_FORMAT", "").strip().lower() or "auto"
     ),
