@@ -39,7 +39,6 @@ def _mock_host_allocation_without_cuda(monkeypatch):
 def test_copy_preserves_per_tensor_dtype_and_warm_buffers(
     dist_ready, monkeypatch, mode
 ):
-    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
     if mode is TrainerStagingMode.COPY_TO_HOST:
         _mock_host_allocation_without_cuda(monkeypatch)
     manager = _Manager()
@@ -94,7 +93,6 @@ def test_in_place_accepts_fp32_override(dist_ready):
 
 
 def test_multiple_dtype_overrides_include_fp16_and_scalar(dist_ready, monkeypatch):
-    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
     manager = _Manager()
     adapter = FSDPTrainerAdapter(
         manager=manager,
@@ -117,7 +115,6 @@ def test_multiple_dtype_overrides_include_fp16_and_scalar(dist_ready, monkeypatc
 
 
 def test_copy_rejects_source_dtype_change_before_writing(dist_ready, monkeypatch):
-    monkeypatch.setattr(f"{ADAPTER}.classic_cuda_alloc", nullcontext)
     manager = _Manager()
     adapter = FSDPTrainerAdapter(
         manager=manager,
@@ -348,6 +345,174 @@ def test_non_dict_tensors_is_rejected(dist_ready):
     adapter = _adapter()
     with pytest.raises(TypeError, match="state_dict"):
         _stage(adapter, [torch.ones(2, 4, dtype=torch.bfloat16)])
+
+
+class _FakeEvent:
+    def __init__(self):
+        self.recorded_on = None
+        self.waits = 0
+
+    def record(self, stream):
+        self.recorded_on = stream
+
+    def synchronize(self):
+        self.waits += 1
+
+
+class _FakeDeviceModule:
+    """Stand-in for torch.cuda / torch.xpu that records how it was driven."""
+
+    def __init__(self):
+        self.requested = []
+        self.streams_for = []
+        self.events = []
+
+    def Event(self):
+        event = _FakeEvent()
+        self.events.append(event)
+        return event
+
+    def current_stream(self, device=None):
+        self.streams_for.append(device)
+        return f"stream:{device}"
+
+
+def _unexpected_cuda_call(*args, **kwargs):
+    raise AssertionError("the snapshot fence must not touch the process CUDA device")
+
+
+@pytest.fixture
+def device_module(monkeypatch):
+    module = _FakeDeviceModule()
+
+    def get_device_module(device):
+        module.requested.append(device)
+        return module
+
+    monkeypatch.setattr(torch, "get_device_module", get_device_module)
+    return module
+
+
+def test_device_fence_records_on_each_device_stream(device_module):
+    xpu0, xpu1 = torch.device("xpu:0"), torch.device("xpu:1")
+
+    fence = FSDPTrainerAdapter._device_fence([xpu1, xpu0, xpu1])
+
+    # One event per distinct device, each from that device's own module and
+    # recorded on that device's stream rather than the process current stream.
+    assert device_module.requested == [xpu0, xpu1]
+    assert device_module.streams_for == [xpu0, xpu1]
+    assert [e.recorded_on for e in device_module.events] == [
+        "stream:xpu:0",
+        "stream:xpu:1",
+    ]
+
+    assert [e.waits for e in device_module.events] == [0, 0]
+    fence.wait()
+    assert [e.waits for e in device_module.events] == [1, 1]
+
+
+def test_device_fence_ignores_the_process_cuda_device(device_module, monkeypatch):
+    # The fence must come from the device's own module, so a non-CUDA
+    # accelerator never reaches torch.cuda.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_stream", _unexpected_cuda_call)
+    monkeypatch.setattr(torch.cuda, "Event", _unexpected_cuda_call)
+
+    FSDPTrainerAdapter._device_fence([torch.device("xpu:0")]).wait()
+
+    assert device_module.requested == [torch.device("xpu:0")]
+
+
+def test_cpu_snapshot_needs_no_device_fence(dist_ready, device_module):
+    staged = _stage(
+        _adapter(),
+        {"w": torch.ones(2, 4, dtype=torch.bfloat16)},
+        mode=TrainerStagingMode.COPY_TO_DEVICE,
+    )
+    staged.publish_ready.wait()
+
+    assert device_module.requested == []
+
+
+def test_host_arena_needs_no_alloc_scope(monkeypatch):
+    monkeypatch.setattr(
+        f"{ADAPTER}.accelerator_backend_for",
+        Mock(side_effect=AssertionError("host memory has no accelerator backend")),
+    )
+
+    assert isinstance(FSDPTrainerAdapter._registered_alloc_scope("cpu"), nullcontext)
+
+
+def test_arena_alloc_scope_follows_the_arena_device(monkeypatch):
+    backend, scope = object(), object()
+    backend_for = Mock(return_value=backend)
+    scope_for = Mock(return_value=scope)
+    monkeypatch.setattr(f"{ADAPTER}.accelerator_backend_for", backend_for)
+    monkeypatch.setattr(f"{ADAPTER}.registered_buffer_alloc_scope", scope_for)
+
+    xpu1 = torch.device("xpu:1")
+    assert FSDPTrainerAdapter._registered_alloc_scope(xpu1) is scope
+    backend_for.assert_called_once_with(xpu1)
+    scope_for.assert_called_once_with(backend)
+
+
+def test_device_arenas_are_allocated_inside_their_alloc_scope(dist_ready, monkeypatch):
+    scoped_devices = []
+    inside = []
+    allocations = []
+    empty = torch.empty
+
+    class _Scope:
+        def __enter__(self):
+            inside.append(True)
+
+        def __exit__(self, *exc):
+            inside.pop()
+
+    def alloc_scope(device):
+        scoped_devices.append(device)
+        return _Scope()
+
+    def allocate(*args, **kwargs):
+        if "pin_memory" in kwargs:
+            allocations.append((kwargs["device"], bool(inside)))
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(
+        FSDPTrainerAdapter, "_registered_alloc_scope", staticmethod(alloc_scope)
+    )
+    monkeypatch.setattr(f"{ADAPTER}.torch.empty", allocate)
+    state = {"a": torch.ones(2), "b": torch.ones(3)}
+
+    _stage(_adapter(), state, TrainerStagingMode.COPY_TO_DEVICE).publish_ready.wait()
+
+    cpu = torch.device("cpu")
+    assert scoped_devices == [cpu, cpu]
+    assert allocations == [(cpu, True), (cpu, True)]
+
+
+@pytest.mark.skipif(
+    not (hasattr(torch, "xpu") and torch.xpu.is_available()), reason="requires XPU"
+)
+def test_xpu_device_snapshot_is_fenced_on_the_arena_device(dist_ready):
+    manager = _Manager()
+    adapter = _adapter(manager)
+    device = torch.device("xpu", torch.xpu.current_device())
+    addresses = None
+    for value in (1.000123, 2.000321, 3.001234):
+        state = {
+            "w": torch.full((128, 256), value, device=device, dtype=torch.float32).t()
+        }
+        staged = _stage(adapter, state, TrainerStagingMode.COPY_TO_DEVICE)
+        staged.publish_ready.wait()
+        (served,) = manager.registered[0].values()
+        assert served.device == device
+        assert torch.equal(served.cpu(), torch.full((256, 128), value).bfloat16())
+        if addresses is not None:
+            assert served.data_ptr() == addresses
+        addresses = served.data_ptr()
+    assert len(manager.registered) == 1
 
 
 def test_host_staging_without_cuda_rejects_before_allocation(dist_ready, monkeypatch):
