@@ -1,0 +1,112 @@
+{
+  "skill_name": "modelexpress-p2p",
+  "evals": [
+    {
+      "id": "install-server-redis",
+      "expected_skill": "modelexpress-p2p",
+      "prompt": "Install the ModelExpress server in namespace mx with a Redis backend and tell me how to check it is healthy.",
+      "expected_output": "Install the Helm chart from the helm/ directory of a ModelExpress checkout. The chart does not bundle Redis: provide one, for example the checked-in examples/p2p_transfer_k8s/server/redis_backend/redis-standalone.yaml, which creates a Service named redis. Then helm install modelexpress ./helm -n mx --set env.MX_METADATA_BACKEND=redis --set env.REDIS_URL=redis://redis:6379. MX_METADATA_BACKEND is required or the server fails to start. Check health with kubectl rollout status deployment/modelexpress -n mx and helm test modelexpress -n mx, which runs grpc-health-probe against grpc.health.v1; the pod probes only check that port 8001 accepts connections.",
+      "assertions": [
+        "Install from the chart in a ModelExpress checkout and set MX_METADATA_BACKEND=redis and REDIS_URL",
+        "Note that the chart does not bundle Redis",
+        "Use helm test (gRPC health) as the health check, not only pod readiness"
+      ]
+    },
+    {
+      "id": "install-server-kubernetes-backend",
+      "expected_skill": "modelexpress-p2p",
+      "prompt": "We do not want to run Redis. How do I install the ModelExpress server so P2P discovery uses Kubernetes resources instead?",
+      "expected_output": "Use the kubernetes metadata backend. Apply helm/crds/modelexpress-crds.yaml first, because Helm installs missing CRDs but never updates existing ones. Install the chart with env.MX_METADATA_BACKEND=kubernetes, serviceAccount.rbac.enabled=true, which creates a ClusterRole and ClusterRoleBinding for the ModelMetadata and ModelCacheEntry resources, and serviceAccount.automount=true, because the chart defaults it to false and the server needs the ServiceAccount token to call the Kubernetes API. The server writes them into MX_METADATA_NAMESPACE, which defaults to the release namespace. Workers need no Kubernetes RBAC; they talk to the server over gRPC.",
+      "assertions": [
+        "Apply the CRDs before installing or upgrading the chart",
+        "Set MX_METADATA_BACKEND=kubernetes, serviceAccount.rbac.enabled=true, and serviceAccount.automount=true",
+        "Do not add metadata RBAC to the workers"
+      ]
+    },
+    {
+      "id": "dynamo-vllm-enable-p2p",
+      "expected_skill": "modelexpress-p2p",
+      "prompt": "I run vLLM workers under NVIDIA Dynamo with a DynamoGraphDeployment. How do I make new worker replicas get their weights over P2P instead of reading the model from storage?",
+      "expected_output": "Install the ModelExpress server separately; the Dynamo platform chart does not install it. Use a Dynamo vLLM runtime image that includes the ModelExpress client. On the main container of each worker component add --load-format modelexpress to the args, set MX_SERVER_ADDRESS and MODEL_EXPRESS_URL to the same server address (the client reads MODEL_EXPRESS_URL first, and the operator may inject it), request the cluster's RDMA device resource, and add the IPC_LOCK capability. Keep the model configuration and tokenizer files available to every worker. Apply with one replica, wait for the DGD to be ready, then scale the worker component. Confirm P2P with RDMA transfer complete in the new replica's main container log.",
+      "assertions": [
+        "Install the ModelExpress server separately from Dynamo",
+        "Add --load-format modelexpress and set MX_SERVER_ADDRESS and MODEL_EXPRESS_URL to the same value",
+        "Request RDMA resources and IPC_LOCK",
+        "Start one replica, wait for ready, then scale",
+        "Confirm P2P from the new replica's log lines"
+      ]
+    },
+    {
+      "id": "sglang-standalone-p2p",
+      "expected_skill": "modelexpress-p2p",
+      "prompt": "How do I turn on ModelExpress P2P weight loading for a standalone SGLang deployment on Kubernetes?",
+      "expected_output": "Use an SGLang image with the upstream ModelExpress delegation hook (docs/SGLANG.md names a known-good one) and install the ModelExpress client with --no-deps. Set MX_SERVER_ADDRESS and launch every replica with the same command: --host 0.0.0.0 --load-format remote_instance --remote-instance-weight-loader-backend modelexpress --modelexpress-config '{\"transport\":\"nixl\"}'. Keep --model-path on the model identity or a local path, not an object-storage URI. Give the pod RDMA resources and IPC_LOCK. The first replica loads from storage and publishes; later replicas pull over P2P. Start from examples/p2p_transfer_k8s/client/sglang/sglang-single-node-p2p.yaml.",
+      "assertions": [
+        "Require an SGLang image with the ModelExpress delegation hook and the client installed",
+        "Give the remote_instance load format with the modelexpress backend and the nixl transport",
+        "Use the same command on every replica"
+      ]
+    },
+    {
+      "id": "diagnose-no-rdma-source",
+      "expected_skill": "modelexpress-p2p",
+      "prompt": "My second replica came up fine but its log says 'Strategy rdma failed, trying next: No RDMA source available' and it loaded from disk. Why?",
+      "expected_output": "The worker found no ready source with this model's identity on the server it is talking to. Check in order: the first replica had finished loading and become ready before the second started; both replicas run the same ModelExpress client version (for vLLM, also the same vLLM version) with the same model string, revision, dtype or quantization, and parallel layout; and both reach the same ModelExpress server (MODEL_EXPRESS_URL takes precedence over MX_SERVER_ADDRESS). Falling back to storage is expected behavior, so the pod being healthy does not show P2P worked.",
+      "assertions": [
+        "Explain that no compatible ready source was found",
+        "Check first-replica readiness, identical model settings, and the server address",
+        "Note that the pod still becomes healthy after falling back to storage"
+      ]
+    },
+    {
+      "id": "address-precedence-dynamo",
+      "expected_skill": "modelexpress-p2p",
+      "prompt": "I set MX_SERVER_ADDRESS on my Dynamo workers to our new ModelExpress server, but they keep registering with the old one. What is going on?",
+      "expected_output": "The ModelExpress client reads the deprecated MODEL_EXPRESS_URL before MX_SERVER_ADDRESS. The Dynamo operator injects MODEL_EXPRESS_URL into every pod when the platform chart sets dynamo-operator.modelExpressURL, and that value wins. Set MODEL_EXPRESS_URL in the env of each worker's main container to the same address as MX_SERVER_ADDRESS; the operator does not override an env var the container already sets.",
+      "assertions": [
+        "Identify MODEL_EXPRESS_URL precedence over MX_SERVER_ADDRESS",
+        "Name the operator's dynamo-operator.modelExpressURL injection as a likely source",
+        "Set both variables to the same address in the DGD"
+      ]
+    },
+    {
+      "id": "slow-transfer-aws-efa",
+      "expected_skill": "modelexpress-p2p",
+      "prompt": "On AWS the second vLLM replica logs '[TIMING] RDMA transfer complete' but only at a few Gbps. Is P2P working?",
+      "expected_output": "The line is logged whatever transport UCX used, and its Gbps figure does not name the transport, so low Gbps is a reason to check the transport rather than proof of TCP. On AWS EFA, UCX can fall back to TCP without warning: use the libfabric backend (MX_NIXL_BACKEND=LIBFABRIC) with the image, vpc.amazonaws.com/efa device resource, and environment shown in examples/p2p_transfer_k8s/client/vllm/aws_efa/. Elsewhere, check NIC selection with MX_RDMA_NIC_PIN=auto or UCX_NET_DEVICES.",
+      "assertions": [
+        "Treat low Gbps as a prompt to check the transport, and confirm the fabric as the aws_efa README's Verify section describes",
+        "Recommend MX_NIXL_BACKEND=LIBFABRIC and the EFA device resource on AWS"
+      ]
+    },
+    {
+      "id": "k8s-service-no-server",
+      "expected_skill": "modelexpress-p2p",
+      "prompt": "Every replica serves the same fixed checkpoint and we would rather not run a ModelExpress server. Can new replicas still get weights over P2P?",
+      "expected_output": "Yes: use the k8s-service metadata backend, which needs no ModelExpress server, Redis, or CRDs. Set MX_METADATA_BACKEND=k8s-service on the workers instead of MX_SERVER_ADDRESS, put the source pods behind a Kubernetes Service matched by MX_K8S_SERVICE_PATTERN, and start from examples/k8s_service_sources/. It fits only when weights stay fixed for each pod's lifetime and every pod behind the Service serves the same checkpoint.",
+      "assertions": [
+        "Choose the k8s-service backend and say no server is needed",
+        "Set MX_METADATA_BACKEND=k8s-service on the workers rather than a server address",
+        "State the fixed-weights, same-checkpoint condition"
+      ]
+    },
+    {
+      "id": "neg-rl-refit",
+      "expected_skill": null,
+      "prompt": "After every RL training step I need to push the trainer's new weights into my running vLLM generators. How do I set that up with ModelExpress?",
+      "expected_output": "Out of scope for modelexpress-p2p: live RL weight refit is not P2P initial loading (see docs/rl/README.md).",
+      "assertions": [
+        "modelexpress-p2p stays inactive"
+      ]
+    },
+    {
+      "id": "neg-dynamo-recipe-deploy",
+      "expected_skill": null,
+      "prompt": "Deploy the Qwen vLLM disaggregated recipe with Dynamo on my cluster and run a smoke test.",
+      "expected_output": "Out of scope for modelexpress-p2p: deploying a Dynamo recipe; P2P applies only if the user asks to enable it.",
+      "assertions": [
+        "modelexpress-p2p stays inactive"
+      ]
+    }
+  ]
+}

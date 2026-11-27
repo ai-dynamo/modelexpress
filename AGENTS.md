@@ -68,6 +68,7 @@ Load the matching skill before starting any of these. Each is a `SKILL.md` under
 | Bump the release version or public-image tags | `bump-version` |
 | Commit sign-off and DCO repair | `dco` |
 | Wire an RL trainer and a vLLM or SGLang generator through ModelExpress for live weight refit; configure FSDP staging or diagnose RDMA rail selection | `modelexpress-rl-refit` |
+| Set up P2P weight loading for inference workers, standalone or under NVIDIA Dynamo | `modelexpress-p2p` |
 
 ## Git Workflow
 
