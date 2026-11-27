@@ -134,6 +134,21 @@ def _require_uniform_result(
     return first
 
 
+def _is_draft_pass(ctx: LoadContext) -> bool:
+    return getattr(ctx, "p2p_role", "main") == "draft"
+
+
+def _version_identity(ctx: LoadContext):
+    """The identity a weight version is recorded under.
+
+    A speculative draft with its own checkpoint joins its target's
+    publication, so the version is the target's.
+    """
+    if _is_draft_pass(ctx) and ctx.p2p_source_identity is not None:
+        return ctx.p2p_source_identity
+    return ctx.identity
+
+
 def _fetch_ready_version(
     client: ModelExpressControlClient,
     ctx: LoadContext,
@@ -150,7 +165,7 @@ def _fetch_ready_version(
         )
     if version.state is not WeightVersionState.READY:
         raise RuntimeError(f"revision {version_uid!r} is not READY")
-    if version.model_name != ctx.identity.model_name:
+    if version.model_name != _version_identity(ctx).model_name:
         raise RuntimeError(
             f"revision {version_uid!r} model_name does not match the worker"
         )
@@ -249,8 +264,11 @@ class DesiredVersionObjectStorageStrategy(ModelStreamerStrategy):
         desired_version_uid = ctx.desired_version_uid
         if desired_version_uid is None:
             return False
-        available = envs.MX_REFIT_CHECKPOINT_DIR is not None and (
-            self.supports_explicit_uri(ctx)
+        # Version checkpoints hold only the target model.
+        available = (
+            not _is_draft_pass(ctx)
+            and envs.MX_REFIT_CHECKPOINT_DIR is not None
+            and self.supports_explicit_uri(ctx)
         )
         results = _gather_phase(
             ctx,

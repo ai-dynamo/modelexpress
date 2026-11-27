@@ -396,6 +396,61 @@ def test_desired_p2p_requires_matching_ready_control_record(
     assert ctx.identity.revision == "base"
 
 
+@pytest.mark.parametrize("separate_checkpoint", [True, False])
+def test_desired_p2p_loads_a_draft_under_its_target_version(
+    monkeypatch, separate_checkpoint
+):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    ctx = _context()
+    ctx.p2p_role = "draft"
+    if separate_checkpoint:
+        ctx.identity.model_name = "draft-model"
+        ctx.p2p_source_identity = SimpleNamespace(model_name="test-model")
+    else:
+        ctx.p2p_source_identity = None
+    result = LoadResult(value=nn.Linear(1, 1))
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.get_weight_version.return_value = _version(
+        "version-7", WeightPayloadFormat.FULL_HF_CHECKPOINT
+    )
+
+    with patch(
+        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        return_value=client,
+    ), patch(
+        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load",
+        return_value=result,
+    ) as load:
+        assert DesiredVersionP2PStrategy().load(result, ctx) is result
+
+    load.assert_called_once_with(result, ctx)
+
+
+def test_desired_p2p_rejects_a_draft_whose_target_has_another_model_name(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    ctx = _context()
+    ctx.p2p_role = "draft"
+    ctx.identity.model_name = "test-model"
+    ctx.p2p_source_identity = SimpleNamespace(model_name="other-target")
+    result = LoadResult(value=nn.Linear(1, 1))
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.get_weight_version.return_value = _version(
+        "version-7", WeightPayloadFormat.FULL_HF_CHECKPOINT
+    )
+
+    with patch(
+        "modelexpress_rl.inference.load_strategy.ModelExpressControlClient.connect",
+        return_value=client,
+    ), patch(
+        "modelexpress.load_strategy.rdma_strategy.RdmaStrategy.load"
+    ) as load, pytest.raises(StrategyFailed, match="model_name does not match"):
+        DesiredVersionP2PStrategy().load(result, ctx)
+
+    load.assert_not_called()
+
+
 def test_desired_p2p_restores_revision_on_miss(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     ctx = _context()
@@ -455,6 +510,19 @@ def test_desired_object_storage_is_skipped_without_cache_directory(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
     monkeypatch.delenv("MX_REFIT_CHECKPOINT_DIR", raising=False)
     assert DesiredVersionObjectStorageStrategy().is_available(_context()) is False
+
+
+def test_desired_object_storage_is_skipped_for_a_draft(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_REFIT_DESIRED_VERSION_UID", "version-7")
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_DIR", str(tmp_path))
+    ctx = _context()
+    ctx.p2p_role = "draft"
+    with patch.object(
+        DesiredVersionObjectStorageStrategy, "supports_explicit_uri", return_value=True
+    ):
+        assert DesiredVersionObjectStorageStrategy().is_available(ctx) is False
+        ctx.p2p_role = "main"
+        assert DesiredVersionObjectStorageStrategy().is_available(ctx) is True
 
 
 @pytest.mark.parametrize("storage_type", [ObjectStorageType.S3, ObjectStorageType.AZURE])
