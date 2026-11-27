@@ -198,7 +198,7 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     )
 
     try:
-        tensors, _ = fetch_tensor_manifest(
+        tensor_manifest = fetch_tensor_manifest(
             endpoint,
             "weight-source",
             timeout=1.0,
@@ -220,7 +220,9 @@ def test_worker_grpc_server_shares_port_for_tensor_and_artifact_sources(tmp_path
     finally:
         server.stop(grace=None)
 
-    assert [tensor.name for tensor in tensors] == ["weight"]
+    assert [tensor.name for tensor in tensor_manifest.tensors] == ["weight"]
+    assert tensor_manifest.agent_name == "source-agent"
+    assert tensor_manifest.metadata_endpoint == "127.0.0.1:5555"
     assert header.mx_source_id == "artifact-source"
     assert header.artifact_id == artifact_id
 
@@ -515,7 +517,7 @@ def test_fetch_tensor_manifest_accepts_legacy_source_without_worker_id():
     server, port = _start_server(LegacyServicer())
 
     try:
-        tensors, _ = fetch_tensor_manifest(
+        manifest = fetch_tensor_manifest(
             f"127.0.0.1:{port}",
             "source-123",
             worker_id="selected-generation",
@@ -524,7 +526,7 @@ def test_fetch_tensor_manifest_accepts_legacy_source_without_worker_id():
     finally:
         server.stop(grace=None)
 
-    assert tensors == []
+    assert list(manifest.tensors) == []
 
 
 def test_new_server_accepts_legacy_request_without_worker_id():
@@ -536,7 +538,7 @@ def test_new_server_accepts_legacy_request_without_worker_id():
     server, port = _start_server(servicer)
 
     try:
-        tensors, _ = fetch_tensor_manifest(
+        manifest = fetch_tensor_manifest(
             f"127.0.0.1:{port}",
             "source-123",
             timeout=1.0,
@@ -544,7 +546,7 @@ def test_new_server_accepts_legacy_request_without_worker_id():
     finally:
         server.stop(grace=None)
 
-    assert tensors == []
+    assert list(manifest.tensors) == []
 
 
 def test_transfer_artifact_from_worker_retries_after_source_buffer_exhaustion(

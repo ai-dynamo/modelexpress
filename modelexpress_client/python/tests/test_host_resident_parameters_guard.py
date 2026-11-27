@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from modelexpress.adapter import StrategyFailed
-from modelexpress.load_strategy import base, rdma_strategy
+from modelexpress.load_strategy import base, nixl_p2p_strategy as rdma_strategy
 from modelexpress.load_strategy.context import LoadResult
 from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 
@@ -208,5 +208,7 @@ def test_target_with_artifact_manager_falls_back_before_receiving(
             "worker",
         )
 
-    artifact_manager.shutdown.assert_called_once()
+    artifact_manager.shutdown.assert_not_called()
     artifact_manager.receive_from_source.assert_not_called()
+    RdmaStrategy().rollback(ctx)
+    artifact_manager.shutdown.assert_called_once()

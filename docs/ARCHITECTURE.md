@@ -160,6 +160,8 @@ ModelExpress/
 │       │   ├── context.py              # LoadContext and LoadResult
 │       │   ├── draft_gate.py           # Delay main publication until a draft pass completes
 │       │   ├── base.py                 # LoadStrategy ABC and shared helpers
+│       │   ├── nixl_p2p_strategy.py    # Shared NIXL receive/retry lifecycle
+│       │   ├── tcp_strategy.py         # Cross-domain P2P over forced TCP
 │       │   ├── rdma_strategy.py        # RdmaStrategy (P2P GPU transfer via NIXL)
 │       │   ├── server_cache_strategy.py # ServerCacheStrategy (weights from MX Server)
 │       │   ├── instant_tensor_strategy.py # InstantTensorStrategy (fast local safetensors)
@@ -715,7 +717,9 @@ After successful RDMA receive and target-local finalization, the vLLM adapter
 synchronizes the accelerator and clears unused allocator cache before subsequent
 initialization. Live model tensors remain allocated.
 
-**MTP two-pass load.** vLLM loads the main model and then the speculative draft on the same worker. The main pass owns one NIXL agent, metadata listener, and source publication. A draft from the same checkpoint reuses that agent and appends its tensors under the `mx_draft::` namespace; it does not bind a second listener or replace the main tensor registry. With `MX_ENABLE_SEPARATE_DRAFT_P2P=1`, a separate-checkpoint draft discovers peers through the main source identity and uses a compatibility-digested tensor namespace. It falls back to storage if its identity is incomplete or no compatible source is available. The receiving main pass ignores draft descriptors, while the receiving draft pass requires complete coverage of its own descriptors. The main publication waits for the draft pass (or the engine health endpoint) so a peer does not discover a half-populated source. Failed draft registration rolls back only draft tensors, not the live main agent.
+**MTP two-pass load.** vLLM loads the main model and then the speculative draft on the same worker. The main pass owns one published NIXL agent, metadata listener, and source publication. A draft from the same checkpoint appends its finalized tensors to that agent under the `mx_draft::` namespace without replacing the main tensor registry. With `MX_ENABLE_SEPARATE_DRAFT_P2P=1`, a separate-checkpoint draft discovers peers through the main source identity and uses a compatibility-digested tensor namespace. It falls back to storage if its identity is incomplete or no compatible source is available. The receiving main pass ignores draft descriptors, while the receiving draft pass requires complete coverage of its own descriptors. The main publication waits for the draft pass (or the engine health endpoint) so a peer does not discover a half-populated source.
+
+Each actual draft RDMA receive attempt owns a temporary NIXL manager with a unique agent name and an ephemeral metadata listener (`listen_port=0`). It is never published. Failed initialization or registration releases this receiver; a failed READ also clears exception-held agent references before another source, model reinitialization, or storage fallback. Reload retries retain the model object but still release the failed receiver. Cleanup failure stops loading. Successful post-processing releases the receiver before registering the final draft tensors with the main agent and extending its publication. No-source and storage-only paths create no receiver. The main agent and its registrations remain intact throughout this receive lifecycle; this does not coordinate shared source publication during draft reload.
 
 For a cold MTP source, ModelStreamer asks the initialized vLLM model for `is_unused_checkpoint_weight`, when available, and selects **complete shard files** before reading them. A RunAI loader that accepts the predicate handles selection itself; otherwise MX uses vLLM's local safetensors filter or a generic checkpoint-index selector. The model-owned hook always takes precedence. For older engines without the hook, MX has a bounded draft-only fallback for the Qwen3.5, Qwen3-Next, DeepSeek MTP, GLM4-MoE MTP and GLM4-MoE-Lite MTP loader classes. Qwen's legacy rule retains `mtp.*`, embedding and head weights; the DeepSeek/GLM paths reuse the installed loader's layer-selection helper with its runtime config. Unsupported classes, missing helpers/configuration or unusable optional index metadata retain full-file loading. Main models without a hook also retain full-file loading. Mixed shards may be read twice. This is not tensor-range filtering; vLLM still performs tensor mapping and `load_weights`. A draft that lacks a compatible main agent or READY peer can use the usual storage strategies. For P2P, Step3.5 keeps its per-layer `shared_head.head` tensors: unlike the base MTP proposer, its proposer does not replace them with the target head.
 
@@ -856,8 +860,9 @@ preparation and retain their existing same-identity restrictions.
 for the draft on the same GPU. Its `ModelConfig` has `is_draft_model=True` and,
 unless `speculative_draft_load_format` names another format, it loads through the
 same `remote_instance` backend. The generic MX draft path recognizes that
-second pass, reuses the main load's NIXL agent instead of binding the same
-metadata port again, and gives draft tensors a separate manifest namespace.
+second pass, receives through a temporary agent, and publishes through the main
+load's NIXL agent without rebinding its metadata port. Draft tensors have a
+separate manifest namespace, with the same receive cleanup lifecycle as vLLM.
 Cold-load shard selection is separate from P2P compatibility. MX recognizes
 exact SGLang main and draft model classes and mirrors their unconditional
 checkpoint-name exclusions in `DraftSelection` rules. For example, Qwen3.5
@@ -937,6 +942,8 @@ flowchart LR
     P -->|one manifest, two role-scoped tensor sets| T[New replica<br/>main and draft P2P]
 ```
 
+**NIXL receive contexts.** `NixlTransferManager` owns one Agent. Its optional `ucx_mode="tcp"` creates a UCX context with `tcp,cuda_copy` and `UCX_NET_DEVICES=all`, independently of the automatic transport settings and RDMA NIC pinning. MX serializes context creation and restores temporary environment values on success or failure. TCP VMM registration uses per-tensor regions; the existing automatic context keeps its registration policy.
+
 **LoadStrategyChain** (`load_strategy/`):
 
 Auto-detects the best loading strategy with a prioritized chain. Each strategy is a subclass of `LoadStrategy` (ABC) with `is_available(ctx)` and `load(result, ctx)` methods. Engine-specific work is delegated to `ctx.adapter`; `LoadResult` carries the value returned to the engine plus the model used for tensor discovery and publication. The chain filters to eligible strategies and runs them in order until one succeeds:
@@ -944,11 +951,54 @@ Auto-detects the best loading strategy with a prioritized chain. Each strategy i
 | Priority | Strategy | `is_available()` | Behavior |
 |---|---|---|---|
 | p0 | `RdmaStrategy` | NIXL available | `ListSources(READY)`, filter by `worker_rank` and runtime `accelerator`, order the survivors via the configured `SourceSelector` (`MX_P2P_SOURCE_SELECTOR`: `random` default, `rendezvous_hash`, `load_aware`, or `topology_aware`), then try candidates (max 3). Filtering before the retry slice prevents incompatible sources from exhausting the retry budget; a post-`GetMetadata` accelerator check remains as defense-in-depth. Before preparing target tensors, P2P sources must serve a manifest for the selected runtime `worker_id`; generation mismatches and transfer failures retry the next candidate, reinitializing the target first when it may have been mutated. |
-| p1 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
-| p2 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + no object-store `MX_MODEL_URI` + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves and (if needed) downloads the weight files. An `s3://`, `gs://`, or `az://` `MX_MODEL_URI` skips this strategy and proceeds to ModelStreamer. Falls through on other failures. |
-| p3 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
-| p4 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
-| p5 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+| p1 | `TcpStrategy` | `adaptive` topology policy + main or compatible draft first load + CUDA/UCX + direct worker discovery | Forced TCP using the complete compatible list, same-domain first. Shares receive and recovery with `RdmaStrategy`; after successful receive, closes the temporary context and registers the final tensors with the normal publication agent. |
+| p2 | `ServerCacheStrategy` | `MODEL_EXPRESS_NO_SHARED_STORAGE` enabled + server address configured + adapter implements `load_via_native` | Stream the model's weight files from ModelExpress Server into the snapshot the engine already resolved, then hand off to the engine's native loader. The cold-miss path for workers with no route to Hugging Face: the server downloads and caches the model once, and every later worker is served from that cache. Non-weight files arrive earlier, before the engine starts — see [Server-Backed Model Cache](#server-backed-model-cache). Falls through on failure. |
+| p3 | `InstantTensorStrategy` | `MX_INSTANT_TENSOR` enabled (default) + no object-store `MX_MODEL_URI` + `instanttensor` installed + CUDA device + adapter implements `build_instanttensor_weight_iter` (and `apply_weight_iter`) | Load the model's own safetensors directly onto CUDA via the `instanttensor` library (distributed loading, pipelined prefetch, direct I/O, GDS when available). Reuses vLLM's built-in `--load-format instanttensor` path, so the engine resolves and (if needed) downloads the weight files. An `s3://`, `gs://`, or `az://` `MX_MODEL_URI` skips this strategy and proceeds to ModelStreamer. Falls through on other failures. |
+| p4 | `ModelStreamerStrategy` | `MX_MODEL_URI` set + `runai_model_streamer` installed | Stream safetensors to GPU via CPU staging buffer. `MX_MODEL_URI` accepts remote URIs (`s3://`, `gs://`, `az://`), absolute local paths, or HF model IDs (resolved via `HF_HUB_CACHE`). All storage backends (S3, GCS, Azure) included by default. |
+| p5 | `GdsStrategy` | Active accelerator backend supports GDS and GDS hardware is available | Load via `MxGdsLoader` (direct file-to-GPU). Falls through on failure. Reads full checkpoint tensors and slices for TP downstream — see [GDS Reads Full Checkpoint Tensors Under TP](#gds-reads-full-checkpoint-tensors-under-tp). |
+| p6 | `DefaultStrategy` | Engine native fallback loader available | Native loader fallback (for vLLM, `DefaultModelLoader`, CPU-staged, auto-downloads from HF Hub). |
+
+`RdmaStrategy` and `TcpStrategy` inherit the common `NixlP2PStrategy` lifecycle.
+`LoadContext.p2p_state` retains the resolved topology, complete compatible source
+list and failure classification for this load. Under `adaptive`, each rank calls
+`list_sources` at most once. With a configured domain, the NIXL backend uses
+same-domain candidates and TCP uses all candidates with same-domain sources
+first. Without a domain, both strategies use all compatible sources in the
+selector's order. LIBFABRIC skips the UCX-only `TcpStrategy`. Each strategy has
+its own retry limit. Model preparation, tensor discovery or post-processing failures
+skip TCP; with UCX, source failures and automatic-context initialization or
+backend registration failures allow it. Receive registration propagates errors
+to strategy recovery;
+cleanup must succeed before another channel or storage loader runs. Failed
+cleanup retains the manager and terminates loading.
+
+Compatible draft first loads use the same strategy chain, discovering sources
+under the main model's identity and accepting only their own draft namespace.
+Each strategy independently applies `MAX_DRAFT_SOURCE_METADATA_LOOKUPS` to
+manifest probes and `MAX_SOURCE_RETRIES` to receive attempts. Sources without
+the matching draft namespace consume only the lookup budget. Both automatic
+and TCP draft receives use temporary agents with ephemeral metadata ports;
+after post-processing and receiver cleanup, finalized draft tensors join the
+main model's shared publication. Failed attempts never shut down that shared
+agent, and storage fallback uses the same publication path.
+
+```mermaid
+flowchart TD
+    A[Discover compatible sources once] --> R[Configured NIXL backend: same domain if configured, otherwise all sources]
+    R -->|No source or recoverable transfer failure| C[Existing rollback and model recovery]
+    C --> B{UCX backend?}
+    B -->|Yes| T[Forced TCP: all sources, same-domain first when configured]
+    B -->|No| S[Storage strategies]
+    T -->|No source or recoverable failure| F[Existing recovery and storage strategies]
+    R -->|Success on all ranks| P[Finalize and publish]
+    T -->|Success on all ranks| H[Close TCP receiver and register with normal agent]
+    H --> P
+```
+
+The chain coordinates eligibility, preparation, loading and finalization across
+ranks. A local model failure rejects TCP in `prepare()`, so all ranks skip it
+together. A rank that succeeded while a peer failed recovers before joining the
+next strategy. Publication occurs only after every rank finalizes successfully.
 
 When a vLLM loading attempt fails after mutating the model, retry cleanup
 unregisters its layers and clears the old model's tensor graph before allocating
@@ -964,7 +1014,7 @@ See [ModelExpress Benchmarks](BENCHMARKS.md) for measured loading-path, NIXL reg
 
 ### External Loading Strategies
 
-`plugins.py` loads external `LoadStrategy` implementations for the shared `INFERENCE` chain. `MX_LOAD_PLUGIN` selects one plugin, inserted immediately before the built-in strategy named by `MX_LOAD_PLUGIN_BEFORE`. The default is `server-cache`, placing the plugin after RDMA. Unknown target names fail before discovery or loading. The six built-in strategies retain their relative order. RL and SGLang's `transfer_engine` path are unchanged. Unset or empty `MX_LOAD_PLUGIN` skips discovery and external imports and ignores `MX_LOAD_PLUGIN_BEFORE`.
+`plugins.py` loads external `LoadStrategy` implementations for the shared `INFERENCE` chain. `MX_LOAD_PLUGIN` selects one plugin, inserted immediately before the built-in strategy named by `MX_LOAD_PLUGIN_BEFORE`. The default is `server-cache`, placing the plugin after the P2P strategies. Unknown target names fail before discovery or loading. The built-in strategies retain their relative order. RL and SGLang's `transfer_engine` path are unchanged. Unset or empty `MX_LOAD_PLUGIN` skips discovery and external imports and ignores `MX_LOAD_PLUGIN_BEFORE`.
 
 Entries are named `mx_plugin_<name>.py` and export a no-argument `register_plugin()` returning a concrete, no-argument `LoadStrategy` class with the matching `name`. The registry stores external classes only. Discovery validates entries and duplicate names; the inference chain separately rejects built-in name collisions before selecting a plugin. Unknown selections also fail before loading. Modules are cached per worker, while each model load creates a new instance of the selected class. Unselected classes are not instantiated.
 
@@ -1052,7 +1102,9 @@ On-cluster (8×B200 nodes, InfiniBand RDMA; vLLM `--load-format modelexpress`, T
 
 NVFP4 MoE models (known case: Kimi-K2.5-NVFP4) previously produced corrupted inference after RDMA transfer despite all registered tensor bytes matching. This is a specific instance of a broader class of bugs: post-processing stashes computed state on non-Module objects (e.g. `FusedMoEQuantConfig.a1_gscale = 1/activation_scale` on the quant method), which is invisible to `named_parameters()`/`named_buffers()`. On the target those values are computed from dummy weights before RDMA, and RDMA only overwrites the registered tensors, so the stashed values stay wrong. The fix (`adopt_hidden_tensors()`) recursively scans module attributes for orphaned accelerator tensors (via `is_accel_tensor()`) and registers them as non-persistent buffers so they are included in the RDMA manifest. Verified correct on vLLM v0.17.1 and v0.19.0 with Kimi-K2.5-NVFP4 and on DeepSeek-V3 (MLA + FP8).
 
-During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match (a likely symptom of a rolling update where pods run different image versions). The receive path converts it, like any receive failure, into a `SourceTransferError`. Before trying the next ranked source, `RdmaStrategy` clears its NIXL state and uses the engine adapter to replace a possibly mutated model with a fresh instance. If the final transfer fails after mutation, the outer strategy chain performs the same cleanup before falling through to the next strategy.
+Before preparing the target, `RdmaStrategy` checks that the source manifest's `agent_name` and `metadata_endpoint` match the discovery metadata. An agent can be recreated under the same `worker_id` during vLLM level-1 sleep/wake. A connection identity mismatch skips that candidate before model preparation or transfer and follows the existing metadata-miss retry path.
+
+During transfer, `ManifestMismatchError` is raised if source and target tensor names or sizes don't match (a likely symptom of a rolling update where pods run different image versions). The receive path converts it, like any receive failure, into a `SourceTransferError`. Manifest mismatches during donor-dependent preparation or post-receive validation are also source failures: adaptive loading can recover and try the next candidate or TCP. OOM and other local model errors remain model failures and skip TCP. Before trying the next ranked source, `RdmaStrategy` clears its NIXL state and uses the engine adapter to replace a possibly mutated model with a fresh instance. If the final transfer fails after mutation, the outer strategy chain performs the same cleanup before falling through to the next strategy.
 
 After loading by any strategy, the worker starts a `PublisherThread` that owns initial publication retry and then periodically sends `UpdateStatus(READY)` to keep `updated_at` fresh. On clean shutdown, the publisher sends `UpdateStatus(STALE)` via an `atexit` handler. Metadata publish failures are logged and retried in the publisher thread instead of crashing the worker.
 

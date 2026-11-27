@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch.nn as nn
 
 from .. import envs
-from ..adapter import EngineAdapter, StrategyFailed
+from ..adapter import EngineAdapter, StrategyFailed, StrategyRecoveryError
 from ..nixl_transfer import is_nixl_available
 from ..tensor_utils import log_tensor_summary, undiscovered_parameters
 from ..metadata.publish import extend_published_tensors, publish_metadata_and_ready
@@ -59,6 +59,10 @@ class SourceTransferError(Exception):
     (OOM, process_weights_after_loading, warmup) are left as plain exceptions
     so they propagate without poisoning a healthy source.
     """
+
+
+class NixlRegistrationError(RuntimeError):
+    """NIXL could not register the discovered tensors with its backend."""
 
 
 @contextmanager
@@ -212,6 +216,8 @@ def _init_nixl_manager(
     role: str,
     listen_port: int = 0,
     accelerator_backend: AcceleratorBackend | None = None,
+    *,
+    ucx_mode: str = "auto",
 ) -> NixlTransferManager:
     """Create and initialize a NIXL transfer manager."""
     from ..nixl_transfer import NixlTransferManager
@@ -223,8 +229,18 @@ def _init_nixl_manager(
         device_id=device_id,
         listen_port=listen_port,
         accelerator_backend=accelerator_backend,
+        ucx_mode=ucx_mode,
     )
-    manager.initialize()
+    try:
+        manager.initialize()
+    except Exception:
+        try:
+            manager.shutdown()
+        except Exception as cleanup_error:
+            raise StrategyRecoveryError(
+                "Failed to close an initializing NIXL agent"
+            ) from cleanup_error
+        raise
     logger.debug(f"[Worker {global_rank}] NIXL manager initialized")
     return manager
 
@@ -250,13 +266,17 @@ def register_tensors(
     ctx: LoadContext,
     *,
     reuse_discovered: bool = False,
+    required: bool = False,
 ) -> None:
     """Collect model tensors and register them with NIXL.
 
-    Failures are logged but do not raise — the worker continues without
-    P2P serving capability.
+    Publication is best-effort. Receivers require registration and leave
+    failure recovery to the strategy that owns the receiving agent.
 
     Args:
+        required: Propagate errors without releasing the manager. The caller
+            must roll back before retrying. Backend failures are reported as
+            NixlRegistrationError, separately from tensor discovery failures.
         reuse_discovered: If True, skip tensor discovery
             (``ctx.adapter.discover_tensors``) and re-register the
             previously collected set held in ``ctx.tensors``. Use on
@@ -305,6 +325,7 @@ def register_tensors(
         )
         return
 
+    registering = False
     try:
         if reuse_discovered and ctx.tensors:
             logger.info(
@@ -342,6 +363,7 @@ def register_tensors(
                 }
             log_tensor_summary(ctx.tensors, ctx.global_rank, "Registering tensors")
 
+        registering = True
         if ctx.nixl_manager is None:
             if ctx.shared_nixl_manager is not None:
                 # Draft pass: rebinding MX_METADATA_PORT + device_id is what
@@ -359,6 +381,8 @@ def register_tensors(
                         listen_port,
                         ctx.accelerator_backend,
                     )
+                except StrategyRecoveryError:
+                    raise
                 except Exception as e:
                     raise RuntimeError(
                         f"NIXL agent with listen port {listen_port} = "
@@ -378,7 +402,7 @@ def register_tensors(
             # sub-range of the arena reserve) would restore single-MR here.
             logger.debug(
                 f"[Worker {ctx.global_rank}] Appending draft tensors to the "
-                "shared NIXL registration..."
+                "NIXL registration..."
             )
             ctx.nixl_manager.register_additional_tensors(ctx.tensors)
         elif not ctx.nixl_manager.tensor_descriptors:
@@ -392,8 +416,14 @@ def register_tensors(
                 logger.debug(f"[Worker {ctx.global_rank}] Registering tensors with NIXL...")
                 ctx.nixl_manager.register_tensors(ctx.tensors)
             logger.debug(f"[Worker {ctx.global_rank}] Tensors registered with NIXL")
+    except StrategyRecoveryError:
+        raise
     except Exception as e:
-        if ctx.p2p_role == "draft":
+        if required:
+            if registering:
+                raise NixlRegistrationError(str(e)) from e
+            raise
+        if ctx.p2p_role == "draft" and ctx.nixl_manager is ctx.shared_nixl_manager:
             # Never publish draft descriptors that are not registered; the
             # shared agent itself stays with the main load.
             ctx.nixl_manager = None

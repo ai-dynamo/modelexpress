@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar
 
 import torch
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
     from ..adapter import EngineAdapter
     from ..nixl_transfer import NixlTransferManager
     from ..vmm import VmmArena
+    from ..topology import TopologyPolicy
 
     EngineModelConfig: TypeAlias = VllmModelConfig | SglangModelConfig
     EngineLoadConfig: TypeAlias = VllmLoadConfig | SglangLoadConfig
@@ -61,6 +63,21 @@ class LoadResult(Generic[T]):
         return self.model if self.publishable else None
 
 
+class P2PFailure(Enum):
+    SOURCE = "source"
+    CHANNEL = "channel"
+    MODEL = "model"
+
+
+@dataclass
+class P2PState:
+    """Discovery and failure state retained across P2P strategies, never resources."""
+
+    policy: TopologyPolicy | None
+    sources: tuple[p2p_pb2.SourceInstanceRef, ...] | None = None
+    last_failure: P2PFailure = P2PFailure.SOURCE
+
+
 @dataclass
 class LoadContext:
     """Shared state passed to all loading strategies."""
@@ -91,7 +108,7 @@ class LoadContext:
         default_factory=CudaAcceleratorBackend
     )
     # "main" for the primary load; "draft" for the speculative second pass
-    # on the same worker. The draft shares the main load's NIXL agent,
+    # on the same worker. The draft publishes through the main load's NIXL agent,
     # metadata port and SourceIdentity rather than publishing its own.
     p2p_role: str = "main"
     # A separate draft is advertised within its main model's publication.
@@ -105,8 +122,8 @@ class LoadContext:
     # Replica-wide cold-start fallback skips peer reads but still publishes.
     skip_rdma: bool = False
     # Draft pass only: the main load's already-initialized NIXL manager. The
-    # draft registers into it instead of binding MX_METADATA_PORT + device_id
-    # a second time.
+    # draft registers its finalized tensors into it after releasing its
+    # temporary receive manager, without rebinding MX_METADATA_PORT + device_id.
     shared_nixl_manager: NixlTransferManager | None = None
     # Set only after the draft's descriptors have extended the main publication.
     draft_published: bool = False
@@ -116,6 +133,7 @@ class LoadContext:
     source_ready_fn: Callable[[], bool] | None = None
     # Optional engine gate checked before artifact cache settling.
     artifact_ready_fn: Callable[[], bool] | None = None
+    p2p_state: P2PState | None = None
     nixl_manager: NixlTransferManager | None = None
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
     # When MX_VMM_ARENA=1, maybe_enter_vmm_arena populates this with the

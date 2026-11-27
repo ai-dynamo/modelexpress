@@ -75,6 +75,7 @@ class LoadStrategyChain:
         Raises RuntimeError if no strategy succeeds.
         """
         from .rdma_strategy import RdmaStrategy
+        from .tcp_strategy import TcpStrategy
         from .server_cache_strategy import ServerCacheStrategy
         from .instant_tensor_strategy import InstantTensorStrategy
         from .model_streamer_strategy import ModelStreamerStrategy
@@ -85,6 +86,7 @@ class LoadStrategyChain:
 
         all_strategies: list[LoadStrategy] = [
             RdmaStrategy(),
+            TcpStrategy(),
             ServerCacheStrategy(),
             InstantTensorStrategy(),
             ModelStreamerStrategy(),
@@ -381,6 +383,7 @@ def execute_load_strategies(
     strategies: list[LoadStrategy],
 ) -> nn.Module:
     """Execute an ordered policy using the common fallback lifecycle."""
+    ctx.p2p_state = None
     eligible = _eligible_on_every_rank(strategies, ctx)
     logger.info(f"Eligible loaders: {[strategy.name for strategy in eligible]}")
 
@@ -415,8 +418,9 @@ def execute_load_strategies(
                     # A reload writes into the engine's live model, which the next
                     # strategy overwrites in full, and a rebuilt model would never
                     # reach the engine.
-                    if e.mutated and not ctx.is_reload:
+                    if e.mutated:
                         clear_exception_tracebacks(e)
+                    if e.mutated and not ctx.is_reload:
                         result = LoadStrategyChain._reinit_for_retry(result, ctx, strategy)
                 except Exception as recovery_error:
                     recovery_failure = recovery_error

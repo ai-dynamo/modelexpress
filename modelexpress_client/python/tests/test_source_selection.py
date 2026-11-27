@@ -23,11 +23,11 @@ from modelexpress import p2p_pb2
 from modelexpress.adapter import StrategyFailed, StrategyRecoveryError
 from modelexpress.load_strategy import _strategy_phases
 from modelexpress.load_strategy.base import LoadResult, clear_exception_tracebacks
-from modelexpress.load_strategy.rdma_strategy import (
+from modelexpress.load_strategy.nixl_p2p_strategy import (
     MAX_DRAFT_SOURCE_METADATA_LOOKUPS,
     MAX_SOURCE_RETRIES,
-    RdmaStrategy,
 )
+from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
 from modelexpress.source_selection import (
     ENV_SELECTOR,
     LoadAwareSelector,
@@ -240,6 +240,7 @@ def test_rendezvous_hash_removing_source_preserves_relative_order():
 
 def _rdma_ctx(instances):
     ctx = MagicMock()
+    ctx.p2p_state = None
     ctx.global_rank = 0
     ctx.worker_rank = 0
     ctx.worker_id = "target-0"
@@ -285,7 +286,7 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
     filtered out". On a dashboard the two were the same absence.
     """
     m = MagicMock()
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
     monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
 
@@ -299,7 +300,7 @@ def test_no_peers_published_records_a_zero_funnel(monkeypatch):
 
 def test_no_peers_with_topology_policy_records_topology_stage(monkeypatch):
     m = MagicMock()
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     _require_zone(monkeypatch, "az1")
 
     assert RdmaStrategy()._find_source_instances(_rdma_ctx([])) == []
@@ -316,7 +317,7 @@ def test_list_sources_rpc_failure_is_recorded_not_silent(monkeypatch):
     "nobody has published weights yet".
     """
     m = MagicMock()
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
 
     ctx = _rdma_ctx([])
@@ -328,7 +329,7 @@ def test_list_sources_rpc_failure_is_recorded_not_silent(monkeypatch):
 
 def test_successful_listing_records_an_ok_outcome(monkeypatch):
     m = MagicMock()
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     monkeypatch.setenv(ENV_SELECTOR, "rendezvous_hash")
 
     ctx = _rdma_ctx([_ref("s0aaaaaaaaaaaaaa", "w0", worker_rank=0)])
@@ -406,7 +407,7 @@ def test_find_source_instances_preferred_zone_orders_same_zone_first(monkeypatch
 
 def test_find_source_instances_required_zone_records_funnel(monkeypatch):
     m = MagicMock()
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     _require_zone(monkeypatch, "az1")
     instances = [
         _zone_ref("s0aaaaaaaaaaaaaa", "far-0", "az2"),
@@ -422,7 +423,7 @@ def test_find_source_instances_preferred_zone_funnel_counts_same_zone(monkeypatc
     # preferred keeps every candidate; the funnel stage must still report how
     # many share the zone, or it would read as all-local.
     m = MagicMock()
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     _require_zone(monkeypatch, "az1", enforcement="preferred")
     instances = [
         _zone_ref("s0aaaaaaaaaaaaaa", "far-0", "az2"),
@@ -438,7 +439,7 @@ def test_find_source_instances_preferred_zone_funnel_counts_same_zone(monkeypatc
 def test_find_source_instances_without_policy_omits_topology_stage(monkeypatch):
     # With the feature off the stage would only duplicate accelerator_matched.
     m = MagicMock()
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     monkeypatch.delenv("MX_P2P_TOPOLOGY_DOMAIN", raising=False)
     RdmaStrategy()._find_source_instances(_rdma_ctx([_zone_ref("s0aaaaaaaaaaaaaa", "w0", "az2")]))
     stages = {call.args[1] for call in m.observe_candidates.call_args_list}
@@ -753,7 +754,7 @@ def test_load_metadata_miss_tries_next_candidate():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(
-            "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
+            "modelexpress.load_strategy.nixl_p2p_strategy.worker_tensor_count",
             lambda w: 1,
         )
         result = strat.load(MagicMock(), ctx)
@@ -766,7 +767,8 @@ def test_load_metadata_miss_tries_next_candidate():
     assert cands[1].worker_id in args
 
 
-def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
+@pytest.mark.parametrize("mismatch", ["worker_id", "agent_name", "metadata_endpoint"])
+def test_load_generation_mismatch_tries_next_candidate(monkeypatch, mismatch):
     strat = RdmaStrategy()
     cands = _sources(2)
     strat._find_source_instances = MagicMock(return_value=cands)
@@ -780,11 +782,19 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
         ),
     ]
     strat._load_as_target = MagicMock(return_value="loaded")
-    manifest = [p2p_pb2.TensorDescriptor(name="weight")]
+    manifest = p2p_pb2.GetTensorManifestResponse(
+        tensors=[p2p_pb2.TensorDescriptor(name="weight")],
+    )
+    rejected_manifest = RuntimeError("worker_id mismatch")
+    if mismatch != "worker_id":
+        rejected_manifest = p2p_pb2.GetTensorManifestResponse(
+            worker_id=cands[0].worker_id,
+            **{mismatch: "replacement"},
+        )
     fetch_manifest = MagicMock(
         side_effect=[
-            RuntimeError("worker_id mismatch"),
-            (manifest, 10),
+            rejected_manifest,
+            manifest,
         ],
     )
     monkeypatch.setattr(
@@ -792,7 +802,7 @@ def test_load_generation_mismatch_tries_next_candidate(monkeypatch):
         fetch_manifest,
     )
     monkeypatch.setattr(
-        "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
+        "modelexpress.load_strategy.nixl_p2p_strategy.worker_tensor_count",
         lambda worker: 1,
     )
 
@@ -831,7 +841,7 @@ def test_fetch_worker_metadata_fetches_missing_manifest(monkeypatch):
         found=True,
         worker=worker,
     )
-    fetch_manifest = MagicMock(return_value=([], 0))
+    fetch_manifest = MagicMock(return_value=p2p_pb2.GetTensorManifestResponse())
     monkeypatch.setattr(
         "modelexpress.metadata.worker_server.fetch_tensor_manifest",
         fetch_manifest,
@@ -896,7 +906,7 @@ def test_load_transfer_failure_reinitializes_and_tries_next_source():
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(
-            "modelexpress.load_strategy.rdma_strategy.worker_tensor_count",
+            "modelexpress.load_strategy.nixl_p2p_strategy.worker_tensor_count",
             lambda w: 1,
         )
         result = strat.load(original_result, ctx)
@@ -1066,10 +1076,9 @@ def test_load_cleanup_failure_aborts_before_reinit():
     manager.shutdown.side_effect = RuntimeError("shutdown failed")
     ctx.nixl_manager = manager
 
-    with pytest.raises(StrategyFailed, match="shutdown failed") as exc:
+    with pytest.raises(StrategyRecoveryError, match="shutdown failed"):
         strat.load(MagicMock(), ctx)
 
-    assert exc.value.mutated is True
     assert strat._load_as_target.call_count == 1
     assert ctx.nixl_manager is manager
     ctx.adapter.reinit_for_retry.assert_not_called()
@@ -1132,9 +1141,9 @@ def test_rendezvous_hash_stable_on_score_tie():
 
 def _patched_metrics(monkeypatch):
     m = MagicMock()
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", m)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", m)
     monkeypatch.setattr(
-        "modelexpress.load_strategy.rdma_strategy.worker_tensor_count", lambda w: 1
+        "modelexpress.load_strategy.nixl_p2p_strategy.worker_tensor_count", lambda w: 1
     )
     monkeypatch.delenv(ENV_SELECTOR, raising=False)  # policy label -> "random"
     return m
@@ -1413,12 +1422,12 @@ def _real_metrics(monkeypatch):
     monkeypatch.delenv("PROMETHEUS_MULTIPROC_DIR", raising=False)
     monkeypatch.delenv(ENV_SELECTOR, raising=False)
     collector = MetricsCollector(registry=CollectorRegistry())
-    monkeypatch.setattr("modelexpress.load_strategy.rdma_strategy.selection_metrics", collector)
+    monkeypatch.setattr("modelexpress.load_strategy.nixl_p2p_strategy.selection_metrics", collector)
     monkeypatch.setattr(
-        "modelexpress.load_strategy.rdma_strategy.worker_tensor_count", lambda w: 1
+        "modelexpress.load_strategy.nixl_p2p_strategy.worker_tensor_count", lambda w: 1
     )
     monkeypatch.setattr(
-        "modelexpress.load_strategy.rdma_strategy.register_tensors", lambda result, ctx: None
+        "modelexpress.load_strategy.nixl_p2p_strategy.register_tensors", lambda result, ctx, **kwargs: None
     )
     return collector
 

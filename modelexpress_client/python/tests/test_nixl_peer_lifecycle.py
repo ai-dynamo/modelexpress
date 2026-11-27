@@ -63,6 +63,42 @@ def _manager(agent=None, metadata=b"md", accelerator=None):
     return mgr
 
 
+def test_draft_shutdown_retains_failed_registration(monkeypatch):
+    from modelexpress.adapter import StrategyRecoveryError
+    from modelexpress.load_strategy.rdma_strategy import RdmaStrategy
+
+    agent = FakeAgent()
+    manager = _manager(agent=agent)
+    first, second = object(), object()
+    tensors = {"draft.weight": object()}
+    manager._registered_memory = [first, second]
+    manager._tensors = tensors
+    ctx = SimpleNamespace(
+        p2p_role="draft", nixl_manager=manager, shared_nixl_manager=None, tensors=tensors,
+    )
+    deregister = agent.deregister_memory
+
+    def fail_first(registered):
+        if registered is first:
+            raise RuntimeError("registration is busy")
+        deregister(registered)
+
+    monkeypatch.setattr(agent, "deregister_memory", fail_first)
+    with pytest.raises(StrategyRecoveryError, match="registration is busy"):
+        RdmaStrategy().rollback(ctx)
+    assert manager._agent is agent
+    assert manager._tensors is tensors
+    assert manager._registered_memory == [first]
+    assert agent.deregistered == [second]
+    assert ctx.nixl_manager is manager
+
+    monkeypatch.setattr(agent, "deregister_memory", deregister)
+    RdmaStrategy().rollback(ctx)
+    assert manager._agent is None
+    assert ctx.nixl_manager is None
+    assert agent.deregistered == [second, first]
+
+
 class TestTracksLoadedPeers:
     def test_a_fetched_source_is_tracked_with_its_endpoint(self):
         """The endpoint is retained because it identifies the peer we connected to."""
@@ -161,7 +197,10 @@ class TestDisconnect:
         assert seen["agent_alive"] is True
         assert mgr._agent is None
 
-    def test_registered_memory_is_released_before_agent_is_dropped(self):
+    @pytest.mark.parametrize("fail_deregister", [False, True])
+    def test_registered_memory_is_released_before_agent_is_dropped(
+        self, fail_deregister, caplog
+    ):
         agent = FakeAgent()
         mgr = _manager(agent=agent)
         first, second = object(), object()
@@ -172,10 +211,15 @@ class TestDisconnect:
         def spy(registered):
             seen.append((registered, mgr._agent is agent))
             real_deregister(registered)
+            if fail_deregister and registered is second:
+                raise RuntimeError("deregistration failed")
 
         agent.deregister_memory = spy
         mgr.shutdown()
 
+        assert (
+            "Failed to deregister NIXL memory during shutdown" in caplog.text
+        ) is fail_deregister
         assert seen == [(second, True), (first, True)]
         assert agent.deregistered == [second, first]
         assert mgr._registered_memory == []

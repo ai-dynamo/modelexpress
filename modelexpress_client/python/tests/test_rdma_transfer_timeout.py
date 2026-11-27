@@ -18,8 +18,8 @@ Run: pytest tests/test_rdma_transfer_timeout.py
 
 import pytest
 
-from modelexpress.load_strategy import rdma_strategy
-from modelexpress.load_strategy.rdma_strategy import (
+from modelexpress.load_strategy import nixl_p2p_strategy as rdma_strategy
+from modelexpress.load_strategy.nixl_p2p_strategy import (
     DEFAULT_RDMA_TRANSFER_TIMEOUT_S,
     MAX_SOURCE_RETRIES,
     _transfer_timeout_seconds,

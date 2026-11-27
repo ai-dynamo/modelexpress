@@ -768,13 +768,8 @@ def fetch_tensor_manifest(
     timeout: float = 5.0,
     *,
     worker_id: str = "",
-) -> tuple[list[p2p_pb2.TensorDescriptor], int]:
-    """Fetch tensor descriptors directly from a source worker's WorkerService.
-
-    Returns a `(tensors, response_bytes)` tuple. `response_bytes` is the
-    wire size of the protobuf response (`response.ByteSize()`); callers
-    use it to instrument manifest fetch timing.
-    """
+) -> p2p_pb2.GetTensorManifestResponse:
+    """Fetch a source worker's tensor manifest, including its connection identity."""
     channel = grpc.insecure_channel(endpoint)
     stub = p2p_pb2_grpc.WorkerServiceStub(channel)
     request = p2p_pb2.GetTensorManifestRequest(mx_source_id=mx_source_id)
@@ -797,7 +792,7 @@ def fetch_tensor_manifest(
         f"Fetched {len(response.tensors)} tensors from worker at {endpoint} "
         f"({response_bytes} bytes)"
     )
-    return list(response.tensors), response_bytes
+    return response
 
 
 @contextmanager
