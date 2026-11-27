@@ -432,14 +432,16 @@ def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIde
     except Exception:
         mx_version = "0.0.0"
 
+    tensor_parallel_size = _get_parallel_size(
+        "get_tensor_model_parallel_world_size"
+    )
+
     return p2p_pb2.SourceIdentity(
         mx_version=mx_version,
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_WEIGHTS,
         model_name=_get_model_name(model_config),
         backend_framework=p2p_pb2.BACKEND_FRAMEWORK_SGLANG,
-        tensor_parallel_size=_get_parallel_size(
-            "get_tensor_model_parallel_world_size"
-        ),
+        tensor_parallel_size=tensor_parallel_size,
         pipeline_parallel_size=_get_parallel_size(
             "get_pipeline_model_parallel_world_size"
         ),
@@ -449,6 +451,7 @@ def build_sglang_source_identity(model_config: ModelConfig) -> p2p_pb2.SourceIde
         dtype=_get_dtype(model_config),
         quantization=_get_quantization(model_config),
         revision=_get_revision(model_config),
+        extra_parameters=_get_layout_parameters(tensor_parallel_size),
     )
 
 
@@ -505,6 +508,52 @@ def _get_parallel_size(name: str) -> int:
     from sglang.srt.distributed import parallel_state
 
     return int(getattr(parallel_state, name)())
+
+
+def _get_layout_parameters(tensor_parallel_size: int) -> dict[str, str]:
+    """Return SGLang's effective weight-layout parallelism.
+
+    ``tensor_parallel_size`` alone is not sufficient for SGLang models using
+    attention context/data parallelism.  In particular, DeepSeek DSA prefill
+    CP can make the attention shard size smaller than the ordinary TP size,
+    while ``moe_dense_tp_size=1`` replicates dense MLP weights.  These values
+    are included in ``extra_parameters`` so they participate in the
+    content-addressed source ID.
+
+    SGLang v0.5.16 and later expose the resolved topology through
+    ``runtime_context``.  Do not substitute ordinary TP when that state is not
+    available: doing so would merge incompatible source pools, which is the
+    failure this identity is intended to prevent.
+    """
+
+    try:
+        from sglang.srt.runtime_context import get_parallel, get_server_args
+
+        parallel = get_parallel()
+        server_args = get_server_args()
+        attention_tp_size = int(parallel.attn_tp_size)
+        attention_cp_size = int(parallel.attn_cp_size)
+        attention_dp_size = int(parallel.attn_dp_size)
+    except Exception as exc:
+        raise RuntimeError(
+            "Cannot build a safe SGLang ModelExpress source identity before "
+            "the resolved parallel layout is available"
+        ) from exc
+
+    # ``moe_dense_tp_size`` is a configuration value, while the layout needs
+    # its effective value: None means that dense MLPs use ordinary TP.
+    configured_dense_tp = getattr(server_args, "moe_dense_tp_size", None)
+    if configured_dense_tp is None:
+        dense_mlp_tp_size = tensor_parallel_size
+    else:
+        dense_mlp_tp_size = int(configured_dense_tp)
+
+    return {
+        "attention_tp_size": str(attention_tp_size),
+        "attention_cp_size": str(attention_cp_size),
+        "attention_dp_size": str(attention_dp_size),
+        "dense_mlp_tp_size": str(dense_mlp_tp_size),
+    }
 
 
 def _get_sglang_worker_rank(load_config: LoadConfig) -> int:
