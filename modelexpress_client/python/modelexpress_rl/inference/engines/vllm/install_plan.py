@@ -11,7 +11,11 @@ from collections.abc import Callable
 
 import torch
 from modelexpress_rl.inference.plan import SourceReplayBatch
-from modelexpress_rl.refit.reshard.types import CaptureResult, IncompleteRefit
+from modelexpress_rl.refit.reshard.types import (
+    CaptureResult,
+    IncompleteRefit,
+    run_epilogue,
+)
 from typing import TYPE_CHECKING
 from weakref import ref
 from uuid import UUID
@@ -31,6 +35,9 @@ class _EngineRuntimeBindings:
     overlap_tensors: dict
     aliases: _ParameterAliases
     load_aliases: _ParameterAliases
+    # Full names of runtime-only alias slots; see
+    # ``_VllmInstaller._runtime_alias_slots``.
+    runtime_alias_slots: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -216,8 +223,12 @@ class _InstallExecution:
                 f"a post-load hook replaced module {plan.path!r} "
                 "before its parameters were committed"
             )
+        runtime_slots = self._captured.engine.runtime.runtime_alias_slots
         current = {
-            name for name, value in layer._parameters.items() if value is not None
+            name
+            for name, value in layer._parameters.items()
+            if value is not None
+            and (f"{plan.path}.{name}" if plan.path else name) not in runtime_slots
         }
         current.update(
             name
@@ -322,10 +333,10 @@ class _InstallExecution:
             raise IncompleteRefit(
                 f"pending parameter slot {recorded.param_name!r} was replaced"
             )
-        destination = _receive_destination(target, bounded=self._bounded)
+        whole = _receive_destination(target, bounded=self._bounded)
         if target.dtype != recorded.dest_dtype:
             raise IncompleteRefit("recorded destination has no compatible live storage")
-        destination = destination.as_strided(
+        destination = whole.as_strided(
             recorded.dest_shape,
             recorded.dest_stride,
             target.storage_offset() + recorded.dest_offset,
@@ -340,6 +351,13 @@ class _InstallExecution:
                 "weight installation requires an ordinary source tensor"
             )
         torch.Tensor.copy_(destination, value)
+        if recorded.epilogue:
+            # Capture admits only an epilogue whose value ``copy_`` broadcasts
+            # to the destination, as the loader's own ``copy_`` did.
+            value = run_epilogue(whole, recorded.epilogue)
+            if type(value) is not torch.Tensor:
+                raise IncompleteRefit("recorded epilogue did not produce a tensor")
+            torch.Tensor.copy_(whole, value)
 
     def _begin_source_owner(self, owner):
         from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO

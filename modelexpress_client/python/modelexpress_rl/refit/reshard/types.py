@@ -81,7 +81,12 @@ class RecordedCopy:
     into ``param_name`` at ``as_strided(dest_shape, dest_stride, dest_offset)``.
     Destination coordinates are physical and relative to the registered owner.
     No real storage is needed. ``dest_dtype`` vs the source dtype decides raw-copy vs
-    convert-via-staging downstream."""
+    convert-via-staging downstream.
+
+    ``epilogue`` recomputes the whole destination from itself once this copy
+    has landed, for a loader that transforms what it copied (Mamba2 stores
+    ``A = -exp(A_log)``). Its steps are ``(aten op, args, kwargs)`` whose tensor
+    arguments are ``EpilogueRef``s; only ordered source replay applies it."""
 
     src_name: str
     op_chain: OpChain
@@ -90,6 +95,30 @@ class RecordedCopy:
     dest_shape: tuple
     dest_stride: tuple
     dest_dtype: Any
+    epilogue: tuple = ()
+
+
+@dataclass(frozen=True)
+class EpilogueRef:
+    """An epilogue step input: the destination (``-1``) or an earlier step's output."""
+
+    index: int
+
+
+def run_epilogue(destination, steps):
+    """Evaluate a recorded epilogue on ``destination``; returns the new value."""
+    from torch.utils._pytree import tree_map
+
+    values = []
+
+    def resolve(value):
+        if isinstance(value, EpilogueRef):
+            return destination if value.index < 0 else values[value.index]
+        return value
+
+    for func, args, kwargs in steps:
+        values.append(func(*tree_map(resolve, args), **tree_map(resolve, dict(kwargs))))
+    return values[-1]
 
 @dataclass
 class CaptureResult:
