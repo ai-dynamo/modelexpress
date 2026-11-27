@@ -46,7 +46,7 @@ def test_factory_default_returns_mx_client(monkeypatch):
     assert isinstance(create_metadata_client(), MxClient)
 
 
-@pytest.mark.parametrize("value", ["", "server", "redis", "kubernetes", "k8s", "crd"])
+@pytest.mark.parametrize("value", ["", "server", "redis", "redis-cluster", "kubernetes", "k8s", "crd"])
 def test_factory_central_aliases_return_mx_client(monkeypatch, value):
     monkeypatch.setenv("MX_METADATA_BACKEND", value)
     assert isinstance(create_metadata_client(), MxClient)

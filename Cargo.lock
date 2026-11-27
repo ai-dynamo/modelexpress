@@ -630,6 +630,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc16"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "338089f42c427b86394a5ee60ff321da23a5c89c9d89514c829687b26359fcff"
+
+[[package]]
 name = "crc32c"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3448,13 +3454,16 @@ dependencies = [
  "backon",
  "bytes",
  "combine",
+ "crc16",
  "futures",
  "futures-util",
  "itertools 0.13.0",
  "itoa",
+ "log",
  "num-bigint",
  "percent-encoding",
  "pin-project-lite",
+ "rand 0.8.6",
  "ryu",
  "sha1_smol",
  "socket2 0.5.10",

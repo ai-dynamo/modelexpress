@@ -7,6 +7,7 @@ pub mod cache;
 pub mod config;
 pub mod metrics;
 pub mod p2p;
+pub mod redis_conn;
 pub mod refit;
 pub mod refit_collective;
 pub mod registry;

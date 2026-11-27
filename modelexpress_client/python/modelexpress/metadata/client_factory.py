@@ -11,8 +11,8 @@ branch on backend.
 
 Supported values:
 
-- ``""`` / ``"server"`` / ``"redis"`` / ``"kubernetes"`` / ``"k8s"`` /
-  ``"crd"`` - central ModelExpress server (default). Returns
+- ``""`` / ``"server"`` / ``"redis"`` / ``"redis-cluster"`` / ``"kubernetes"`` /
+  ``"k8s"`` / ``"crd"`` - central ModelExpress server (default). Returns
   :class:`MxClient`.
 - ``"k8s-service"`` / ``"service"`` - K8s-Service-routed decentralized
   backend. Returns :class:`MxK8sServiceClient`.
@@ -29,7 +29,7 @@ from .k8s_service_client import MxK8sServiceClient
 logger = logging.getLogger("modelexpress.metadata.client_factory")
 
 _CENTRAL_BACKEND_ALIASES = frozenset({
-    "", "server", "redis", "kubernetes", "k8s", "crd",
+    "", "server", "redis", "redis-cluster", "kubernetes", "k8s", "crd",
 })
 _K8S_SERVICE_ALIASES = frozenset({"k8s-service", "service"})
 

@@ -159,6 +159,9 @@ pub async fn create_registry_backend(
             backend.connect().await?;
             Ok(Arc::new(backend) as Arc<dyn RegistryBackend>)
         }
+        BackendConfig::RedisCluster { .. } => {
+            Err("redis-cluster backend is not yet supported for the model registry".into())
+        }
         BackendConfig::Kubernetes { namespace } => {
             let backend = kubernetes::KubernetesRegistryBackend::new(&namespace).await?;
             backend.connect().await?;

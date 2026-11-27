@@ -101,6 +101,9 @@ pub async fn create_backend(
         BackendConfig::Redis { url } => Ok(Some(Arc::new(
             redis::RedisCollectiveBackend::connect(url).await?,
         ))),
+        BackendConfig::RedisCluster { .. } => Err(CollectiveBackendError::Unavailable(
+            "redis-cluster backend is not yet supported for collective refit".to_string(),
+        )),
         BackendConfig::Kubernetes { .. } => Ok(None),
         #[cfg(feature = "memory-backend")]
         BackendConfig::Memory => Ok(None),
