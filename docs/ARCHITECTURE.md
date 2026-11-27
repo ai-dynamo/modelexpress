@@ -371,6 +371,11 @@ Key message types: `SourceIdentity` (all fields affecting tensor layout compatib
 
 Rust and Python compute `mx_source_id` from the same normalized, sorted-key JSON encoded as UTF-8, preserving non-ASCII identity strings.
 
+Canonicalization preserves case in model names, revisions, and opaque
+extra parameters, while compatibility labels retain lowercase normalization.
+See [source identity canonicalization](metadata.md#source-identity-and-content-addressed-keys)
+for ID compatibility.
+
 ### p2p.proto - WorkerService (P2P, opt-in)
 
 | RPC | Request | Response | Purpose |
@@ -495,6 +500,11 @@ Runs in a background tokio task on a configurable interval (default 1 hour). LRU
 ### P2P Metadata Backends
 
 Two families of backends exist: **server-coordinated** (the server owns the metadata store) and **decentralized** (no central server in the loop).
+
+Rust Kubernetes clients use kube 4.2.1 with k8s-openapi 0.28 and schemars 1.
+This includes the OpenSSL cluster-CA trust fix for RUSTSEC-2026-0600 and covers
+both metadata backends and TokenReview authentication. The Kubernetes types
+are generated for the v1.32 API baseline.
 
 Server-coordinated backends live in the Rust server and are selected via `MX_METADATA_BACKEND`:
 

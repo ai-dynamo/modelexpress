@@ -33,9 +33,9 @@ _OPTIONAL_SOURCE_ID_FIELDS = (
 def compute_mx_source_id(identity: p2p_pb2.SourceIdentity) -> str:
     """Compute the 16-char hex ``mx_source_id`` for a ``SourceIdentity``.
 
-    All string fields are lowercased and ``extra_parameters`` is sorted
-    by key so semantically-identical identities produce identical IDs
-    regardless of case or insertion order.
+    Model names, revisions and extra parameters preserve case. Compatibility
+    labels retain their lowercase normalization. Map insertion order does
+    not affect the ID.
     """
     canonical = _canonical_json(identity)
     digest = hashlib.sha256(canonical.encode()).hexdigest()
@@ -43,35 +43,21 @@ def compute_mx_source_id(identity: p2p_pb2.SourceIdentity) -> str:
 
 
 def _canonical_json(identity: p2p_pb2.SourceIdentity) -> str:
-    # Normalize extra_parameters deterministically:
-    # 1. sort by original key (ASCII/byte order, matches Rust's String::cmp)
-    # 2. lowercase both keys and values
-    # 3. on case-colliding keys, keep the first value we see (stable because
-    #    the sort already picks a canonical survivor)
-    # Rust's HashMap iteration order is non-deterministic, so this explicit
-    # sort-then-dedup is what keeps cross-language hashes stable when users
-    # pass case-colliding keys.
-    sorted_extra: dict[str, str] = {}
-    for k, v in sorted(identity.extra_parameters.items()):
-        lk = k.lower()
-        if lk not in sorted_extra:
-            sorted_extra[lk] = v.lower()
     payload = {
         "mx_version": identity.mx_version.lower(),
         "mx_source_type": identity.mx_source_type,
-        "model_name": identity.model_name.lower(),
+        "model_name": identity.model_name,
         "backend_framework": identity.backend_framework,
         "tensor_parallel_size": identity.tensor_parallel_size,
         "pipeline_parallel_size": identity.pipeline_parallel_size,
         "expert_parallel_size": identity.expert_parallel_size,
         "dtype": identity.dtype.lower(),
         "quantization": identity.quantization.lower(),
-        "extra_parameters": sorted_extra,
-        "revision": identity.revision.lower(),
+        "extra_parameters": dict(identity.extra_parameters),
+        "revision": identity.revision,
     }
-    # Include optional compatibility fields only when set. That preserves
-    # existing weight source IDs while letting artifact/cache sources split IDs
-    # by framework, compiler, CUDA, and GPU compatibility constraints.
+    # Optional compatibility fields split artifact/cache sources by framework,
+    # compiler, CUDA, and GPU constraints only when set.
     for field in _OPTIONAL_SOURCE_ID_FIELDS:
         value = getattr(identity, field)
         if value:

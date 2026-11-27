@@ -43,6 +43,17 @@ Every source is identified by a `SourceIdentity` proto containing all fields tha
 
 The server computes `mx_source_id = SHA256(canonical_json(identity))[:16]` -- a 16-char hex key used to address all metadata for sources with identical configuration. This is content-addressed: two sources with the same identity hash to the same `mx_source_id`, enabling automatic peer discovery.
 
+Canonicalization preserves `model_name`, `revision`, and all `extra_parameters` keys and
+values exactly, including case. Compatibility labels such as `dtype` and
+`quantization` remain lowercase, and map insertion order does not affect the ID.
+For example, `s3://weights/ModelA` and `s3://weights/modela`, or `Release-A` and
+`release-a`, identify separate source pools.
+
+The Rust server and Python clients must use the same canonicalization. Identities
+whose opaque fields are already lowercase retain their existing IDs; identities
+affected by case preservation must be republished under their new IDs. The
+existing `mx_version` field remains part of the hash.
+
 Runtime accelerator compatibility is deliberately not part of `SourceIdentity` or `mx_source_id`. The source worker's active accelerator backend is stored as runtime `WorkerMetadata.accelerator` so rolling upgrades and existing pinned source-ID hash tests remain stable.
 
 ### Multi-Instance Support

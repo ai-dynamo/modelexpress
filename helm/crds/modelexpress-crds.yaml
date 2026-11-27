@@ -9,7 +9,6 @@ metadata:
 spec:
   group: modelexpress.nvidia.com
   names:
-    categories: []
     kind: ModelMetadata
     plural: modelmetadatas
     shortNames:
@@ -137,7 +136,9 @@ spec:
                         minimum: 0.0
                         type: integer
                       totalSize:
-                        description: Total artifact bytes across all manifest files. Kubernetes OpenAPI exposes this as int64; the backend converts to/from the proto uint64.
+                        description: |-
+                          Total artifact bytes across all manifest files. Kubernetes OpenAPI
+                          exposes this as int64; the backend converts to/from the proto uint64.
                         format: int64
                         minimum: 0.0
                         type: integer
@@ -153,6 +154,7 @@ spec:
                     - nixl
                     - transfer_engine
                     - none
+                    - null
                     nullable: true
                     type: string
                   metadataEndpoint:
@@ -167,7 +169,12 @@ spec:
                     description: |-
                       Source-published busyness in [0, 1] (default: RDMA NIC utilization).
 
-                      `None` must serialize as an explicit `null`, not be skipped: both status writes go out as a JSON merge patch, where an omitted key means "leave unchanged" and `null` means "delete". Skipping it would let the field go `None -> Some` but never back, so a worker the reaper marks Stale with no reading would keep advertising its last load. The CRD schema declares the field `nullable` so the API server accepts the null.
+                      `None` must serialize as an explicit `null`, not be skipped: both status
+                      writes go out as a JSON merge patch, where an omitted key means "leave
+                      unchanged" and `null` means "delete". Skipping it would let the field go
+                      `None -> Some` but never back, so a worker the reaper marks Stale with no
+                      reading would keep advertising its last load. The CRD schema declares the
+                      field `nullable` so the API server accepts the null.
                     format: float
                     nullable: true
                     type: number
@@ -232,7 +239,6 @@ metadata:
 spec:
   group: modelexpress.nvidia.com
   names:
-    categories: []
     kind: ModelCacheEntry
     plural: modelcacheentries
     shortNames:
@@ -270,7 +276,10 @@ spec:
             description: ModelCacheEntry spec - desired state. One CR per cached model.
             properties:
               modelName:
-                description: Full model name (e.g., `meta-llama/Llama-3.1-70B`). Preserved in spec so operators can recover the original name even when the CR's metadata.name is a sanitized/hashed form.
+                description: |-
+                  Full model name (e.g., `meta-llama/Llama-3.1-70B`). Preserved in spec so
+                  operators can recover the original name even when the CR's metadata.name is a
+                  sanitized/hashed form.
                 type: string
               provider:
                 description: Provider string — `"HuggingFace"`, `"Ngc"`, `"Gcs"`, or `"S3"`.
@@ -303,7 +312,9 @@ spec:
                 nullable: true
                 type: string
               leaseExpiresAt:
-                description: Owner-generated RFC3339 heartbeat deadline. Observers use changes in this value to measure liveness locally instead of comparing clocks across replicas.
+                description: |-
+                  Owner-generated RFC3339 heartbeat deadline. Observers use changes in this value
+                  to measure liveness locally instead of comparing clocks across replicas.
                 format: date-time
                 nullable: true
                 type: string
@@ -313,7 +324,9 @@ spec:
                 type: string
               phase:
                 default: ''
-                description: One of `"Downloading"`, `"Downloaded"`, `"Error"`. Empty string on freshly-created records that haven't yet received a status patch.
+                description: |-
+                  One of `"Downloading"`, `"Downloaded"`, `"Error"`. Empty string on freshly-created
+                  records that haven't yet received a status patch.
                 enum:
                 - ''
                 - Downloading

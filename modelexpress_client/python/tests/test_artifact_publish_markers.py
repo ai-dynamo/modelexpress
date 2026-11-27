@@ -123,24 +123,45 @@ def test_successful_publish_retains_lease(monkeypatch, tmp_path):
     assert al.mark_publish_scheduled(ctx, _transfer(tmp_path), _identity()) is None
 
 
-def test_marker_key_uses_canonical_compatibility_identity(tmp_path):
+def test_marker_key_normalizes_compatibility_labels_and_map_order(tmp_path):
     transfer = _transfer(tmp_path)
     upper = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
         model_name="ORG/Test-Model",
-        revision="MAIN",
+        revision="Release-A",
         extra_parameters={"Z": "VALUE", "A": "OTHER"},
+        dtype="BFLOAT16",
+        gpu_arch="SM90",
     )
     lower = p2p_pb2.SourceIdentity(
         mx_source_type=p2p_pb2.MX_SOURCE_TYPE_TRITON_CACHE,
-        model_name="org/test-model",
-        revision="main",
-        extra_parameters={"a": "other", "z": "value"},
+        model_name="ORG/Test-Model",
+        revision="Release-A",
+        extra_parameters={"A": "OTHER", "Z": "VALUE"},
+        dtype="bfloat16",
+        gpu_arch="sm90",
     )
 
     assert al.artifact_marker_key(transfer, upper, "install") == (
         al.artifact_marker_key(transfer, lower, "install")
     )
+
+
+def test_case_distinct_models_have_independent_publish_leases(monkeypatch, tmp_path):
+    monkeypatch.setattr(al.tempfile, "gettempdir", lambda: str(tmp_path))
+    transfer = _transfer(tmp_path)
+    ctx = SimpleNamespace(global_rank=0)
+    upper = _identity()
+    upper.model_name = "s3://weights/ModelA"
+    lower = _identity()
+    lower.model_name = "s3://weights/modela"
+
+    upper_lease = al.mark_publish_scheduled(ctx, transfer, upper)
+    lower_lease = al.mark_publish_scheduled(ctx, transfer, lower)
+
+    assert upper_lease is not None
+    assert lower_lease is not None
+    assert upper_lease != lower_lease
 
 
 def test_scheduled_publisher_lease_reclaimed_after_owner_terminates(

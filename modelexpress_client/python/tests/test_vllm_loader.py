@@ -822,6 +822,25 @@ class TestRdmaReloadIdentityGate:
         )
         assert self._is_available(ctx) is False
 
+    @pytest.mark.parametrize(
+        ("field", "first", "second"),
+        [
+            ("model_name", "s3://weights/ModelA", "s3://weights/modela"),
+            ("revision", "Release-A", "release-a"),
+        ],
+    )
+    def test_reload_of_case_distinct_weights_skips_rdma(self, field, first, second):
+        loaded = self._identity("v1")
+        requested = self._identity("v1")
+        setattr(loaded, field, first)
+        setattr(requested, field, second)
+        ctx = _make_load_context(
+            identity=requested,
+            is_reload=True,
+            loaded_identity=loaded,
+        )
+        assert self._is_available(ctx) is False
+
     def test_reload_with_unknown_loaded_weights_skips_rdma(self):
         ctx = _make_load_context(identity=self._identity("abc"), is_reload=True)
         assert self._is_available(ctx) is False

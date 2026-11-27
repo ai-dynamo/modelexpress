@@ -27,6 +27,14 @@ ModelExpress uses a layered configuration system. Sources are applied in order o
 
 > Most environment variables the code reads — including their defaults and fallback chains — are defined in one place per language: `modelexpress_common/src/envs.rs` (Rust server/client) and `modelexpress_client/python/modelexpress/envs.py` (Python client). Treat those modules as the canonical inventory; the tables below mirror them, and the documented exceptions are called out where needed.
 
+### Kubernetes API Certificate Trust
+
+When a cluster CA is configured, the Kubernetes client's OpenSSL connector
+trusts only that CA bundle, matching the rustls connector. If an API-server
+connection uses a TLS inspection proxy, include its CA in the kubeconfig CA
+bundle rather than relying on OpenSSL's system trust store. This follows the
+[kube-client trust fix](https://rustsec.org/advisories/RUSTSEC-2026-0600).
+
 ### Generating a Configuration File
 
 ```bash
