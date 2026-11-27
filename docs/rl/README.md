@@ -43,7 +43,7 @@ The distribution installs these automatic plugin entry points:
 | vLLM | `vllm.general_plugins` | `modelexpress_rl` | `modelexpress_rl.inference.engines.vllm.registration:register` |
 | SGLang | `sglang.srt.plugins` | `modelexpress_rl` | `modelexpress_rl.inference.engines.sglang.registration:register` |
 
-With engine plugin autoload enabled, no manual registration call is needed. If plugin loading is filtered, include `modelexpress_rl` in `VLLM_PLUGINS` or `SGLANG_PLUGINS` as appropriate. For vLLM, the plugin exposes the `modelexpress` native weight-transfer backend; the regular base inference loader remains available independently.
+With engine plugin autoload enabled, no manual registration call is needed. If plugin loading is filtered, include `modelexpress_rl` in `VLLM_PLUGINS` or `SGLANG_PLUGINS` as appropriate. For vLLM, the plugin exposes the `modelexpress` native weight-transfer backend, plus `modelexpress_nccl`, which wraps vLLM's NCCL backend and keeps updated workers published as P2P sources; the regular base inference loader remains available independently.
 
 Deployments that previously used only `VLLM_PLUGINS=modelexpress` for refit must include `modelexpress_rl`. For manual RL registration, call `modelexpress_rl.inference.engines.vllm.registration.register()` instead of the base `register_modelexpress_loaders()`. Set `MX_LOAD_STRATEGY_CHAIN` before registration. Existing native or custom weight-transfer registrations are preserved.
 

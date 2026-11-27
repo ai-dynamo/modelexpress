@@ -9,7 +9,16 @@ from modelexpress import envs, register_modelexpress
 from .. import configure_engine_logging
 
 logger = logging.getLogger(__name__)
-_WEIGHT_TRANSFER_BACKEND = "modelexpress"
+_WEIGHT_TRANSFER_BACKENDS = {
+    "modelexpress": (
+        "modelexpress_rl.inference.engines.vllm.weight_transfer_engine",
+        "ModelExpressWeightTransferEngine",
+    ),
+    "modelexpress_nccl": (
+        "modelexpress_rl.inference.engines.vllm.nccl_publication_engine",
+        "ModelExpressNCCLWeightTransferEngine",
+    ),
+}
 
 
 def register() -> None:
@@ -26,7 +35,7 @@ def register() -> None:
 
 
 def register_plugin_weight_transfer_engine() -> None:
-    """Register the ModelExpress backend when vLLM exposes weight transfer."""
+    """Register the ModelExpress backends when vLLM exposes weight transfer."""
     try:
         from vllm.distributed.weight_transfer.factory import (
             WeightTransferEngineFactory,
@@ -35,10 +44,6 @@ def register_plugin_weight_transfer_engine() -> None:
         logger.debug("vLLM does not expose the weight-transfer engine factory")
         return
 
-    if _WEIGHT_TRANSFER_BACKEND in WeightTransferEngineFactory._registry:
-        return
-    WeightTransferEngineFactory.register_engine(
-        _WEIGHT_TRANSFER_BACKEND,
-        "modelexpress_rl.inference.engines.vllm.weight_transfer_engine",
-        "ModelExpressWeightTransferEngine",
-    )
+    for name, (module_path, class_name) in _WEIGHT_TRANSFER_BACKENDS.items():
+        if name not in WeightTransferEngineFactory._registry:
+            WeightTransferEngineFactory.register_engine(name, module_path, class_name)

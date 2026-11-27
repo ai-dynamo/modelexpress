@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     MX_RESHARD_PUBLISH_DIGEST: bool
     MX_REDIS_URL: str
     MX_GENERATOR_SOURCE_ORDER: str | None
+    MX_RUNTIME_PUBLISH_REVISION: str | None
     AZURE_STORAGE_ACCOUNT_NAME: str | None
     AZURE_STORAGE_ACCOUNT_URL: str | None
     AZURE_STORAGE_CONNECTION_STRING: str | None
@@ -114,6 +115,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REDIS_URL": lambda: os.environ.get("MX_REDIS_URL", "redis://localhost:6379"),
     # ── Generator weight sync ──────────────────────────────────────────────
     "MX_GENERATOR_SOURCE_ORDER": lambda: os.environ.get("MX_GENERATOR_SOURCE_ORDER"),
+    # Source revision NCCL-updated weights are republished under.
+    "MX_RUNTIME_PUBLISH_REVISION": lambda: (
+        os.environ.get("MX_RUNTIME_PUBLISH_REVISION", "").strip() or None
+    ),
     "AZURE_STORAGE_ACCOUNT_NAME": lambda: (
         os.environ.get("AZURE_STORAGE_ACCOUNT_NAME", "").strip() or None
     ),

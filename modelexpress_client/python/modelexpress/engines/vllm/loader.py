@@ -529,12 +529,17 @@ class MxModelLoader(BaseModelLoader):
             return self._ctx.worker_id
         return None
 
-    def unpublish_runtime_tensors(self) -> None:
-        """Withdraw this loader's runtime tensors before an active refit."""
+    def unpublish_runtime_tensors(self, drain_timeout: float | None = None) -> None:
+        """Withdraw this loader's runtime tensors before an active refit.
+
+        ``drain_timeout`` defaults to ``MX_TRANSFER_TIMEOUT``.
+        """
         if self._ctx is not None:
             drain_tensor_readers(
                 self._ctx,
-                timeout=envs.MX_TRANSFER_TIMEOUT,
+                timeout=(
+                    envs.MX_TRANSFER_TIMEOUT if drain_timeout is None else drain_timeout
+                ),
             )
             unpublish_metadata(self._ctx)
 

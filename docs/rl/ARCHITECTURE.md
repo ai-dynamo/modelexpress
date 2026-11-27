@@ -830,6 +830,23 @@ complete `ModelExpressGeneratorClient.stage_weight()` wall-clock call.
 preparation lock, which another rank's preparation, a streamed full checkpoint's
 cache writer, or the background seed copy may hold.
 
+The plugin also registers a `modelexpress_nccl` backend for trainers that push
+weights over vLLM's native NCCL backend. It subclasses vLLM's
+`NCCLWeightTransferEngine` and adds ModelExpress publication of the target
+model around each update, so a restarted replica can copy the live weights from
+a healthy peer. `start_weight_update()` drains peer readers and withdraws the
+worker's tensors before NCCL mutates them. The drain outlasts the reader lease,
+and a failed drain fails the update before any mutation. `finish_weight_update()`
+republishes the tensors under `MX_RUNTIME_PUBLISH_REVISION`. A failed publish
+is logged and the update still succeeds, because the weights are already
+installed. Workers loaded through `MxModelLoader` publish through that loader.
+Workers started with `--load-format dummy` register their tensors with NIXL when
+the engine is built, before torch.compile and CUDA graph capture. When a
+speculative draft is configured, the target and draft form one publication
+transaction: the first update withdraws and drains the publication, and it is
+republished only after both updates finish successfully. This prevents peers
+from observing a new target with an old or partially updated draft.
+
 The active vLLM refit installer lives in
 `modelexpress_rl.inference.engines.vllm.installer`. It captures canonical
 load-time destinations and aliases once for the generator client's lifetime,

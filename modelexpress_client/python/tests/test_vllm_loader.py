@@ -96,6 +96,20 @@ def test_model_loader_owns_runtime_tensor_publication(monkeypatch):
     assert ctx.identity.revision == "version-a"
 
 
+def test_model_loader_unpublish_accepts_drain_timeout(monkeypatch):
+    from modelexpress.engines.vllm import loader as loader_mod
+
+    loader = _make_loader()
+    loader._ctx = _make_load_context(device_id=3)
+    drain = MagicMock()
+    monkeypatch.setattr(loader_mod, "drain_tensor_readers", drain)
+    monkeypatch.setattr(loader_mod, "unpublish_metadata", MagicMock())
+
+    loader.unpublish_runtime_tensors(drain_timeout=300)
+
+    drain.assert_called_once_with(loader._ctx, timeout=300)
+
+
 def test_model_loader_keeps_source_published_when_reader_drain_times_out(
     monkeypatch,
 ):

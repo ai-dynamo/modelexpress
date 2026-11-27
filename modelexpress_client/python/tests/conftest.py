@@ -143,6 +143,26 @@ def _maybe_mock_vllm():
         def trainer_send_weights(iterator, trainer_args):
             raise NotImplementedError
 
+    class NCCLWeightTransferEngine(WeightTransferEngine):
+        def start_weight_update(self):
+            pass
+
+        def finish_weight_update(self):
+            pass
+
+        def init_transfer_engine(self, init_info):
+            pass
+
+        def receive_weights(self, update_info, load_weights=None):
+            pass
+
+        def shutdown(self):
+            pass
+
+        @staticmethod
+        def trainer_send_weights(iterator, trainer_args):
+            pass
+
     class WeightTransferEngineFactory:
         _registry = {}
 
@@ -175,6 +195,7 @@ def _maybe_mock_vllm():
         "vllm.distributed.weight_transfer": MagicMock(),
         "vllm.distributed.weight_transfer.base": MagicMock(),
         "vllm.distributed.weight_transfer.factory": MagicMock(),
+        "vllm.distributed.weight_transfer.nccl_engine": MagicMock(),
     }
 
     # Explicit attributes survive monkeypatch teardown under pytest 9.2.
@@ -201,6 +222,9 @@ def _maybe_mock_vllm():
     )
     vllm_mods["vllm.distributed.weight_transfer.factory"].WeightTransferEngineFactory = (
         WeightTransferEngineFactory
+    )
+    vllm_mods["vllm.distributed.weight_transfer.nccl_engine"].NCCLWeightTransferEngine = (
+        NCCLWeightTransferEngine
     )
 
     # set_default_torch_dtype needs to be a real context manager
